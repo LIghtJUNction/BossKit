@@ -1,0 +1,20 @@
+{
+  "code": 0,
+  "zpData": {
+    "jobList": [
+      {
+        "encryptJobId": "sanitized-zp-001",
+        "jobName": "Rust Platform Engineer",
+        "brandName": "Example Systems",
+        "cityName": "深圳",
+        "areaDistrict": "南山区",
+        "salaryDesc": "20-30K",
+        "experienceName": "3-5年",
+        "degreeName": "本科",
+        "jobTypeName": "全职",
+        "skills": ["Rust", "Linux"],
+        "welfareList": ["双休", "五险一金"]
+      }
+    ]
+  }
+}

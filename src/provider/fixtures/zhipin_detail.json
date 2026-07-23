@@ -1,0 +1,21 @@
+{
+  "code": 0,
+  "zpData": {
+    "jobInfo": {
+      "jobName": "Rust Platform Engineer",
+      "cityName": "深圳",
+      "areaDistrict": "南山区",
+      "salaryDesc": "20-30K",
+      "experienceName": "3-5年",
+      "degreeName": "本科",
+      "jobTypeName": "全职",
+      "skills": ["Rust", "Linux"],
+      "welfareList": ["双休", "五险一金"],
+      "address": "科技园示例路"
+    },
+    "brandComInfo": {
+      "brandName": "Example Systems"
+    },
+    "jobDetail": "Build reliable Linux platform services in Rust."
+  }
+}

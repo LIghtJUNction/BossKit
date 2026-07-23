@@ -1,0 +1,25 @@
+[
+  {
+    "timestamp": 1,
+    "query": "rust",
+    "platform": "zhipin",
+    "city": "深圳",
+    "page": 1,
+    "limit": 20,
+    "filters": {
+      "company": null,
+      "salary": null,
+      "experience": null,
+      "education": null,
+      "employment_type": null,
+      "welfare": []
+    },
+    "providers": [
+      {
+        "platform": "zhipin",
+        "count": 1,
+        "error_code": null
+      }
+    ]
+  }
+]

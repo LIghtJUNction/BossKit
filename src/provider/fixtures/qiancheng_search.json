@@ -1,0 +1,23 @@
+{
+  "status": "1",
+  "resultbody": {
+    "job": {
+      "items": [
+        {
+          "jobId": "sanitized-51-001",
+          "jobHref": "https://we.51job.com/pc/search/jobdetail?jobId=sanitized-51-001",
+          "jobName": "Rust Systems Engineer",
+          "fullCompanyName": "Example Technology",
+          "jobAreaString": "深圳",
+          "jobAreaLevelDetail": "南山区",
+          "provideSalaryString": "20-30K",
+          "workYearString": "3-5年",
+          "degreeString": "本科",
+          "jobType": "全职",
+          "skillLabel": ["Rust", "Linux"],
+          "jobTags": ["双休", "五险一金"]
+        }
+      ]
+    }
+  }
+}

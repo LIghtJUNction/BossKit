@@ -1,0 +1,20 @@
+[
+  {
+    "id": "fixture-zhipin",
+    "platform": "zhipin",
+    "remote_id": "fixture-remote",
+    "title": "Rust Engineer",
+    "company": "Example",
+    "city": "深圳",
+    "salary": "20-30K",
+    "url": "https://example.test/job",
+    "district": "南山",
+    "experience": "3年",
+    "education": "本科",
+    "employment_type": "全职",
+    "skills": ["Rust"],
+    "welfare": ["双休"],
+    "description": "Cached fixture detail",
+    "address": "科技园"
+  }
+]
