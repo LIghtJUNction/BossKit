@@ -1,5 +1,6 @@
 //! Operations shared by CLI and MCP transports.
 
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 #[cfg(target_os = "linux")]
@@ -887,7 +888,7 @@ fn inspect_clean_targets(
             Ok(CleanInspection {
                 logical,
                 path,
-                identity: metadata.as_ref().map(file_identity).transpose()?,
+                identity: metadata.as_ref().map(file_identity),
             })
         })
         .collect()
@@ -1480,16 +1481,17 @@ fn cleanup_rollback_error(cause: impl AsRef<str>, report: RecoveryReport) -> Bos
         .join(", ");
     let mut message = format!("{}; no archived file was deleted", cause.as_ref());
     if !paths.is_empty() {
-        message.push_str(&format!("; verified preserved at: {paths}"));
+        let _ = write!(message, "; verified preserved at: {paths}");
     }
     if !report.unverified_targets.is_empty() {
-        message.push_str(&format!(
+        let _ = write!(
+            message,
             "; no stable recovery path could be verified for: {}",
             report.unverified_targets.join(", ")
-        ));
+        );
     }
     if !report.issues.is_empty() {
-        message.push_str(&format!("; recovery issues: {}", report.issues.join(" | ")));
+        let _ = write!(message, "; recovery issues: {}", report.issues.join(" | "));
     }
     BossError::Cleanup(message)
 }
@@ -1507,16 +1509,16 @@ fn file_identity_from_stat(stat: &rustix::fs::Stat) -> Result<FileIdentity, Stri
     })
 }
 
-fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, BossError> {
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     #[cfg(unix)]
     {
-        Ok(FileIdentity {
+        FileIdentity {
             len: metadata.len(),
             device: metadata.dev(),
             inode: metadata.ino(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
-        })
+        }
     }
     #[cfg(not(unix))]
     {
@@ -1524,10 +1526,10 @@ fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, BossError> {
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
-        Ok(FileIdentity {
+        FileIdentity {
             len: metadata.len(),
             modified,
-        })
+        }
     }
 }
 
@@ -2345,8 +2347,7 @@ mod tests {
         std::fs::write(paths.jobs(), b"jobs").expect("jobs");
         std::fs::write(paths.history(), b"history").expect("history");
         let jobs_identity =
-            file_identity(&std::fs::symlink_metadata(paths.jobs()).expect("metadata"))
-                .expect("identity");
+            file_identity(&std::fs::symlink_metadata(paths.jobs()).expect("metadata"));
         let service = BossService::from_paths(paths.clone()).expect("service");
         let result = service.clean("all", true).expect("clean");
         let recovery = result["files"]
@@ -2358,8 +2359,7 @@ mod tests {
             .map(PathBuf::from)
             .expect("recovery path");
         let recovered_identity =
-            file_identity(&std::fs::symlink_metadata(&recovery).expect("metadata"))
-                .expect("identity");
+            file_identity(&std::fs::symlink_metadata(&recovery).expect("metadata"));
         let transaction = PathBuf::from(
             result["archive_transaction"]
                 .as_str()

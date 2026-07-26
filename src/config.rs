@@ -216,36 +216,33 @@ impl ConfigStore {
 
     /// Resets one override or every override.
     pub fn reset(&mut self, key: Option<&str>) -> Result<ConfigChange, BossError> {
-        match key {
-            Some(key) => {
-                let previous = self.get(key)?.value;
-                match key {
-                    "platform" => self.overrides.platform = None,
-                    "request_timeout_secs" => self.overrides.request_timeout_secs = None,
-                    "page_size" => self.overrides.page_size = None,
-                    "operating_mode" => self.overrides.operating_mode = None,
-                    "log_level" => self.overrides.log_level = None,
-                    _ => return Err(unknown_key(key)),
-                }
-                self.persist()?;
-                Ok(ConfigChange {
-                    key: key.to_owned(),
-                    previous,
-                    new: self.get(key)?.value,
-                })
+        if let Some(key) = key {
+            let previous = self.get(key)?.value;
+            match key {
+                "platform" => self.overrides.platform = None,
+                "request_timeout_secs" => self.overrides.request_timeout_secs = None,
+                "page_size" => self.overrides.page_size = None,
+                "operating_mode" => self.overrides.operating_mode = None,
+                "log_level" => self.overrides.log_level = None,
+                _ => return Err(unknown_key(key)),
             }
-            None => {
-                let previous = serde_json::to_value(self.effective())
-                    .map_err(|error| BossError::ConfigJson(error.to_string()))?;
-                self.overrides = UserOverrides::default();
-                self.persist()?;
-                Ok(ConfigChange {
-                    key: "all".to_owned(),
-                    previous,
-                    new: serde_json::to_value(self.effective())
-                        .map_err(|error| BossError::ConfigJson(error.to_string()))?,
-                })
-            }
+            self.persist()?;
+            Ok(ConfigChange {
+                key: key.to_owned(),
+                previous,
+                new: self.get(key)?.value,
+            })
+        } else {
+            let previous = serde_json::to_value(self.effective())
+                .map_err(|error| BossError::ConfigJson(error.to_string()))?;
+            self.overrides = UserOverrides::default();
+            self.persist()?;
+            Ok(ConfigChange {
+                key: "all".to_owned(),
+                previous,
+                new: serde_json::to_value(self.effective())
+                    .map_err(|error| BossError::ConfigJson(error.to_string()))?,
+            })
         }
     }
 

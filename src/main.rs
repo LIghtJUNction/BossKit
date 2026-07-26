@@ -469,7 +469,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode, BossError> {
     if let Command::Doctor { platform } = &cli.command {
         print_json(&Envelope::success(BossService::doctor_local(
-            platform.and_then(|value| value.selected()),
+            platform.and_then(PlatformArg::selected),
         )));
         return Ok(ExitCode::SUCCESS);
     }
@@ -560,7 +560,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 service.resume_skills(&name, add, remove)?,
             )),
             ResumeCommand::Clone { name, new_name } => {
-                print_json(&Envelope::success(service.resume_clone(&name, &new_name)?))
+                print_json(&Envelope::success(service.resume_clone(&name, &new_name)?));
             }
             ResumeCommand::Diff { left, right } => {
                 print_json(&Envelope::success(service.resume_diff(&left, &right)?));
@@ -589,9 +589,8 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         }
         Command::Ls { platform, limit } => {
             let defaults = service.effective_config();
-            let platform = platform
-                .map(PlatformArg::selected)
-                .unwrap_or_else(|| defaults.platform.selected());
+            let platform =
+                platform.map_or_else(|| defaults.platform.selected(), PlatformArg::selected);
             let limit = limit.map_or(defaults.page_size, NonZeroUsize::get);
             print_json(&Envelope::success(service.list(platform, limit)?));
         }
@@ -648,7 +647,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 service.shortlist_add(&job_id, tags, note)?,
             )),
             ShortlistCommand::Ls { tag } => {
-                print_json(&Envelope::success(service.shortlist_list(tag.as_deref())?))
+                print_json(&Envelope::success(service.shortlist_list(tag.as_deref())?));
             }
             ShortlistCommand::Annotate {
                 job_id,

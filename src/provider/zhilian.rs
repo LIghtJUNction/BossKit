@@ -82,7 +82,7 @@ impl ZhilianProvider {
     pub fn detail_url(job: &Job) -> Result<reqwest::Url, BossError> {
         let mut url = parse_url("https://fe-api.zhaopin.com/api/c/jobs/")?;
         url.path_segments_mut()
-            .map_err(|_| BossError::InvalidArgument("invalid detail base URL".to_owned()))?
+            .map_err(|()| BossError::InvalidArgument("invalid detail base URL".to_owned()))?
             .pop_if_empty()
             .push(&job.remote_id)
             .push("info");

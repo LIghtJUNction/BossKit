@@ -396,7 +396,7 @@ fn parse_attributes(html: &str, start: usize, end: usize) -> Vec<HtmlAttribute<'
             while cursor < end && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            parse_attribute_value(html, &mut cursor, end)
+            Some(parse_attribute_value(html, &mut cursor, end))
         } else {
             None
         };
@@ -405,10 +405,10 @@ fn parse_attributes(html: &str, start: usize, end: usize) -> Vec<HtmlAttribute<'
     attributes
 }
 
-fn parse_attribute_value<'a>(html: &'a str, cursor: &mut usize, end: usize) -> Option<&'a str> {
+fn parse_attribute_value<'a>(html: &'a str, cursor: &mut usize, end: usize) -> &'a str {
     let bytes = html.as_bytes();
     if *cursor >= end {
-        return Some("");
+        return "";
     }
     if matches!(bytes[*cursor], b'\'' | b'"') {
         let quote = bytes[*cursor];
@@ -421,13 +421,13 @@ fn parse_attribute_value<'a>(html: &'a str, cursor: &mut usize, end: usize) -> O
         if *cursor < end {
             *cursor += 1;
         }
-        Some(value)
+        value
     } else {
         let value_start = *cursor;
         while *cursor < end && !bytes[*cursor].is_ascii_whitespace() {
             *cursor += 1;
         }
-        Some(&html[value_start..*cursor])
+        &html[value_start..*cursor]
     }
 }
 
