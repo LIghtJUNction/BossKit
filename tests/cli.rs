@@ -31,6 +31,9 @@ fn run_mcp(data_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
     let output = Command::cargo_bin("boss")
         .expect("binary")
         .env("BOSS_DATA_DIR", data_dir)
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .env_remove("BOSS_ZHILIAN_COOKIE")
+        .env_remove("BOSS_QIANCHENG_COOKIE")
         .arg("mcp")
         .write_stdin(input)
         .output()
@@ -270,6 +273,72 @@ fn status_and_doctor_are_structured_and_offline() {
 }
 
 #[test]
+fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("desktop-cookie-export.txt");
+        let fixture_cookie = "session=fixture-cookie-value";
+        std::fs::write(&source, fixture_cookie).expect("write export");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("secure export");
+        let source_text = source.display().to_string();
+
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .env_remove("BOSS_ZHIPIN_COOKIE")
+            .env_remove("BOSS_ZHILIAN_COOKIE")
+            .env_remove("BOSS_QIANCHENG_COOKIE")
+            .args([
+                "login",
+                "--platform",
+                "zhipin",
+                "--credential-file",
+                &source_text,
+            ])
+            .output()
+            .expect("login");
+        assert!(output.status.success());
+        let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
+        let login_text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            login["data"]["network_checked"] == false
+                && login["data"]["results"][0]["state"] == "stored_unverified"
+                && login["data"]["results"][0]["source"] == "credential_file"
+                && !login_text.contains(fixture_cookie)
+                && !login_text.contains(&source_text)
+        );
+
+        let status = run_json(directory.path(), &["status", "--platform", "zhipin"]);
+        assert!(
+            status["data"]["providers"][0]["stored_session_present"] == true
+                && status["data"]["providers"][0]["registered_export_present"] == true
+                && status["data"]["providers"][0]["auth_state"] == "stored_session_present"
+        );
+        let logout = run_json(
+            directory.path(),
+            &["logout", "--platform", "zhipin", "--yes"],
+        );
+        assert_eq!(logout["data"]["results"][0]["revoked"], true);
+        let after_logout = run_json(directory.path(), &["status", "--platform", "zhipin"]);
+        assert!(
+            after_logout["data"]["providers"][0]["stored_session_present"] == false
+                && after_logout["data"]["providers"][0]["registered_export_present"] == false
+                && source.is_file()
+        );
+
+        let manual_required = run_json(directory.path(), &["login", "--platform", "zhilian"]);
+        assert_eq!(
+            manual_required["data"]["results"][0]["state"],
+            "manual_login_required"
+        );
+    }
+}
+
+#[test]
 fn doctor_reports_invalid_config_as_local_error() {
     let directory = tempdir().expect("temporary directory");
     std::fs::write(directory.path().join("config.json"), b"{not-json").expect("write invalid");
@@ -287,9 +356,18 @@ fn schema_formats_use_expected_wrappers() {
     assert!(native["data"]["commands"].is_array());
     assert!(openai["data"][0]["function"]["parameters"].is_object());
     assert!(anthropic["data"][0]["input_schema"].is_object());
+    let commands = native["data"]["commands"].as_array().expect("commands");
+    let mcp_tools = mcp["data"].as_array().expect("mcp tools");
     assert_eq!(
         native["data"]["mcp_tools"].as_array().map(Vec::len),
         mcp["data"].as_array().map(Vec::len)
+    );
+    assert!(
+        commands.iter().any(|command| command["name"] == "login")
+            && commands.iter().any(|command| command["name"] == "logout")
+            && mcp_tools
+                .iter()
+                .all(|tool| !matches!(tool["name"].as_str(), Some("login" | "logout")))
     );
 }
 
@@ -373,6 +451,37 @@ fn preset_and_watch_snapshots_have_local_lifecycles() {
 }
 
 #[test]
+fn keyword_reply_cli_lifecycle_returns_local_suggestions() {
+    let directory = tempdir().expect("temporary directory");
+    let added = run_json(
+        directory.path(),
+        &["reply", "add", " Offer ", " Thanks for reaching out. "],
+    );
+    assert_eq!(
+        (
+            added["data"]["keyword"].as_str(),
+            added["data"]["reply"].as_str(),
+        ),
+        (Some("Offer"), Some("Thanks for reaching out."))
+    );
+    let listed = run_json(directory.path(), &["reply", "list"]);
+    let matched = run_json(
+        directory.path(),
+        &["reply", "match", "A new OFFER is ready"],
+    );
+    let unmatched = run_json(directory.path(), &["reply", "match", "No update today"]);
+    let removed = run_json(directory.path(), &["reply", "remove", "offer"]);
+    assert!(
+        listed["data"].as_array().map(Vec::len) == Some(1)
+            && matched["data"]["matched"] == true
+            && matched["data"]["rule"]["reply"] == "Thanks for reaching out."
+            && unmatched["data"]["matched"] == false
+            && unmatched["data"]["rule"].is_null()
+            && removed["data"]["keyword"] == "Offer"
+    );
+}
+
+#[test]
 fn resume_cli_is_typed_and_requires_deletion_confirmation() {
     let directory = tempdir().expect("temporary directory");
     run_json(
@@ -411,6 +520,8 @@ fn clean_preview_and_archive_preserve_config_and_report_recovery_paths() {
     seed_jobs(directory.path());
     run_json(directory.path(), &["config", "set", "page_size", "7"]);
     run_json(directory.path(), &["preset", "add", "p", "rust"]);
+    run_json(directory.path(), &["reply", "add", "offer", "Thanks"]);
+    let reply_preview = run_json(directory.path(), &["clean", "--target", "reply_rules"]);
     let preview = run_json(directory.path(), &["clean", "--target", "all"]);
     assert!(preview["data"]["preview"] == true && directory.path().join("jobs.json").exists());
     let cleaned = run_json(directory.path(), &["clean", "--target", "all", "--yes"]);
@@ -444,13 +555,17 @@ fn clean_preview_and_archive_preserve_config_and_report_recovery_paths() {
     )
     .expect("clean preview json");
     assert!(
-        cleaned["data"]["files"].as_array().map(Vec::len) == Some(6)
+        cleaned["data"]["files"].as_array().map(Vec::len) == Some(7)
+            && reply_preview["data"]["files"].as_array().map(Vec::len) == Some(1)
+            && reply_preview["data"]["files"][0]["target"] == "reply_rules"
             && cleaned["data"]["action"] == "archive"
             && cleaned["data"]["recoverable"] == true
             && archived_paths_exist
             && directory.path().join("config.json").exists()
             && !directory.path().join("jobs.json").exists()
+            && !directory.path().join("reply_rules.json").exists()
             && stats["data"]["file_bytes"]["jobs"] == 0
+            && stats["data"]["file_bytes"]["reply_rules"] == 0
             && clean_schema
                 .and_then(|tool| tool["description"].as_str())
                 .is_some_and(|description| description.contains("never archives or removes"))

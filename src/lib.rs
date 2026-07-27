@@ -1,5 +1,6 @@
 //! Shared services for the `boss` read-only job search CLI and MCP server.
 
+pub mod auth;
 pub mod cache;
 pub mod city;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod mcp;
 pub mod model;
 pub mod preset;
 pub mod provider;
+pub mod reply;
 pub mod resume;
 pub mod schema;
 pub mod service;
@@ -25,5 +27,6 @@ pub use model::{
     Envelope, Job, Platform, PlatformInfo, PlatformSelector, SearchFilters, SearchReport,
     SearchSpec, SearchSpecPatch,
 };
+pub use reply::{ReplyMatch, ReplyRule, ReplyStore};
 pub use service::BossService;
 pub use shortlist::{ShortlistEntry, ShortlistStore};

@@ -23,6 +23,10 @@ boss search rust --company 示例 --experience 3年 --education 本科 \
 boss preset add rust-backend rust --platform all --city 深圳
 boss search --preset rust-backend --limit 10
 boss preset ls
+boss reply add "面试" "感谢您的联系，我会尽快回复。"
+boss reply ls                    # 可见别名：list
+boss reply match "您方便参加面试吗？"
+boss reply rm "面试"             # 可见别名：remove
 boss watch add daily --preset rust-backend
 boss watch run daily
 boss watch run --all
@@ -46,6 +50,11 @@ boss config get page_size
 boss config set page_size 30
 boss config reset page_size
 boss config reset
+
+boss login --platform zhipin --credential-file ./zhipin-cookies.txt
+boss login                         # 自动尝试环境变量、已登记导出文件、已保存会话
+boss login --platform zhilian --manual
+boss logout --platform zhipin --yes
 
 boss status --platform all
 boss doctor --platform all
@@ -88,8 +97,10 @@ boss mcp
 - `shortlist.json`：完整职位快照、去重标签、备注和首次添加时间
 - `history.json`：BossKit 本地搜索尝试审计，最多保留最新 200 条
 - `presets.json`：完整、已验证的命名搜索规范
+- `reply_rules.json`：关键词到建议回复的严格本地规则，按添加顺序保存
 - `watches.json`：显式前台监视、完整去重的已见稳定 ID 和最后成功运行时间；不会截断后遗忘旧 ID
 - `resumes.json`：单一严格类型的本地简历集合
+- `.auth/sessions.json`：仅本机私有的登录 Cookie 和已登记导出文件引用；Unix 下目录为 `0700`、文件为 `0600`
 - `.bosskit-clean-archive/<事务>/`：Linux 确认 clean 后保留的同文件系统可恢复归档；不会被后续 clean 或 stats 当作活动数据
 
 写入使用数据根目录内的临时文件和原子替换。配置仅接受以下键，不接受 Cookie、Token、API key 或未知键：
@@ -107,6 +118,10 @@ boss mcp
 `boss history` 不是招聘平台的远端浏览历史；它只记录 BossKit 自己完成的搜索尝试、
 本地过滤条件以及每个平台的数量或错误码。
 
+`boss reply` 只在本地保存规则并对传入文本进行确定性关键词匹配：ASCII 大小写不敏感的字面子串，
+多个规则命中时选择关键词最长的规则，同长度时选择最早保存的规则。`match` 只返回建议文本，
+绝不会获取会话、调用平台消息接口或发送平台消息。
+
 `boss export` 完全本地运行。无 `--output` 时，即使请求 CSV/HTML，也只在 JSON 信封中返回
 结构化脱敏职位和格式元数据；指定路径时才原子写入对应 JSON、CSV 或 HTML 文件。
 现有文件默认拒绝覆盖，必须显式 `--force`。默认保留本地稳定 ID 并省略远端 ID，
@@ -116,7 +131,23 @@ boss mcp
 
 `boss cities` 会诚实列出当前三个适配器共同映射的 10 个逻辑城市：北京、上海、广州、深圳、杭州、成都、武汉、南京、苏州、西安。单平台搜索还可传该平台原生纯数字城市代码。
 
-Cookie 只能通过环境变量提供，不会持久化：
+`boss login` 只做本地 Cookie 导入和保存，**绝不发起登录或认证网络请求**；成功结果是
+`local_unverified`，后续正常的只读搜索请求才会体现 Cookie 是否仍有效。默认的自动顺序是：
+环境变量、已登记的导出文件、已保存会话；`--credential-file` 则只允许一个具体平台，并会立即导入且登记该文件，供之后的 `boss login` 再次自动尝试。
+
+```bash
+chmod 600 ./zhipin-cookies.txt
+boss login --platform zhipin --credential-file ./zhipin-cookies.txt
+boss login --platform zhipin --manual     # 仅 TTY，输入不会回显
+boss login                                # 依次尝试三个平台；非 TTY 时返回 manual_login_required
+boss logout --platform zhipin --yes       # 只撤销本地会话和文件引用，不删除原导出文件
+```
+
+可直接导入的仅是用户**明确导出并指定**的普通文件，且 Unix 下必须是当前用户拥有、非符号链接、常规文件、最大 64 KiB，并且不对组或其他用户开放。支持的格式是：原始 `Cookie:` 头/纯 Cookie 文本、按当前平台域名筛选的 Netscape Cookie 导出，以及受限 JSON（`{"cookie":"..."}` 或包含 `domain`、`name`、`value` 的 `cookies` 数组）。
+
+BossKit **不会**扫描、遍历、读取、解密或破解桌面客户端、浏览器、SQLite、系统钥匙串或其他私有凭据库；它也不会输出 Cookie 值、导出文件路径或将这些操作暴露给 MCP。这样“桌面端凭据文件”仅表示用户主动导出的、可审计的 Cookie 文件，而不是原生私有凭据存储。
+
+仍可使用环境变量；环境 Cookie 在正常 Provider 请求和 `boss login` 自动尝试中优先于本地保存会话：
 
 ```bash
 export BOSS_ZHIPIN_COOKIE='...'
@@ -124,7 +155,7 @@ export BOSS_ZHILIAN_COOKIE='...'
 export BOSS_QIANCHENG_COOKIE='...'
 ```
 
-`status` 只输出环境变量名、是否存在以及 `env_cookie_present|missing`，从不输出值。输出错误也会脱敏。
+`status` 和 `doctor` 只输出环境变量名、会话/导出引用是否存在以及安全状态类别，从不输出 Cookie、文件路径或内容。输出错误也会脱敏。
 
 ## MCP
 
@@ -139,15 +170,18 @@ MCP 客户端命令为 `boss mcp`。stdio 服务支持 MCP `2025-03-26` 的 `ini
 - `preset_add`, `preset_list`, `preset_show`, `preset_remove`
 - `watch_add`, `watch_list`, `watch_show`, `watch_run`, `watch_remove`
 - `resume_init`, `resume_list`, `resume_show`, `resume_set`, `resume_skills`, `resume_clone`, `resume_diff`, `resume_remove`
+- `keyword_reply_add`, `keyword_reply_list`, `keyword_reply_remove`, `keyword_reply_match`
 - `stats`, `clean_preview`
 
 `export_jobs` 只返回结构化数据，不接受输出路径，也不会通过 MCP 写文件。
+`login` 与 `logout` 特意仅保留在本机 CLI，MCP 没有对应工具、参数或凭据文件入口。
 `clean_preview` 永远只预览，MCP 不会移动或移除文件。CLI 的确认 clean 仅在 Linux 可用：
-它把六个已知活动 JSON 文件原子移动到 `.bosskit-clean-archive/<事务>/`，返回每个恢复路径，
+它把七个已知活动 JSON 文件原子移动到 `.bosskit-clean-archive/<事务>/`，返回每个恢复路径，
 不执行 unlink。若并发写入阻止错误回滚，文件会移动到数据根目录下经过验证的私有
 `.bosskit-clean-recovery-<事务>/`，错误仅报告验证成功的恢复路径；其他平台仅支持预览。
 监视仅在显式调用 `watch run` 时顺序执行只读搜索，
-没有后台调度。简历功能只管理 `resumes.json` 中的本地类型化文档，不与招聘平台同步。
+没有后台调度。简历功能只管理 `resumes.json` 中的本地类型化文档，不与招聘平台同步。关键词回复
+只管理 `reply_rules.json` 并返回本地建议，永不发送平台消息。
 
 参数采用严格 JSON Schema；畸形参数返回 JSON-RPC `-32602`，有效调用中的执行错误才返回 `isError: true`。
 

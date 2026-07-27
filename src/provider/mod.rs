@@ -61,10 +61,6 @@ pub(crate) fn stable_id(platform: Platform, remote_id: &str, url: &str) -> Strin
     format!("{}-{:x}", platform.as_str(), hasher.finalize())
 }
 
-pub(crate) fn cookie(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
 pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
 ) -> Result<serde_json::Value, BossError> {

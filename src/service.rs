@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::auth::{AuthStore, read_manual_cookie};
 use crate::config::{AppConfig, ConfigChange, ConfigEntry, ConfigStore};
 use crate::export::{ExportOptions, ExportResult, ExportSource, structured_jobs, write_export};
 use crate::history::{HistoryProviderSummary, SearchHistoryEntry, SearchHistoryStore};
@@ -22,6 +23,7 @@ use crate::preset::{Preset, PresetStore};
 use crate::provider::{
     JobProvider, QianchengProvider, SearchRequest, ZhilianProvider, ZhipinProvider, http_client,
 };
+use crate::reply::{ReplyMatch, ReplyRule, ReplyStore};
 use crate::resume::{ResumeDiff, ResumeDocument, ResumeStore, export_document};
 use crate::schema::{SchemaFormat, render};
 use crate::shortlist::{ShortlistComparison, ShortlistEntry, ShortlistStore};
@@ -104,8 +106,10 @@ pub struct BossService {
     shortlist: ShortlistStore,
     history: SearchHistoryStore,
     presets: PresetStore,
+    reply_rules: ReplyStore,
     watches: WatchStore,
     resumes: ResumeStore,
+    auth: AuthStore,
     providers: Vec<Box<dyn JobProvider>>,
 }
 
@@ -118,19 +122,25 @@ impl BossService {
     pub(crate) fn from_paths(paths: DataPaths) -> Result<Self, BossError> {
         let config = ConfigStore::from_paths(&paths)?;
         let client = http_client(config.effective().request_timeout_secs)?;
+        let auth = AuthStore::from_paths(&paths);
+        let zhipin_cookie = auth.runtime_cookie(Platform::Zhipin);
+        let zhilian_cookie = auth.runtime_cookie(Platform::Zhilian);
+        let qiancheng_cookie = auth.runtime_cookie(Platform::Qiancheng);
         Ok(Self {
             cache: JobCache::from_paths(&paths),
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
             paths,
             config,
+            auth,
             providers: vec![
-                Box::new(ZhipinProvider::new(client.clone())),
-                Box::new(ZhilianProvider::new(client.clone())),
-                Box::new(QianchengProvider::new(client)),
+                Box::new(ZhipinProvider::new(client.clone(), zhipin_cookie)),
+                Box::new(ZhilianProvider::new(client.clone(), zhilian_cookie)),
+                Box::new(QianchengProvider::new(client, qiancheng_cookie)),
             ],
         })
     }
@@ -182,25 +192,36 @@ impl BossService {
         json!({"count":cities.len(),"cities":cities})
     }
 
-    /// Reports configured cookie presence without exposing values.
+    /// Reports configured authentication state without exposing values or paths.
     #[must_use]
     pub fn status(&self, platform: Option<Platform>) -> Value {
         let providers: Vec<Value> = selected_platforms(platform)
             .into_iter()
             .map(|selected| {
-                let variable = cookie_env(selected);
-                let present = std::env::var(variable).is_ok_and(|value| !value.is_empty());
+                let variable = AuthStore::cookie_env(selected);
+                let env_present = AuthStore::environment_cookie(selected).is_some();
+                let stored_session_present = self.auth.has_session(selected);
+                let registered_export_present = self.auth.has_registered_export(selected);
                 json!({
                     "platform":selected,
                     "cookie_env":variable,
-                    "present":present,
-                    "auth_state":if present {"env_cookie_present"} else {"missing"}
+                    "present":env_present,
+                    "stored_session_present":stored_session_present,
+                    "registered_export_present":registered_export_present,
+                    "auth_state":if env_present {
+                        "env_cookie_present"
+                    } else if stored_session_present {
+                        "stored_session_present"
+                    } else {
+                        "missing"
+                    }
                 })
             })
             .collect();
         json!({
             "network_checked":false,
             "configured_default":self.config.effective().platform,
+            "auth_store":self.auth.health().as_str(),
             "providers":providers
         })
     }
@@ -212,6 +233,8 @@ impl BossService {
             &self.paths,
             &self.cache,
             &self.shortlist,
+            &self.reply_rules,
+            &self.auth,
             self.providers.len(),
             platform,
         )
@@ -223,7 +246,108 @@ impl BossService {
         let paths = DataPaths::discover();
         let cache = JobCache::from_paths(&paths);
         let shortlist = ShortlistStore::from_paths(&paths);
-        diagnose_local(&paths, &cache, &shortlist, 3, platform)
+        let reply_rules = ReplyStore::from_paths(&paths);
+        let auth = AuthStore::from_paths(&paths);
+        diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
+    }
+
+    /// Locally imports or selects a Cookie source without making a network request.
+    pub fn login(
+        &mut self,
+        platform: Option<Platform>,
+        credential_file: Option<&Path>,
+        manual: bool,
+    ) -> Result<Value, BossError> {
+        if credential_file.is_some() && platform.is_none() {
+            return Err(BossError::InvalidArgument(
+                "--credential-file requires exactly one concrete --platform".to_owned(),
+            ));
+        }
+        if credential_file.is_some() && manual {
+            return Err(BossError::InvalidArgument(
+                "--credential-file cannot be combined with --manual".to_owned(),
+            ));
+        }
+        let results = selected_platforms(platform)
+            .into_iter()
+            .map(|selected| self.login_platform(selected, credential_file, manual))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({
+            "network_checked":false,
+            "verification":"local_unverified",
+            "results":results
+        }))
+    }
+
+    /// Removes local sessions and registered source references, never external files.
+    pub fn logout(&mut self, platform: Option<Platform>, yes: bool) -> Result<Value, BossError> {
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "logout requires --yes".to_owned(),
+            ));
+        }
+        let results = selected_platforms(platform)
+            .into_iter()
+            .map(|selected| {
+                Ok(json!({
+                    "platform":selected,
+                    "revoked":self.auth.revoke(selected)?
+                }))
+            })
+            .collect::<Result<Vec<_>, BossError>>()?;
+        Ok(json!({"network_checked":false,"results":results}))
+    }
+
+    fn login_platform(
+        &mut self,
+        platform: Platform,
+        credential_file: Option<&Path>,
+        manual: bool,
+    ) -> Result<Value, BossError> {
+        if manual {
+            return self.manual_login_result(platform);
+        }
+        if let Some(path) = credential_file {
+            if let Ok(cookie) = self.auth.read_export(platform, path) {
+                self.auth.store_file_session(platform, path, cookie)?;
+                return Ok(login_outcome(
+                    platform,
+                    "stored_unverified",
+                    "credential_file",
+                ));
+            }
+            return self.manual_login_result(platform);
+        }
+        if let Some(cookie) = AuthStore::environment_cookie(platform) {
+            self.auth.store_session(platform, cookie)?;
+            return Ok(login_outcome(platform, "stored_unverified", "environment"));
+        }
+        if let Ok(Some(cookie)) = self.auth.registered_export_cookie(platform) {
+            self.auth.store_session(platform, cookie)?;
+            return Ok(login_outcome(
+                platform,
+                "stored_unverified",
+                "registered_credential_file",
+            ));
+        }
+        if self.auth.has_session(platform) {
+            return Ok(login_outcome(
+                platform,
+                "stored_unverified",
+                "stored_session",
+            ));
+        }
+        self.manual_login_result(platform)
+    }
+
+    fn manual_login_result(&mut self, platform: Platform) -> Result<Value, BossError> {
+        match read_manual_cookie(platform)? {
+            Some(cookie) => {
+                self.auth.store_session(platform, cookie)?;
+                Ok(login_outcome(platform, "stored_unverified", "manual"))
+            }
+            None => Ok(login_outcome(platform, "manual_login_required", "none")),
+        }
     }
 
     /// Renders the shared capability registry.
@@ -547,6 +671,26 @@ impl BossService {
         self.presets.remove(name)
     }
 
+    /// Adds or updates one strictly local keyword-reply rule.
+    pub fn reply_add(&self, keyword: &str, reply: &str) -> Result<ReplyRule, BossError> {
+        self.reply_rules.add(keyword, reply, now_seconds()?)
+    }
+
+    /// Lists strictly local keyword-reply rules in stored order.
+    pub fn reply_list(&self) -> Result<Vec<ReplyRule>, BossError> {
+        self.reply_rules.list()
+    }
+
+    /// Removes one strictly local keyword-reply rule.
+    pub fn reply_remove(&self, keyword: &str) -> Result<ReplyRule, BossError> {
+        self.reply_rules.remove(keyword)
+    }
+
+    /// Matches local text and returns a suggestion without contacting any platform.
+    pub fn reply_match(&self, message: &str) -> Result<ReplyMatch, BossError> {
+        self.reply_rules.match_message(message)
+    }
+
     /// Adds a foreground watch with a copied search snapshot.
     pub fn watch_add(&self, name: &str, spec: SearchSpec) -> Result<Watch, BossError> {
         let spec = self.validate_search_spec(spec)?;
@@ -790,6 +934,7 @@ impl BossService {
                 "total_failure":history.len().saturating_sub(successful)},
             "shortlist":self.shortlist.list(None)?.len(),
             "presets":self.presets.list()?.len(),
+            "reply_rules":self.reply_rules.list()?.len(),
             "watches":self.watches.list()?.len(),
             "resumes":self.resumes.list()?.len(),
             "file_bytes":sizes
@@ -1547,6 +1692,7 @@ fn known_file_sizes(paths: &DataPaths) -> Result<Value, BossError> {
         ("history", paths.history()),
         ("shortlist", paths.shortlist()),
         ("presets", paths.presets()),
+        ("reply_rules", paths.reply_rules()),
         ("watches", paths.watches()),
         ("resumes", paths.resumes()),
         ("config", paths.config()),
@@ -1574,6 +1720,7 @@ fn clean_targets(
             ("history", paths.history()),
             ("shortlist", paths.shortlist()),
             ("presets", paths.presets()),
+            ("reply_rules", paths.reply_rules()),
             ("watches", paths.watches()),
             ("resumes", paths.resumes()),
         ]
@@ -1592,6 +1739,8 @@ fn diagnose_local(
     paths: &DataPaths,
     cache: &JobCache,
     shortlist: &ShortlistStore,
+    reply_rules: &ReplyStore,
+    auth: &AuthStore,
     provider_count: usize,
     platform: Option<Platform>,
 ) -> Value {
@@ -1635,6 +1784,27 @@ fn diagnose_local(
         shortlist_result.err().map(|error| error.to_string()),
     ));
 
+    let reply_rules_result = reply_rules.check_readable();
+    has_error |= reply_rules_result.is_err();
+    checks.push(check(
+        "reply_rules",
+        if reply_rules_result.is_ok() {
+            "ok"
+        } else {
+            "error"
+        },
+        reply_rules_result.err().map(|error| error.to_string()),
+    ));
+
+    let auth_store_status = auth.health().as_str();
+    let auth_store_warn = auth_store_status == "unavailable";
+    has_warn |= auth_store_warn;
+    checks.push(check(
+        "auth_store",
+        if auth_store_warn { "warn" } else { "ok" },
+        auth_store_warn.then(|| "private credential store was ignored".to_owned()),
+    ));
+
     let registered = provider_count == 3;
     has_error |= !registered;
     checks.push(check(
@@ -1644,16 +1814,20 @@ fn diagnose_local(
     ));
 
     for selected in selected_platforms(platform) {
-        let variable = cookie_env(selected);
-        let present = std::env::var(variable).is_ok_and(|value| !value.is_empty());
+        let variable = AuthStore::cookie_env(selected);
+        let env_present = AuthStore::environment_cookie(selected).is_some();
+        let stored_present = auth.has_session(selected);
+        let present = env_present || stored_present;
         has_warn |= !present;
         checks.push(json!({
             "name":format!("cookie_{}",selected.as_str()),
             "status":if present {"ok"} else {"warn"},
-            "message":if present {
+            "message":if env_present {
                 format!("{variable} is present")
+            } else if stored_present {
+                "private stored session is present".to_owned()
             } else {
-                format!("{variable} is missing")
+                format!("{variable} and private stored session are missing")
             }
         }));
     }
@@ -1664,19 +1838,15 @@ fn diagnose_local(
     })
 }
 
+fn login_outcome(platform: Platform, state: &'static str, source: &'static str) -> Value {
+    json!({"platform":platform,"state":state,"source":source})
+}
+
 fn selected_platforms(platform: Option<Platform>) -> Vec<Platform> {
     platform.map_or_else(
         || vec![Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng],
         |selected| vec![selected],
     )
-}
-
-fn cookie_env(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Zhipin => "BOSS_ZHIPIN_COOKIE",
-        Platform::Zhilian => "BOSS_ZHILIAN_COOKIE",
-        Platform::Qiancheng => "BOSS_QIANCHENG_COOKIE",
-    }
 }
 
 fn check(name: &str, status: &str, message: Option<String>) -> Value {
@@ -1813,8 +1983,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&DataPaths::new(directory.path())),
             history: SearchHistoryStore::from_paths(&DataPaths::new(directory.path())),
             presets: PresetStore::from_paths(&DataPaths::new(directory.path())),
+            reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![
                 Box::new(MockProvider {
                     platform: Platform::Zhipin,
@@ -1855,8 +2027,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&DataPaths::new(directory.path())),
             history: SearchHistoryStore::from_paths(&DataPaths::new(directory.path())),
             presets: PresetStore::from_paths(&DataPaths::new(directory.path())),
+            reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: true,
@@ -1878,8 +2052,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&DataPaths::new(directory.path())),
             history: SearchHistoryStore::from_paths(&DataPaths::new(directory.path())),
             presets: PresetStore::from_paths(&DataPaths::new(directory.path())),
+            reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: true,
@@ -1986,8 +2162,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: true,
@@ -2017,8 +2195,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: false,
@@ -2048,8 +2228,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: true,
@@ -2504,8 +2686,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
                 succeeds: false,
@@ -2539,8 +2723,10 @@ mod tests {
             shortlist: ShortlistStore::from_paths(&paths),
             history: SearchHistoryStore::from_paths(&paths),
             presets: PresetStore::from_paths(&paths),
+            reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            auth: AuthStore::from_paths(&paths),
             providers: vec![
                 Box::new(MockProvider {
                     platform: Platform::Zhipin,

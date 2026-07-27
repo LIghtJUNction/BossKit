@@ -620,6 +620,37 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 .map_err(ToolCallError::Execution)?;
             Ok((success_value(document), false))
         }
+        "keyword_reply_add" => {
+            validate_allowed(&arguments, &["keyword", "reply"])?;
+            let rule = service
+                .reply_add(
+                    required_string(&arguments, "keyword")?,
+                    required_string(&arguments, "reply")?,
+                )
+                .map_err(ToolCallError::Execution)?;
+            Ok((success_value(rule), false))
+        }
+        "keyword_reply_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(service.reply_list().map_err(ToolCallError::Execution)?),
+                false,
+            ))
+        }
+        "keyword_reply_remove" => {
+            validate_allowed(&arguments, &["keyword"])?;
+            let rule = service
+                .reply_remove(required_string(&arguments, "keyword")?)
+                .map_err(ToolCallError::Execution)?;
+            Ok((success_value(rule), false))
+        }
+        "keyword_reply_match" => {
+            validate_allowed(&arguments, &["message"])?;
+            let suggestion = service
+                .reply_match(required_string(&arguments, "message")?)
+                .map_err(ToolCallError::Execution)?;
+            Ok((success_value(suggestion), false))
+        }
         "stats" => {
             validate_allowed(&arguments, &["days"])?;
             let days = positive_u32(&arguments, "days", 30)?;
@@ -640,6 +671,7 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 "history",
                 "shortlist",
                 "presets",
+                "reply_rules",
                 "watches",
                 "resumes",
                 "all",
@@ -988,6 +1020,101 @@ mod tests {
             assert_eq!(response["result"]["isError"], false, "{response}");
         }
         assert!(directory.path().join("presets.json").exists());
+    }
+
+    #[tokio::test]
+    async fn keyword_reply_tools_are_strict_and_return_local_suggestions() {
+        let registry = tool_registry();
+        for (name, fields) in [
+            ("keyword_reply_add", &["keyword", "reply"][..]),
+            ("keyword_reply_list", &[][..]),
+            ("keyword_reply_remove", &["keyword"][..]),
+            ("keyword_reply_match", &["message"][..]),
+        ] {
+            let tool = registry
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("registered tool");
+            let properties: BTreeSet<&str> = tool.input_schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(properties, fields.iter().copied().collect(), "{name}");
+            assert_eq!(tool.input_schema["additionalProperties"], false, "{name}");
+        }
+
+        let directory = tempdir().expect("tempdir");
+        let service =
+            BossService::from_paths(crate::DataPaths::new(directory.path())).expect("service");
+        let add = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"keyword_reply_add","arguments":{"keyword":"Offer","reply":"Thanks"}
+            }}),
+        )
+        .await
+        .expect("add response");
+        assert_eq!(add["result"]["isError"], false);
+
+        let matched = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"keyword_reply_match","arguments":{"message":"NEW OFFER"}
+            }}),
+        )
+        .await
+        .expect("match response");
+        let suggestion: Value = serde_json::from_str(
+            matched["result"]["content"][0]["text"]
+                .as_str()
+                .expect("suggestion text"),
+        )
+        .expect("suggestion json");
+        assert_eq!(
+            (
+                suggestion["data"]["matched"].as_bool(),
+                suggestion["data"]["rule"]["reply"].as_str()
+            ),
+            (Some(true), Some("Thanks"))
+        );
+
+        let listed = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"keyword_reply_list","arguments":{}
+            }}),
+        )
+        .await
+        .expect("list response");
+        let rules: Value = serde_json::from_str(
+            listed["result"]["content"][0]["text"]
+                .as_str()
+                .expect("list text"),
+        )
+        .expect("list json");
+        assert_eq!(rules["data"].as_array().map(Vec::len), Some(1));
+
+        let removed = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"keyword_reply_remove","arguments":{"keyword":"offer"}
+            }}),
+        )
+        .await
+        .expect("remove response");
+        assert_eq!(removed["result"]["isError"], false);
+
+        let rejected = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+                "name":"keyword_reply_add","arguments":{"keyword":"Offer","reply":"Thanks","extra":true}
+            }}),
+        )
+        .await
+        .expect("invalid response");
+        assert_eq!(rejected["error"]["code"], -32602);
     }
 
     #[tokio::test]

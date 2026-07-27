@@ -35,6 +35,11 @@ enum Command {
         #[command(subcommand)]
         command: PresetCommand,
     },
+    /// 管理只在本地建议文本的关键词回复
+    Reply {
+        #[command(subcommand)]
+        command: ReplyCommand,
+    },
     /// 管理显式前台职位监视
     Watch {
         #[command(subcommand)]
@@ -100,6 +105,22 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// 本地导入或选择登录 Cookie，不联网验证
+    Login {
+        #[arg(long, value_enum)]
+        platform: Option<PlatformArg>,
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "credential_file")]
+        manual: bool,
+    },
+    /// 撤销本地保存的登录会话和导出文件引用
+    Logout {
+        #[arg(long, value_enum)]
+        platform: Option<PlatformArg>,
+        #[arg(long)]
+        yes: bool,
     },
     /// 检查本地 Cookie 环境状态，不联网
     Status {
@@ -171,6 +192,20 @@ enum PresetCommand {
     /// 删除预设
     #[command(visible_alias = "remove")]
     Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum ReplyCommand {
+    /// 添加或更新本地关键词回复
+    Add { keyword: String, reply: String },
+    /// 列出本地关键词回复
+    #[command(visible_alias = "list")]
+    Ls,
+    /// 移除本地关键词回复
+    #[command(visible_alias = "remove")]
+    Rm { keyword: String },
+    /// 按本地消息文本返回建议，不发送平台消息
+    Match { message: String },
 }
 
 #[derive(Clone, Args)]
@@ -361,6 +396,8 @@ enum CleanTargetArg {
     History,
     Shortlist,
     Presets,
+    #[value(name = "reply_rules", alias = "reply-rules")]
+    ReplyRules,
     Watches,
     Resumes,
     All,
@@ -373,6 +410,7 @@ impl CleanTargetArg {
             Self::History => "history",
             Self::Shortlist => "shortlist",
             Self::Presets => "presets",
+            Self::ReplyRules => "reply_rules",
             Self::Watches => "watches",
             Self::Resumes => "resumes",
             Self::All => "all",
@@ -505,6 +543,18 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.preset_remove(&name)?));
             }
         },
+        Command::Reply { command } => match command {
+            ReplyCommand::Add { keyword, reply } => {
+                print_json(&Envelope::success(service.reply_add(&keyword, &reply)?));
+            }
+            ReplyCommand::Ls => print_json(&Envelope::success(service.reply_list()?)),
+            ReplyCommand::Rm { keyword } => {
+                print_json(&Envelope::success(service.reply_remove(&keyword)?));
+            }
+            ReplyCommand::Match { message } => {
+                print_json(&Envelope::success(service.reply_match(&message)?));
+            }
+        },
         Command::Watch { command } => match command {
             WatchCommand::Add {
                 name,
@@ -633,6 +683,18 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.config_reset(key.as_deref())?));
             }
         },
+        Command::Login {
+            platform,
+            credential_file,
+            manual,
+        } => print_json(&Envelope::success(service.login(
+            platform.and_then(PlatformArg::selected),
+            credential_file.as_deref(),
+            manual,
+        )?)),
+        Command::Logout { platform, yes } => print_json(&Envelope::success(
+            service.logout(platform.and_then(PlatformArg::selected), yes)?,
+        )),
         Command::Status { platform } => print_json(&Envelope::success(
             service.status(platform.and_then(PlatformArg::selected)),
         )),

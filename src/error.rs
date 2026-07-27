@@ -70,9 +70,15 @@ pub enum BossError {
     /// Resume persistence or validation failed.
     #[error("resume failed: {0}")]
     Resume(String),
+    /// Local keyword-reply rule persistence or lookup failed.
+    #[error("reply rule failed: {0}")]
+    Reply(String),
     /// Guarded cleanup failed.
     #[error("cleanup failed: {0}")]
     Cleanup(String),
+    /// Local authentication setup or private credential storage failed.
+    #[error("authentication setup failed: {0}")]
+    Authentication(String),
 }
 
 impl BossError {
@@ -104,7 +110,9 @@ impl BossError {
             Self::Preset(_) => "preset_error",
             Self::Watch(_) => "watch_error",
             Self::Resume(_) => "resume_error",
+            Self::Reply(_) => "reply_error",
             Self::Cleanup(_) => "cleanup_error",
+            Self::Authentication(_) => "authentication_error",
         }
     }
 
@@ -118,6 +126,7 @@ impl BossError {
                 | Self::Preset(_)
                 | Self::Watch(_)
                 | Self::Resume(_)
+                | Self::Reply(_)
                 | Self::Cleanup(_)
         )
     }

@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 use crate::BossError;
+use crate::reply::{MAX_KEYWORD_CHARS, MAX_MESSAGE_CHARS, MAX_REPLY_CHARS};
 
 /// Supported capability schema wrapper.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -239,6 +240,33 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             },"additionalProperties":false}),
         ),
         tool(
+            "keyword_reply_add",
+            "Add or update a local keyword-reply rule; it never sends a platform message",
+            json!({"type":"object","required":["keyword","reply"],"properties":{
+                "keyword":{"type":"string","minLength":1,"maxLength":MAX_KEYWORD_CHARS},
+                "reply":{"type":"string","minLength":1,"maxLength":MAX_REPLY_CHARS}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "keyword_reply_list",
+            "List local keyword-reply rules",
+            empty(),
+        ),
+        tool(
+            "keyword_reply_remove",
+            "Remove one local keyword-reply rule",
+            json!({"type":"object","required":["keyword"],"properties":{
+                "keyword":{"type":"string","minLength":1,"maxLength":MAX_KEYWORD_CHARS}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "keyword_reply_match",
+            "Match local text deterministically and return a suggestion only; never sends a platform message",
+            json!({"type":"object","required":["message"],"properties":{
+                "message":{"type":"string","minLength":1,"maxLength":MAX_MESSAGE_CHARS}
+            },"additionalProperties":false}),
+        ),
+        tool(
             "stats",
             "Summarize exact strictly local workflow data",
             json!({"type":"object","properties":{
@@ -249,7 +277,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "clean_preview",
             "Preview exact known local files; MCP never archives or removes them",
             json!({"type":"object","required":["target"],"properties":{
-                "target":{"type":"string","enum":["jobs","history","shortlist","presets","watches","resumes","all"]}
+                "target":{"type":"string","enum":["jobs","history","shortlist","presets","reply_rules","watches","resumes","all"]}
             },"additionalProperties":false}),
         ),
     ]
@@ -307,7 +335,9 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                 "mcp_tools":tools,
                 "notes":{
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
-                    "history":"History is BossKit local search-attempt history, not remote platform browsing history."
+                    "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
+                    "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
+                    "authentication":"login and logout are CLI-only private local credential operations. They are deliberately unavailable through MCP and login never performs a network validation request."
                 },
                 "risk":{"remote_writes":false,"local_writes":local_writes}
             })
@@ -363,6 +393,8 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("config get", &[]),
         ("config set", &["config"]),
         ("config reset", &["config"]),
+        ("login", &["private_auth_store"]),
+        ("logout", &["private_auth_store"]),
         ("status", &[]),
         ("doctor", &["doctor_probe"]),
         ("schema", &[]),
@@ -375,6 +407,10 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("preset ls", &[]),
         ("preset show", &[]),
         ("preset rm", &["presets"]),
+        ("reply add", &["reply_rules"]),
+        ("reply ls", &[]),
+        ("reply rm", &["reply_rules"]),
+        ("reply match", &[]),
         ("watch add", &["watches"]),
         ("watch ls", &[]),
         ("watch show", &[]),
@@ -398,6 +434,7 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "history",
                 "shortlist",
                 "presets",
+                "reply_rules",
                 "watches",
                 "resumes",
             ],
@@ -410,6 +447,7 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "jobs_cache",
                 "shortlist",
                 "presets",
+                "reply_rules",
                 "watches",
                 "resumes",
             ],
@@ -445,7 +483,20 @@ mod tests {
                 native["mcp_tools"].as_array().map(Vec::len),
                 tool_registry().len(),
             ),
-            (Some(35), 35)
+            (Some(39), 39)
+        );
+    }
+
+    #[test]
+    fn authentication_commands_are_native_only() {
+        let native = render(SchemaFormat::Native).expect("native");
+        let commands = native["commands"].as_array().expect("commands");
+        assert!(commands.iter().any(|command| command["name"] == "login"));
+        assert!(commands.iter().any(|command| command["name"] == "logout"));
+        assert!(
+            tool_registry()
+                .iter()
+                .all(|tool| !matches!(tool.name, "login" | "logout"))
         );
     }
 

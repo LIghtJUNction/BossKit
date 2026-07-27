@@ -3,21 +3,22 @@ use reqwest::header::{ACCEPT, COOKIE, REFERER};
 use serde_json::Value;
 
 use super::{
-    JobProvider, SearchRequest, cookie, first_text, overlay_list, overlay_text, parse_url,
-    required_url, send_json, send_text, stable_id, text_list,
+    JobProvider, SearchRequest, first_text, overlay_list, overlay_text, parse_url, required_url,
+    send_json, send_text, stable_id, text_list,
 };
 use crate::{BossError, Job, Platform};
 
 /// 前程无忧 / 51job read-only search adapter.
 pub struct QianchengProvider {
     client: reqwest::Client,
+    cookie: Option<String>,
 }
 
 impl QianchengProvider {
     /// Creates the adapter.
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub fn new(client: reqwest::Client, cookie: Option<String>) -> Self {
+        Self { client, cookie }
     }
 
     /// Builds the public search endpoint URL.
@@ -160,7 +161,7 @@ impl JobProvider for QianchengProvider {
             .get(Self::search_url(request)?)
             .header(ACCEPT, "application/json")
             .header(REFERER, "https://we.51job.com/");
-        if let Some(value) = cookie("BOSS_QIANCHENG_COOKIE") {
+        if let Some(value) = self.cookie.as_deref() {
             builder = builder.header(COOKIE, value);
         }
         Self::parse(&send_json(builder).await?)
@@ -172,7 +173,7 @@ impl JobProvider for QianchengProvider {
             .get(Self::detail_url(job)?)
             .header(ACCEPT, "text/html,application/xhtml+xml")
             .header(REFERER, "https://we.51job.com/");
-        if let Some(value) = cookie("BOSS_QIANCHENG_COOKIE") {
+        if let Some(value) = self.cookie.as_deref() {
             builder = builder.header(COOKIE, value);
         }
         Self::parse_detail_html(job, &send_text(builder).await?)

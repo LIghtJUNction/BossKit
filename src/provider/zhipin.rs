@@ -3,21 +3,22 @@ use reqwest::header::{ACCEPT, COOKIE, REFERER};
 use serde_json::Value;
 
 use super::{
-    JobProvider, SearchRequest, cookie, first_text, overlay_list, overlay_text, parse_url,
-    required_url, send_json, stable_id, text_list,
+    JobProvider, SearchRequest, first_text, overlay_list, overlay_text, parse_url, required_url,
+    send_json, stable_id, text_list,
 };
 use crate::{BossError, Job, Platform};
 
 /// BOSS 直聘 read-only search adapter.
 pub struct ZhipinProvider {
     client: reqwest::Client,
+    cookie: Option<String>,
 }
 
 impl ZhipinProvider {
     /// Creates the adapter.
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub fn new(client: reqwest::Client, cookie: Option<String>) -> Self {
+        Self { client, cookie }
     }
 
     /// Builds the public search endpoint URL.
@@ -168,7 +169,7 @@ impl JobProvider for ZhipinProvider {
             .get(Self::search_url(request)?)
             .header(ACCEPT, "application/json")
             .header(REFERER, "https://www.zhipin.com/web/geek/job");
-        if let Some(value) = cookie("BOSS_ZHIPIN_COOKIE") {
+        if let Some(value) = self.cookie.as_deref() {
             builder = builder.header(COOKIE, value);
         }
         Self::parse(&send_json(builder).await?)
@@ -180,7 +181,7 @@ impl JobProvider for ZhipinProvider {
             .get(Self::detail_url(job)?)
             .header(ACCEPT, "application/json")
             .header(REFERER, &job.url);
-        if let Some(value) = cookie("BOSS_ZHIPIN_COOKIE") {
+        if let Some(value) = self.cookie.as_deref() {
             builder = builder.header(COOKIE, value);
         }
         Self::parse_detail(job, &send_json(builder).await?)
