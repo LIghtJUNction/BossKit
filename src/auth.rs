@@ -134,6 +134,24 @@ impl AuthStore {
         self.entry(platform).credential_file.is_some()
     }
 
+    /// Returns the stable, data-root-local default export path for one platform.
+    #[must_use]
+    pub fn default_export_path(&self, platform: Platform) -> PathBuf {
+        self.directory.join(format!("{}.cookie", platform.as_str()))
+    }
+
+    /// Reads a default export from an existing private auth directory only.
+    #[must_use]
+    pub fn default_export_cookie(&self, platform: Platform) -> Option<String> {
+        if !fs::symlink_metadata(&self.directory)
+            .is_ok_and(|metadata| private_directory_metadata(&metadata))
+        {
+            return None;
+        }
+        self.read_export(platform, &self.default_export_path(platform))
+            .ok()
+    }
+
     /// Reads and validates an explicitly selected credential export.
     pub fn read_export(&self, platform: Platform, path: &Path) -> Result<String, BossError> {
         let bytes = read_export_file(path)?;
@@ -652,6 +670,65 @@ mod tests {
         assert!(
             parse_cookie_export(b"session=fixture\r\nInjected: value", Platform::Zhipin).is_err()
         );
+    }
+
+    #[test]
+    fn default_export_paths_are_data_root_local_and_platform_specific() {
+        let directory = tempdir().expect("tempdir");
+        let store = AuthStore::from_paths(&DataPaths::new(directory.path()));
+        let auth_directory = directory.path().join(".auth");
+        assert_eq!(
+            store.default_export_path(Platform::Zhipin),
+            auth_directory.join("zhipin.cookie")
+        );
+        assert_eq!(
+            store.default_export_path(Platform::Zhilian),
+            auth_directory.join("zhilian.cookie")
+        );
+        assert_eq!(
+            store.default_export_path(Platform::Qiancheng),
+            auth_directory.join("qiancheng.cookie")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_export_cookie_requires_a_private_directory_and_safe_file() {
+        let directory = tempdir().expect("tempdir");
+        let store = AuthStore::from_paths(&DataPaths::new(directory.path()));
+        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
+
+        let auth_directory = directory.path().join(".auth");
+        fs::create_dir(&auth_directory).expect("create auth directory");
+        fs::set_permissions(&auth_directory, fs::Permissions::from_mode(0o700))
+            .expect("secure auth directory");
+        let source = store.default_export_path(Platform::Zhipin);
+        fs::write(&source, b"session=fixture").expect("fixture");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).expect("open export");
+        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("secure export");
+        assert_eq!(
+            store.default_export_cookie(Platform::Zhipin),
+            Some("session=fixture".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_export_cookie_does_not_follow_an_auth_directory_symlink() {
+        let data_root = tempdir().expect("data root");
+        let external_directory = tempdir().expect("external directory");
+        fs::set_permissions(external_directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure external directory");
+        let external_source = external_directory.path().join("zhipin.cookie");
+        fs::write(&external_source, b"session=external-fixture").expect("fixture");
+        fs::set_permissions(&external_source, fs::Permissions::from_mode(0o600))
+            .expect("secure external export");
+        std::os::unix::fs::symlink(external_directory.path(), data_root.path().join(".auth"))
+            .expect("symlink auth directory");
+
+        let store = AuthStore::from_paths(&DataPaths::new(data_root.path()));
+        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
     }
 
     #[cfg(unix)]

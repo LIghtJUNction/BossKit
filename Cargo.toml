@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Read-only multi-platform job search CLI and MCP server"
+repository = "https://github.com/LIghtJUNction/BossKit"
+readme = "README.md"
 
 [[bin]]
 name = "boss"

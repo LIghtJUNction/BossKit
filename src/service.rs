@@ -322,6 +322,14 @@ impl BossService {
             self.auth.store_session(platform, cookie)?;
             return Ok(login_outcome(platform, "stored_unverified", "environment"));
         }
+        if let Some(cookie) = self.auth.default_export_cookie(platform) {
+            self.auth.store_session(platform, cookie)?;
+            return Ok(login_outcome(
+                platform,
+                "stored_unverified",
+                "default_credential_file",
+            ));
+        }
         if let Ok(Some(cookie)) = self.auth.registered_export_cookie(platform) {
             self.auth.store_session(platform, cookie)?;
             return Ok(login_outcome(

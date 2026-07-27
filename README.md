@@ -52,7 +52,7 @@ boss config reset page_size
 boss config reset
 
 boss login --platform zhipin --credential-file ./zhipin-cookies.txt
-boss login                         # 自动尝试环境变量、已登记导出文件、已保存会话
+boss login                         # 自动尝试全部平台的环境变量、默认导出文件、已登记导出文件、已保存会话
 boss login --platform zhilian --manual
 boss logout --platform zhipin --yes
 
@@ -101,6 +101,7 @@ boss mcp
 - `watches.json`：显式前台监视、完整去重的已见稳定 ID 和最后成功运行时间；不会截断后遗忘旧 ID
 - `resumes.json`：单一严格类型的本地简历集合
 - `.auth/sessions.json`：仅本机私有的登录 Cookie 和已登记导出文件引用；Unix 下目录为 `0700`、文件为 `0600`
+- `.auth/zhipin.cookie`、`.auth/zhilian.cookie`、`.auth/qiancheng.cookie`：可选的、用户放置的默认 Cookie 导出文件；只在 `boss login` 自动尝试中读取
 - `.bosskit-clean-archive/<事务>/`：Linux 确认 clean 后保留的同文件系统可恢复归档；不会被后续 clean 或 stats 当作活动数据
 
 写入使用数据根目录内的临时文件和原子替换。配置仅接受以下键，不接受 Cookie、Token、API key 或未知键：
@@ -132,14 +133,21 @@ boss mcp
 `boss cities` 会诚实列出当前三个适配器共同映射的 10 个逻辑城市：北京、上海、广州、深圳、杭州、成都、武汉、南京、苏州、西安。单平台搜索还可传该平台原生纯数字城市代码。
 
 `boss login` 只做本地 Cookie 导入和保存，**绝不发起登录或认证网络请求**；成功结果是
-`local_unverified`，后续正常的只读搜索请求才会体现 Cookie 是否仍有效。默认的自动顺序是：
-环境变量、已登记的导出文件、已保存会话；`--credential-file` 则只允许一个具体平台，并会立即导入且登记该文件，供之后的 `boss login` 再次自动尝试。
+`local_unverified`，后续正常的只读搜索请求才会体现 Cookie 是否仍有效。无参数的 `boss login` 会依次尝试全部三个平台；每个平台的自动顺序是：环境变量、默认导出文件、已登记的导出文件、已保存会话。`--credential-file` 则只允许一个具体平台，并会立即导入且登记该文件，供之后的 `boss login` 再次自动尝试。
+
+默认导出文件固定在最终数据根目录（下文以 `<BOSS_DATA_DIR>` 表示）中：
+
+- `<BOSS_DATA_DIR>/.auth/zhipin.cookie`
+- `<BOSS_DATA_DIR>/.auth/zhilian.cookie`
+- `<BOSS_DATA_DIR>/.auth/qiancheng.cookie`
+
+未设置 `BOSS_DATA_DIR` 时，`<BOSS_DATA_DIR>` 指前述规则解析出的实际数据根目录。默认文件不会被登记为自定义来源；缺失、权限不安全或格式无效时会静默跳过并继续后续自动来源。
 
 ```bash
 chmod 600 ./zhipin-cookies.txt
 boss login --platform zhipin --credential-file ./zhipin-cookies.txt
 boss login --platform zhipin --manual     # 仅 TTY，输入不会回显
-boss login                                # 依次尝试三个平台；非 TTY 时返回 manual_login_required
+boss login                                # 依次尝试全部三平台的默认来源；非 TTY 时返回 manual_login_required
 boss logout --platform zhipin --yes       # 只撤销本地会话和文件引用，不删除原导出文件
 ```
 

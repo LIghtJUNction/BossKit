@@ -338,6 +338,65 @@ fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn login_without_arguments_imports_all_private_default_exports_without_leaking_values() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().expect("temporary directory");
+    let auth_directory = directory.path().join(".auth");
+    std::fs::create_dir(&auth_directory).expect("create auth directory");
+    std::fs::set_permissions(&auth_directory, std::fs::Permissions::from_mode(0o700))
+        .expect("secure auth directory");
+    let fixtures = [
+        ("zhipin", "session=zhipin-default-fixture"),
+        ("zhilian", "session=zhilian-default-fixture"),
+        ("qiancheng", "session=qiancheng-default-fixture"),
+    ];
+    for (platform, cookie) in &fixtures {
+        let path = auth_directory.join(format!("{platform}.cookie"));
+        std::fs::write(&path, cookie).expect("write default export");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure default export");
+    }
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .env_remove("BOSS_ZHILIAN_COOKIE")
+        .env_remove("BOSS_QIANCHENG_COOKIE")
+        .arg("login")
+        .output()
+        .expect("login");
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
+    assert_eq!(login["data"]["network_checked"], false);
+    assert_eq!(login["data"]["verification"], "local_unverified");
+    assert_eq!(login["data"]["results"].as_array().map(Vec::len), Some(3));
+    for ((platform, cookie), result) in fixtures
+        .iter()
+        .zip(login["data"]["results"].as_array().expect("login results"))
+    {
+        assert_eq!(result["platform"], *platform);
+        assert_eq!(result["state"], "stored_unverified");
+        assert_eq!(result["source"], "default_credential_file");
+        assert!(!output_text.contains(cookie));
+    }
+
+    let status = run_json(directory.path(), &["status"]);
+    for provider in status["data"]["providers"].as_array().expect("providers") {
+        assert_eq!(provider["stored_session_present"], true);
+        assert_eq!(provider["registered_export_present"], false);
+    }
+}
+
 #[test]
 fn doctor_reports_invalid_config_as_local_error() {
     let directory = tempdir().expect("temporary directory");
