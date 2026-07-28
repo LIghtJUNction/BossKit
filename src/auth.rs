@@ -1,8 +1,7 @@
-//! Private local credential storage and deliberately bounded Cookie import.
+//! Private local Cookie session storage.
 //!
-//! This module never contacts a recruitment platform. It accepts only an
-//! explicitly selected or previously registered export file, never scans
-//! desktop-client stores, and never exposes Cookie values or source paths.
+//! This module never contacts a recruitment platform or reads Cookie export
+//! files. It stores only validated local sessions and never exposes values.
 
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -13,13 +12,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::data::atomic_write_private;
 use crate::{BossError, DataPaths, Platform};
 
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
-const MAX_EXPORT_BYTES: u64 = 64 * 1024;
+const MAX_AUTH_STORE_BYTES: u64 = 64 * 1024;
 
 /// Safe, value-free health of the private credential store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,7 +42,7 @@ impl AuthHealth {
     }
 }
 
-/// Local private session and registered export references.
+/// Local private Cookie sessions.
 #[derive(Clone, Debug)]
 pub struct AuthStore {
     directory: PathBuf,
@@ -69,8 +67,21 @@ struct AuthDocument {
 struct StoredAuth {
     #[serde(default)]
     cookie: Option<String>,
-    #[serde(default)]
-    credential_file: Option<PathBuf>,
+    #[serde(
+        default,
+        rename = "credential_file",
+        deserialize_with = "discard_legacy_credential_file",
+        skip_serializing
+    )]
+    legacy_credential_file: bool,
+}
+
+fn discard_legacy_credential_file<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 impl AuthStore {
@@ -84,12 +95,17 @@ impl AuthStore {
             Ok(Some(_)) | Err(()) => (AuthDocument::default(), AuthHealth::Unavailable),
             Ok(None) => (AuthDocument::default(), AuthHealth::Missing),
         };
-        Self {
+        let mut store = Self {
             directory,
             path,
             document,
             health,
+        };
+        if store.has_legacy_credential_file() && store.persist().is_err() {
+            store.document = AuthDocument::default();
+            store.health = AuthHealth::Unavailable;
         }
+        store
     }
 
     /// Returns the safe local store health.
@@ -128,30 +144,6 @@ impl AuthStore {
         self.session_cookie(platform).is_some()
     }
 
-    /// Returns whether a registered, user-selected export file exists in the store.
-    #[must_use]
-    pub fn has_registered_export(&self, platform: Platform) -> bool {
-        self.entry(platform).credential_file.is_some()
-    }
-
-    /// Returns the stable, data-root-local default export path for one platform.
-    #[must_use]
-    pub fn default_export_path(&self, platform: Platform) -> PathBuf {
-        self.directory.join(format!("{}.cookie", platform.as_str()))
-    }
-
-    /// Reads a default export from an existing private auth directory only.
-    #[must_use]
-    pub fn default_export_cookie(&self, platform: Platform) -> Option<String> {
-        if !fs::symlink_metadata(&self.directory)
-            .is_ok_and(|metadata| private_directory_metadata(&metadata))
-        {
-            return None;
-        }
-        self.read_export(platform, &self.default_export_path(platform))
-            .ok()
-    }
-
     /// Prepares the private root used for an isolated interactive browser profile.
     #[must_use]
     pub(crate) fn browser_profile_root(&self) -> Option<PathBuf> {
@@ -159,49 +151,17 @@ impl AuthStore {
         Some(self.directory.clone())
     }
 
-    /// Reads and validates an explicitly selected credential export.
-    pub fn read_export(&self, platform: Platform, path: &Path) -> Result<String, BossError> {
-        let bytes = read_export_file(path)?;
-        parse_cookie_export(&bytes, platform)
-    }
-
-    /// Re-reads the registered export for automatic login attempts.
-    pub fn registered_export_cookie(
-        &self,
-        platform: Platform,
-    ) -> Result<Option<String>, BossError> {
-        self.entry(platform)
-            .credential_file
-            .as_deref()
-            .map(|path| self.read_export(platform, path))
-            .transpose()
-    }
-
-    /// Stores one validated session without changing a registered export path.
+    /// Stores one validated session.
     pub fn store_session(&mut self, platform: Platform, cookie: String) -> Result<(), BossError> {
         validate_cookie(&cookie)?;
         self.entry_mut(platform).cookie = Some(cookie);
         self.persist()
     }
 
-    /// Stores one session and remembers the explicit export path used to import it.
-    pub fn store_file_session(
-        &mut self,
-        platform: Platform,
-        path: &Path,
-        cookie: String,
-    ) -> Result<(), BossError> {
-        validate_cookie(&cookie)?;
-        let entry = self.entry_mut(platform);
-        entry.cookie = Some(cookie);
-        entry.credential_file = Some(path.to_path_buf());
-        self.persist()
-    }
-
-    /// Removes the saved session and registered export reference for one platform.
+    /// Removes the saved session for one platform.
     pub fn revoke(&mut self, platform: Platform) -> Result<bool, BossError> {
         let entry = self.entry_mut(platform);
-        let changed = entry.cookie.take().is_some() | entry.credential_file.take().is_some();
+        let changed = entry.cookie.take().is_some();
         if changed {
             self.persist()?;
         }
@@ -226,6 +186,16 @@ impl AuthStore {
             Platform::Zhilian => &mut self.document.zhilian,
             Platform::Qiancheng => &mut self.document.qiancheng,
         }
+    }
+
+    fn has_legacy_credential_file(&self) -> bool {
+        [
+            &self.document.zhipin,
+            &self.document.zhilian,
+            &self.document.qiancheng,
+        ]
+        .into_iter()
+        .any(|entry| entry.legacy_credential_file)
     }
 
     fn persist(&mut self) -> Result<(), BossError> {
@@ -320,15 +290,15 @@ fn read_private_store_file(path: &Path) -> Result<Option<Vec<u8>>, ()> {
         Err(_) => return Err(()),
     };
     let metadata = file.metadata().map_err(|_| ())?;
-    if !private_file_metadata(&metadata) || metadata.len() > MAX_EXPORT_BYTES {
+    if !private_file_metadata(&metadata) || metadata.len() > MAX_AUTH_STORE_BYTES {
         return Err(());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::by_ref(&mut file)
-        .take(MAX_EXPORT_BYTES + 1)
+        .take(MAX_AUTH_STORE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ())?;
-    if bytes.len() as u64 > MAX_EXPORT_BYTES {
+    if bytes.len() as u64 > MAX_AUTH_STORE_BYTES {
         return Err(());
     }
     Ok(Some(bytes))
@@ -347,10 +317,6 @@ fn document_is_valid(document: &AuthDocument) -> bool {
                 .cookie
                 .as_deref()
                 .is_none_or(|cookie| validate_cookie(cookie).is_ok())
-                && entry
-                    .credential_file
-                    .as_ref()
-                    .is_none_or(|path| !path.as_os_str().is_empty())
         })
 }
 
@@ -422,153 +388,6 @@ fn private_file_metadata(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-#[cfg(unix)]
-fn read_export_file(path: &Path) -> Result<Vec<u8>, BossError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| auth_error("credential export is unavailable"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| auth_error("credential export is unavailable"))?;
-    if !metadata.is_file()
-        || metadata.uid() != current_uid()
-        || (metadata.mode() & 0o077) != 0
-        || metadata.len() > MAX_EXPORT_BYTES
-    {
-        return Err(auth_error("credential export is unsafe"));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(MAX_EXPORT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| auth_error("credential export is unavailable"))?;
-    if bytes.len() as u64 > MAX_EXPORT_BYTES {
-        return Err(auth_error("credential export is too large"));
-    }
-    Ok(bytes)
-}
-
-#[cfg(not(unix))]
-fn read_export_file(_path: &Path) -> Result<Vec<u8>, BossError> {
-    Err(auth_error(
-        "credential export import requires Unix file safety checks",
-    ))
-}
-
-fn parse_cookie_export(bytes: &[u8], platform: Platform) -> Result<String, BossError> {
-    if bytes.len() > MAX_EXPORT_BYTES as usize {
-        return Err(auth_error("credential export is too large"));
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| auth_error("credential export must be UTF-8 text"))?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err(auth_error("credential export is empty"));
-    }
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return parse_json_export(trimmed, platform);
-    }
-    if trimmed.contains('\t') || trimmed.starts_with("# Netscape HTTP Cookie File") {
-        return parse_netscape_export(trimmed, platform);
-    }
-    if trimmed.contains(['\r', '\n']) {
-        return Err(auth_error("credential export format is unsupported"));
-    }
-    parse_raw_cookie(trimmed)
-}
-
-fn parse_raw_cookie(text: &str) -> Result<String, BossError> {
-    let cookie = text
-        .strip_prefix("Cookie:")
-        .or_else(|| text.strip_prefix("cookie:"))
-        .unwrap_or(text)
-        .trim();
-    validate_cookie(cookie)?;
-    Ok(cookie.to_owned())
-}
-
-fn parse_netscape_export(text: &str, platform: Platform) -> Result<String, BossError> {
-    let mut cookies = Vec::new();
-    let mut saw_cookie_row = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("# Netscape HTTP Cookie File") {
-            continue;
-        }
-        let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
-        if line.starts_with('#') {
-            continue;
-        }
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 7 {
-            return Err(auth_error("credential export format is unsupported"));
-        }
-        saw_cookie_row = true;
-        if domain_matches(platform, fields[0]) {
-            cookies.push(cookie_pair(fields[5], fields[6])?);
-        }
-    }
-    if !saw_cookie_row || cookies.is_empty() {
-        return Err(auth_error(
-            "credential export has no matching platform cookies",
-        ));
-    }
-    let cookie = cookies.join("; ");
-    validate_cookie(&cookie)?;
-    Ok(cookie)
-}
-
-fn parse_json_export(text: &str, platform: Platform) -> Result<String, BossError> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|_| auth_error("credential export format is unsupported"))?;
-    if let Some(cookie) = value
-        .as_object()
-        .and_then(|object| object.get("cookie"))
-        .and_then(Value::as_str)
-    {
-        return parse_raw_cookie(cookie);
-    }
-    let cookies = match &value {
-        Value::Array(cookies) => cookies,
-        Value::Object(object) => object
-            .get("cookies")
-            .and_then(Value::as_array)
-            .ok_or_else(|| auth_error("credential export format is unsupported"))?,
-        _ => return Err(auth_error("credential export format is unsupported")),
-    };
-    let mut selected = Vec::new();
-    for item in cookies {
-        let object = item
-            .as_object()
-            .ok_or_else(|| auth_error("credential export format is unsupported"))?;
-        let domain = object
-            .get("domain")
-            .and_then(Value::as_str)
-            .ok_or_else(|| auth_error("credential export format is unsupported"))?;
-        if domain_matches(platform, domain) {
-            let name = object
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| auth_error("credential export format is unsupported"))?;
-            let value = object
-                .get("value")
-                .and_then(Value::as_str)
-                .ok_or_else(|| auth_error("credential export format is unsupported"))?;
-            selected.push(cookie_pair(name, value)?);
-        }
-    }
-    if selected.is_empty() {
-        return Err(auth_error(
-            "credential export has no matching platform cookies",
-        ));
-    }
-    let cookie = selected.join("; ");
-    validate_cookie(&cookie)?;
-    Ok(cookie)
-}
-
 pub(crate) fn domain_matches(platform: Platform, domain: &str) -> bool {
     let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
     let expected = match platform {
@@ -577,13 +396,6 @@ pub(crate) fn domain_matches(platform: Platform, domain: &str) -> bool {
         Platform::Qiancheng => "51job.com",
     };
     domain == expected || domain.ends_with(&format!(".{expected}"))
-}
-
-fn cookie_pair(name: &str, value: &str) -> Result<String, BossError> {
-    if !valid_cookie_name(name) || !valid_cookie_value(value) {
-        return Err(auth_error("credential export contains an invalid cookie"));
-    }
-    Ok(format!("{name}={value}"))
 }
 
 pub(crate) fn validate_cookie(cookie: &str) -> Result<(), BossError> {
@@ -651,111 +463,40 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn raw_json_and_netscape_exports_are_constrained() {
-        assert_eq!(
-            parse_cookie_export(b"Cookie: session=fixture; token=value", Platform::Zhipin)
-                .expect("raw"),
-            "session=fixture; token=value"
-        );
-        assert_eq!(
-            parse_cookie_export(
-                br#"{"cookies":[{"domain":".zhipin.com","name":"session","value":"fixture"},{"domain":".51job.com","name":"other","value":"skip"}]}"#,
-                Platform::Zhipin,
-            )
-            .expect("json"),
-            "session=fixture"
-        );
-        assert_eq!(
-            parse_cookie_export(
-                b"# Netscape HTTP Cookie File\n.zhipin.com\tTRUE\t/\tFALSE\t0\tsession\tfixture\n.51job.com\tTRUE\t/\tFALSE\t0\tother\tskip\n",
-                Platform::Zhipin,
-            )
-            .expect("netscape"),
-            "session=fixture"
-        );
-        assert!(
-            parse_cookie_export(b"session=fixture\r\nInjected: value", Platform::Zhipin).is_err()
-        );
-    }
-
-    #[test]
-    fn default_export_paths_are_data_root_local_and_platform_specific() {
-        let directory = tempdir().expect("tempdir");
-        let store = AuthStore::from_paths(&DataPaths::new(directory.path()));
-        let auth_directory = directory.path().join(".auth");
-        assert_eq!(
-            store.default_export_path(Platform::Zhipin),
-            auth_directory.join("zhipin.cookie")
-        );
-        assert_eq!(
-            store.default_export_path(Platform::Zhilian),
-            auth_directory.join("zhilian.cookie")
-        );
-        assert_eq!(
-            store.default_export_path(Platform::Qiancheng),
-            auth_directory.join("qiancheng.cookie")
-        );
-    }
-
     #[cfg(unix)]
     #[test]
-    fn default_export_cookie_requires_a_private_directory_and_safe_file() {
+    fn legacy_credential_file_is_migrated_when_store_is_opened() {
         let directory = tempdir().expect("tempdir");
-        let store = AuthStore::from_paths(&DataPaths::new(directory.path()));
-        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
-
-        let auth_directory = directory.path().join(".auth");
+        let paths = DataPaths::new(directory.path());
+        let auth_directory = paths.auth_dir();
         fs::create_dir(&auth_directory).expect("create auth directory");
         fs::set_permissions(&auth_directory, fs::Permissions::from_mode(0o700))
             .expect("secure auth directory");
-        let source = store.default_export_path(Platform::Zhipin);
-        fs::write(&source, b"session=fixture").expect("fixture");
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).expect("open export");
-        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("secure export");
+        fs::write(
+            paths.auth_sessions(),
+            br#"{"zhipin":{"cookie":"session=fixture","credential_file":"retired.txt"}}"#,
+        )
+        .expect("write legacy session");
+        fs::set_permissions(paths.auth_sessions(), fs::Permissions::from_mode(0o600))
+            .expect("secure legacy session");
+
+        let store = AuthStore::from_paths(&paths);
+        assert_eq!(store.health(), AuthHealth::Ready);
         assert_eq!(
-            store.default_export_cookie(Platform::Zhipin),
-            Some("session=fixture".to_owned())
+            store.session_cookie(Platform::Zhipin).as_deref(),
+            Some("session=fixture")
         );
+        let rewritten: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.auth_sessions()).expect("read rewritten session"),
+        )
+        .expect("parse rewritten session");
+        assert!(rewritten["zhipin"].get("credential_file").is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn default_export_cookie_does_not_follow_an_auth_directory_symlink() {
-        let data_root = tempdir().expect("data root");
-        let external_directory = tempdir().expect("external directory");
-        fs::set_permissions(external_directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("secure external directory");
-        let external_source = external_directory.path().join("zhipin.cookie");
-        fs::write(&external_source, b"session=external-fixture").expect("fixture");
-        fs::set_permissions(&external_source, fs::Permissions::from_mode(0o600))
-            .expect("secure external export");
-        std::os::unix::fs::symlink(external_directory.path(), data_root.path().join(".auth"))
-            .expect("symlink auth directory");
-
-        let store = AuthStore::from_paths(&DataPaths::new(data_root.path()));
-        assert_eq!(store.default_export_cookie(Platform::Zhipin), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn source_exports_and_private_store_require_safe_permissions() {
+    fn private_store_requires_safe_permissions() {
         let directory = tempdir().expect("tempdir");
-        let source = directory.path().join("desktop-export.txt");
-        fs::write(&source, b"session=fixture").expect("fixture");
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).expect("open export");
-        assert!(read_export_file(&source).is_err());
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("chmod source");
-        assert_eq!(
-            parse_cookie_export(
-                &read_export_file(&source).expect("private export"),
-                Platform::Zhipin,
-            )
-            .expect("parse"),
-            "session=fixture"
-        );
-
         let paths = DataPaths::new(directory.path());
         let mut store = AuthStore::from_paths(&paths);
         store
@@ -764,28 +505,5 @@ mod tests {
         let directory_mode = fs::metadata(paths.auth_dir()).expect("directory").mode() & 0o777;
         let file_mode = fs::metadata(paths.auth_sessions()).expect("file").mode() & 0o777;
         assert_eq!((directory_mode, file_mode), (0o700, 0o600));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn source_exports_reject_symlinks_non_files_and_oversized_files() {
-        let directory = tempdir().expect("tempdir");
-        let source = directory.path().join("source.txt");
-        fs::write(&source, b"session=fixture").expect("fixture");
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("chmod source");
-
-        let link = directory.path().join("source-link.txt");
-        std::os::unix::fs::symlink(&source, &link).expect("symlink");
-        assert!(read_export_file(&link).is_err());
-
-        let non_file = directory.path().join("not-a-file");
-        fs::create_dir(&non_file).expect("directory");
-        assert!(read_export_file(&non_file).is_err());
-
-        let oversized = directory.path().join("oversized.txt");
-        fs::write(&oversized, vec![b'x'; MAX_EXPORT_BYTES as usize + 1]).expect("large export");
-        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600))
-            .expect("chmod oversized");
-        assert!(read_export_file(&oversized).is_err());
     }
 }

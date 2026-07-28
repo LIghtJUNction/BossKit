@@ -201,13 +201,11 @@ impl BossService {
                 let variable = AuthStore::cookie_env(selected);
                 let env_present = AuthStore::environment_cookie(selected).is_some();
                 let stored_session_present = self.auth.has_session(selected);
-                let registered_export_present = self.auth.has_registered_export(selected);
                 json!({
                     "platform":selected,
                     "cookie_env":variable,
                     "present":env_present,
                     "stored_session_present":stored_session_present,
-                    "registered_export_present":registered_export_present,
                     "auth_state":if env_present {
                         "env_cookie_present"
                     } else if stored_session_present {
@@ -251,29 +249,15 @@ impl BossService {
         diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
     }
 
-    /// Imports a local Cookie source, then tries terminal QR and browser fallbacks.
+    /// Resolves a local Cookie source, then tries terminal QR and browser fallbacks.
     pub async fn login(
         &mut self,
         platform: Option<Platform>,
-        credential_file: Option<&Path>,
         manual: bool,
     ) -> Result<Value, BossError> {
-        if credential_file.is_some() && platform.is_none() {
-            return Err(BossError::InvalidArgument(
-                "--credential-file requires exactly one concrete --platform".to_owned(),
-            ));
-        }
-        if credential_file.is_some() && manual {
-            return Err(BossError::InvalidArgument(
-                "--credential-file cannot be combined with --manual".to_owned(),
-            ));
-        }
         let mut results = Vec::new();
         for selected in selected_platforms(platform) {
-            results.push(
-                self.login_platform(selected, credential_file, manual)
-                    .await?,
-            );
+            results.push(self.login_platform(selected, manual).await?);
         }
         let interactive_qr_used = results
             .iter()
@@ -296,7 +280,7 @@ impl BossService {
         }))
     }
 
-    /// Removes local sessions and registered source references, never external files.
+    /// Removes local saved sessions.
     pub fn logout(&mut self, platform: Option<Platform>, yes: bool) -> Result<Value, BossError> {
         if !yes {
             return Err(BossError::InvalidArgument(
@@ -318,41 +302,14 @@ impl BossService {
     async fn login_platform(
         &mut self,
         platform: Platform,
-        credential_file: Option<&Path>,
         manual: bool,
     ) -> Result<Value, BossError> {
         if manual {
             return self.manual_login_result(platform);
         }
-        if let Some(path) = credential_file
-            && let Ok(cookie) = self.auth.read_export(platform, path)
-        {
-            self.auth.store_file_session(platform, path, cookie)?;
-            return Ok(login_outcome(
-                platform,
-                "stored_unverified",
-                "credential_file",
-            ));
-        }
         if let Some(cookie) = AuthStore::environment_cookie(platform) {
             self.auth.store_session(platform, cookie)?;
             return Ok(login_outcome(platform, "stored_unverified", "environment"));
-        }
-        if let Some(cookie) = self.auth.default_export_cookie(platform) {
-            self.auth.store_session(platform, cookie)?;
-            return Ok(login_outcome(
-                platform,
-                "stored_unverified",
-                "default_credential_file",
-            ));
-        }
-        if let Ok(Some(cookie)) = self.auth.registered_export_cookie(platform) {
-            self.auth.store_session(platform, cookie)?;
-            return Ok(login_outcome(
-                platform,
-                "stored_unverified",
-                "registered_credential_file",
-            ));
         }
         if self.auth.has_session(platform) {
             return Ok(login_outcome(

@@ -106,16 +106,14 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 导入本地 Cookie；无可用来源时先显示终端二维码，再打开隔离浏览器
+    /// 保存本地 Cookie；无可用来源时先显示终端二维码，再打开隔离浏览器
     Login {
         #[arg(long, value_enum)]
         platform: Option<PlatformArg>,
         #[arg(long)]
-        credential_file: Option<PathBuf>,
-        #[arg(long, conflicts_with = "credential_file")]
         manual: bool,
     },
-    /// 撤销本地保存的登录会话和导出文件引用
+    /// 撤销本地保存的登录会话
     Logout {
         #[arg(long, value_enum)]
         platform: Option<PlatformArg>,
@@ -683,17 +681,9 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.config_reset(key.as_deref())?));
             }
         },
-        Command::Login {
-            platform,
-            credential_file,
-            manual,
-        } => print_json(&Envelope::success(
+        Command::Login { platform, manual } => print_json(&Envelope::success(
             service
-                .login(
-                    platform.and_then(PlatformArg::selected),
-                    credential_file.as_deref(),
-                    manual,
-                )
+                .login(platform.and_then(PlatformArg::selected), manual)
                 .await?,
         )),
         Command::Logout { platform, yes } => print_json(&Envelope::success(

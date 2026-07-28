@@ -273,32 +273,19 @@ fn status_and_doctor_are_structured_and_offline() {
 }
 
 #[test]
-fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
+fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted() {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempdir().expect("temporary directory");
-        let source = directory.path().join("desktop-cookie-export.txt");
         let fixture_cookie = "session=fixture-cookie-value";
-        std::fs::write(&source, fixture_cookie).expect("write export");
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
-            .expect("secure export");
-        let source_text = source.display().to_string();
 
         let output = Command::cargo_bin("boss")
             .expect("binary")
             .env("BOSS_DATA_DIR", directory.path())
-            .env_remove("BOSS_ZHIPIN_COOKIE")
+            .env("BOSS_ZHIPIN_COOKIE", fixture_cookie)
             .env_remove("BOSS_ZHILIAN_COOKIE")
             .env_remove("BOSS_QIANCHENG_COOKIE")
-            .args([
-                "login",
-                "--platform",
-                "zhipin",
-                "--credential-file",
-                &source_text,
-            ])
+            .args(["login", "--platform", "zhipin"])
             .output()
             .expect("login");
         assert!(output.status.success());
@@ -307,16 +294,17 @@ fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
         assert!(
             login["data"]["network_checked"] == false
                 && login["data"]["results"][0]["state"] == "stored_unverified"
-                && login["data"]["results"][0]["source"] == "credential_file"
+                && login["data"]["results"][0]["source"] == "environment"
                 && !login_text.contains(fixture_cookie)
-                && !login_text.contains(&source_text)
         );
 
         let status = run_json(directory.path(), &["status", "--platform", "zhipin"]);
         assert!(
             status["data"]["providers"][0]["stored_session_present"] == true
-                && status["data"]["providers"][0]["registered_export_present"] == true
                 && status["data"]["providers"][0]["auth_state"] == "stored_session_present"
+                && status["data"]["providers"][0]
+                    .get("registered_export_present")
+                    .is_none()
         );
         let logout = run_json(
             directory.path(),
@@ -326,8 +314,9 @@ fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
         let after_logout = run_json(directory.path(), &["status", "--platform", "zhipin"]);
         assert!(
             after_logout["data"]["providers"][0]["stored_session_present"] == false
-                && after_logout["data"]["providers"][0]["registered_export_present"] == false
-                && source.is_file()
+                && after_logout["data"]["providers"][0]
+                    .get("registered_export_present")
+                    .is_none()
         );
 
         let manual_required = run_json(directory.path(), &["login", "--platform", "zhilian"]);
@@ -370,65 +359,6 @@ fn non_tty_login_does_not_start_qr_or_a_user_configured_browser() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains('█'));
     assert!(!marker.exists());
     assert!(!directory.path().join(".auth").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn login_without_arguments_imports_all_private_default_exports_without_leaking_values() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = tempdir().expect("temporary directory");
-    let auth_directory = directory.path().join(".auth");
-    std::fs::create_dir(&auth_directory).expect("create auth directory");
-    std::fs::set_permissions(&auth_directory, std::fs::Permissions::from_mode(0o700))
-        .expect("secure auth directory");
-    let fixtures = [
-        ("zhipin", "session=zhipin-default-fixture"),
-        ("zhilian", "session=zhilian-default-fixture"),
-        ("qiancheng", "session=qiancheng-default-fixture"),
-    ];
-    for (platform, cookie) in &fixtures {
-        let path = auth_directory.join(format!("{platform}.cookie"));
-        std::fs::write(&path, cookie).expect("write default export");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("secure default export");
-    }
-
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_ZHIPIN_COOKIE")
-        .env_remove("BOSS_ZHILIAN_COOKIE")
-        .env_remove("BOSS_QIANCHENG_COOKIE")
-        .arg("login")
-        .output()
-        .expect("login");
-    assert!(
-        output.status.success(),
-        "stderr={} stdout={}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let output_text = String::from_utf8_lossy(&output.stdout);
-    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
-    assert_eq!(login["data"]["network_checked"], false);
-    assert_eq!(login["data"]["verification"], "local_unverified");
-    assert_eq!(login["data"]["results"].as_array().map(Vec::len), Some(3));
-    for ((platform, cookie), result) in fixtures
-        .iter()
-        .zip(login["data"]["results"].as_array().expect("login results"))
-    {
-        assert_eq!(result["platform"], *platform);
-        assert_eq!(result["state"], "stored_unverified");
-        assert_eq!(result["source"], "default_credential_file");
-        assert!(!output_text.contains(cookie));
-    }
-
-    let status = run_json(directory.path(), &["status"]);
-    for provider in status["data"]["providers"].as_array().expect("providers") {
-        assert_eq!(provider["stored_session_present"], true);
-        assert_eq!(provider["registered_export_present"], false);
-    }
 }
 
 #[test]
