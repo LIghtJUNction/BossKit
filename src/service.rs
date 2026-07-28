@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
@@ -251,8 +251,8 @@ impl BossService {
         diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
     }
 
-    /// Locally imports or selects a Cookie source without making a network request.
-    pub fn login(
+    /// Imports a local Cookie source, then tries terminal QR and browser fallbacks.
+    pub async fn login(
         &mut self,
         platform: Option<Platform>,
         credential_file: Option<&Path>,
@@ -268,13 +268,30 @@ impl BossService {
                 "--credential-file cannot be combined with --manual".to_owned(),
             ));
         }
-        let results = selected_platforms(platform)
-            .into_iter()
-            .map(|selected| self.login_platform(selected, credential_file, manual))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = Vec::new();
+        for selected in selected_platforms(platform) {
+            results.push(
+                self.login_platform(selected, credential_file, manual)
+                    .await?,
+            );
+        }
+        let interactive_qr_used = results
+            .iter()
+            .any(|result| result.get("source").and_then(Value::as_str) == Some("interactive_qr"));
+        let interactive_browser_used = results.iter().any(|result| {
+            result.get("source").and_then(Value::as_str) == Some("interactive_browser")
+        });
         Ok(json!({
             "network_checked":false,
-            "verification":"local_unverified",
+            "verification":if interactive_qr_used && interactive_browser_used {
+                "interactive_provider_unverified"
+            } else if interactive_qr_used {
+                "qr_interactive_provider_unverified"
+            } else if interactive_browser_used {
+                "browser_interactive_provider_unverified"
+            } else {
+                "local_unverified"
+            },
             "results":results
         }))
     }
@@ -298,7 +315,7 @@ impl BossService {
         Ok(json!({"network_checked":false,"results":results}))
     }
 
-    fn login_platform(
+    async fn login_platform(
         &mut self,
         platform: Platform,
         credential_file: Option<&Path>,
@@ -307,16 +324,15 @@ impl BossService {
         if manual {
             return self.manual_login_result(platform);
         }
-        if let Some(path) = credential_file {
-            if let Ok(cookie) = self.auth.read_export(platform, path) {
-                self.auth.store_file_session(platform, path, cookie)?;
-                return Ok(login_outcome(
-                    platform,
-                    "stored_unverified",
-                    "credential_file",
-                ));
-            }
-            return self.manual_login_result(platform);
+        if let Some(path) = credential_file
+            && let Ok(cookie) = self.auth.read_export(platform, path)
+        {
+            self.auth.store_file_session(platform, path, cookie)?;
+            return Ok(login_outcome(
+                platform,
+                "stored_unverified",
+                "credential_file",
+            ));
         }
         if let Some(cookie) = AuthStore::environment_cookie(platform) {
             self.auth.store_session(platform, cookie)?;
@@ -345,7 +361,22 @@ impl BossService {
                 "stored_session",
             ));
         }
-        self.manual_login_result(platform)
+        if std::io::stdin().is_terminal()
+            && std::io::stderr().is_terminal()
+            && let Some(cookie) = crate::qr_login::interactive_login(platform).await
+        {
+            self.auth.store_session(platform, cookie)?;
+            return Ok(login_outcome(
+                platform,
+                "stored_unverified",
+                "interactive_qr",
+            ));
+        }
+        self.browser_or_manual_result(
+            platform,
+            Self::browser_login_result,
+            Self::manual_login_result,
+        )
     }
 
     fn manual_login_result(&mut self, platform: Platform) -> Result<Value, BossError> {
@@ -355,6 +386,42 @@ impl BossService {
                 Ok(login_outcome(platform, "stored_unverified", "manual"))
             }
             None => Ok(login_outcome(platform, "manual_login_required", "none")),
+        }
+    }
+
+    fn browser_or_manual_result<B, M>(
+        &mut self,
+        platform: Platform,
+        browser_attempt: B,
+        manual_fallback: M,
+    ) -> Result<Value, BossError>
+    where
+        B: FnOnce(&mut Self, Platform) -> Result<Option<Value>, BossError>,
+        M: FnOnce(&mut Self, Platform) -> Result<Value, BossError>,
+    {
+        match browser_attempt(self, platform)? {
+            Some(result) => Ok(result),
+            None => manual_fallback(self, platform),
+        }
+    }
+
+    fn browser_login_result(&mut self, platform: Platform) -> Result<Option<Value>, BossError> {
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            return Ok(None);
+        }
+        let Some(auth_root) = self.auth.browser_profile_root() else {
+            return Ok(None);
+        };
+        match crate::browser_login::interactive_login(platform, &auth_root) {
+            Some(cookie) => {
+                self.auth.store_session(platform, cookie)?;
+                Ok(Some(login_outcome(
+                    platform,
+                    "stored_unverified",
+                    "interactive_browser",
+                )))
+            }
+            None => Ok(None),
         }
     }
 
@@ -1930,6 +1997,8 @@ fn cleanup_created_directories(directories: &[PathBuf]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1979,6 +2048,27 @@ mod tests {
                 Err(BossError::Parse("detail unavailable".to_owned()))
             }
         }
+    }
+
+    #[test]
+    fn failed_browser_attempt_selects_the_manual_fallback() {
+        let directory = tempdir().expect("temporary directory");
+        let mut service =
+            BossService::from_paths(DataPaths::new(directory.path())).expect("service");
+        let manual_selected = Cell::new(false);
+        let result = service
+            .browser_or_manual_result(
+                Platform::Zhipin,
+                |_, _| Ok(None),
+                |_, platform| {
+                    manual_selected.set(true);
+                    Ok(login_outcome(platform, "manual_login_required", "none"))
+                },
+            )
+            .expect("manual fallback result");
+        assert!(manual_selected.get());
+        assert_eq!(result["state"], "manual_login_required");
+        assert_eq!(result["source"], "none");
     }
 
     #[tokio::test]

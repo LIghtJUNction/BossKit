@@ -106,7 +106,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 本地导入或选择登录 Cookie，不联网验证
+    /// 导入本地 Cookie；无可用来源时先显示终端二维码，再打开隔离浏览器
     Login {
         #[arg(long, value_enum)]
         platform: Option<PlatformArg>,
@@ -687,11 +687,15 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             platform,
             credential_file,
             manual,
-        } => print_json(&Envelope::success(service.login(
-            platform.and_then(PlatformArg::selected),
-            credential_file.as_deref(),
-            manual,
-        )?)),
+        } => print_json(&Envelope::success(
+            service
+                .login(
+                    platform.and_then(PlatformArg::selected),
+                    credential_file.as_deref(),
+                    manual,
+                )
+                .await?,
+        )),
         Command::Logout { platform, yes } => print_json(&Envelope::success(
             service.logout(platform.and_then(PlatformArg::selected), yes)?,
         )),

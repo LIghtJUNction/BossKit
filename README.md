@@ -52,7 +52,7 @@ boss config reset page_size
 boss config reset
 
 boss login --platform zhipin --credential-file ./zhipin-cookies.txt
-boss login                         # 自动尝试全部平台的环境变量、默认导出文件、已登记导出文件、已保存会话
+boss login                         # 自动尝试全部平台的本地来源；无来源时在 TTY 先显示平台二维码，再打开隔离浏览器
 boss login --platform zhilian --manual
 boss logout --platform zhipin --yes
 
@@ -132,8 +132,13 @@ boss mcp
 
 `boss cities` 会诚实列出当前三个适配器共同映射的 10 个逻辑城市：北京、上海、广州、深圳、杭州、成都、武汉、南京、苏州、西安。单平台搜索还可传该平台原生纯数字城市代码。
 
-`boss login` 只做本地 Cookie 导入和保存，**绝不发起登录或认证网络请求**；成功结果是
-`local_unverified`，后续正常的只读搜索请求才会体现 Cookie 是否仍有效。无参数的 `boss login` 会依次尝试全部三个平台；每个平台的自动顺序是：环境变量、默认导出文件、已登记的导出文件、已保存会话。`--credential-file` 则只允许一个具体平台，并会立即导入且登记该文件，供之后的 `boss login` 再次自动尝试。
+`boss login` 会先做本地 Cookie 导入和保存；无参数调用会依次尝试全部三个平台，每个平台的自动顺序是：显式 `--credential-file`、环境变量、默认导出文件、已登记的导出文件、已保存会话。`--credential-file` 只允许一个具体平台，并会立即导入且登记该文件，供之后的 `boss login` 再次自动尝试。
+
+若没有来源成功且 stdin 与 stderr 都是 TTY，默认 `boss login` 会先为该平台执行受限的、用户驱动的二维码登录：BOSS 直聘需要手机扫描和第二次确认，智联招聘使用微信二维码并只在获得 `at`、`rt` 会话 Cookie 后成功，前程无忧使用页面 GUID、二维码轮询和受限登录跳转。二维码只以 Unicode 图案写入 stderr；结构化 stdout 仍只输出 JSON，绝不会输出二维码载荷、Cookie、会话令牌、GUID 或响应内容。过期、取消、拒绝、风险提示、验证码/SMS 要求、协议不完整或超时都会停止二维码流程，随后才进入浏览器兜底；BossKit 不会绕过这些检查。`--manual` 保留原有的隐藏 Cookie 粘贴输入，且不会启动二维码或浏览器流程。任一流不是 TTY 时不会创建认证状态、启动浏览器或访问二维码端点，而是返回 `manual_login_required`。
+
+自动导入完全本地；交互式二维码和浏览器兜底会产生用户可见的平台流量，但 BossKit 不会发起额外的 Provider 验证请求。二维码成功结果仍是 `stored_unverified`（顶层标记为 `qr_interactive_provider_unverified`）；浏览器成功时仍标记为 `browser_interactive_provider_unverified`；后续正常的只读搜索请求才会体现 Cookie 是否仍有效。
+
+当前交互式浏览器兜底仅支持 Linux：它依赖 Unix 私有目录权限，并只在 `PATH` 中按固定顺序尝试 `google-chrome`、`google-chrome-stable`、`chromium`、`chromium-browser`、`microsoft-edge`、`microsoft-edge-stable`。可通过 `BOSS_BROWSER=/绝对或可执行文件名` 显式指定兼容 Chromium DevTools Protocol 的浏览器；BossKit 不会打印该值，也不会自动搜索 macOS 或 Windows 的浏览器路径。
 
 默认导出文件固定在最终数据根目录（下文以 `<BOSS_DATA_DIR>` 表示）中：
 
@@ -146,14 +151,14 @@ boss mcp
 ```bash
 chmod 600 ./zhipin-cookies.txt
 boss login --platform zhipin --credential-file ./zhipin-cookies.txt
-boss login --platform zhipin --manual     # 仅 TTY，输入不会回显
-boss login                                # 依次尝试全部三平台的默认来源；非 TTY 时返回 manual_login_required
+boss login --platform zhipin --manual     # 仅 TTY，隐藏粘贴 Cookie；不会打开浏览器
+boss login                                # 依次尝试全部三平台；无本地来源时先显示二维码、失败后由用户在隔离浏览器完成登录
 boss logout --platform zhipin --yes       # 只撤销本地会话和文件引用，不删除原导出文件
 ```
 
 可直接导入的仅是用户**明确导出并指定**的普通文件，且 Unix 下必须是当前用户拥有、非符号链接、常规文件、最大 64 KiB，并且不对组或其他用户开放。支持的格式是：原始 `Cookie:` 头/纯 Cookie 文本、按当前平台域名筛选的 Netscape Cookie 导出，以及受限 JSON（`{"cookie":"..."}` 或包含 `domain`、`name`、`value` 的 `cookies` 数组）。
 
-BossKit **不会**扫描、遍历、读取、解密或破解桌面客户端、浏览器、SQLite、系统钥匙串或其他私有凭据库；它也不会输出 Cookie 值、导出文件路径或将这些操作暴露给 MCP。这样“桌面端凭据文件”仅表示用户主动导出的、可审计的 Cookie 文件，而不是原生私有凭据存储。
+BossKit **不会**扫描、遍历、读取、解密或破解桌面客户端、既有浏览器配置、SQLite、系统钥匙串或其他私有凭据库；它也不会输出 Cookie 值、导出文件路径、浏览器可执行路径或 DevTools 地址，亦不会将这些操作暴露给 MCP。交互式兜底只启动 BossKit 在私有 `.auth` 目录下创建的全新临时浏览器配置，不自动填充凭据、不绕过扫码或验证码，并在浏览器退出或被终止后清理。
 
 仍可使用环境变量；环境 Cookie 在正常 Provider 请求和 `boss login` 自动尝试中优先于本地保存会话：
 

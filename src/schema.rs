@@ -337,7 +337,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                    "authentication":"login and logout are CLI-only private local credential operations. They are deliberately unavailable through MCP and login never performs a network validation request."
+                    "authentication":"login and logout are CLI-only private credential operations. Automatic sources are local; if none resolve on an interactive terminal, a user-driven platform QR flow runs before the isolated browser fallback. QR art is stderr-only, failures fall through without saving credentials, and authentication remains unavailable through MCP. BossKit does not send a separate provider verification request."
                 },
                 "risk":{"remote_writes":false,"local_writes":local_writes}
             })

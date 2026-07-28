@@ -1,6 +1,7 @@
 //! Shared services for the `boss` read-only job search CLI and MCP server.
 
 pub mod auth;
+pub(crate) mod browser_login;
 pub mod cache;
 pub mod city;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod mcp;
 pub mod model;
 pub mod preset;
 pub mod provider;
+pub(crate) mod qr_login;
 pub mod reply;
 pub mod resume;
 pub mod schema;

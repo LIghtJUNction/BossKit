@@ -152,6 +152,13 @@ impl AuthStore {
             .ok()
     }
 
+    /// Prepares the private root used for an isolated interactive browser profile.
+    #[must_use]
+    pub(crate) fn browser_profile_root(&self) -> Option<PathBuf> {
+        ensure_private_directory(&self.directory).ok()?;
+        Some(self.directory.clone())
+    }
+
     /// Reads and validates an explicitly selected credential export.
     pub fn read_export(&self, platform: Platform, path: &Path) -> Result<String, BossError> {
         let bytes = read_export_file(path)?;
@@ -562,7 +569,7 @@ fn parse_json_export(text: &str, platform: Platform) -> Result<String, BossError
     Ok(cookie)
 }
 
-fn domain_matches(platform: Platform, domain: &str) -> bool {
+pub(crate) fn domain_matches(platform: Platform, domain: &str) -> bool {
     let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
     let expected = match platform {
         Platform::Zhipin => "zhipin.com",
@@ -579,7 +586,7 @@ fn cookie_pair(name: &str, value: &str) -> Result<String, BossError> {
     Ok(format!("{name}={value}"))
 }
 
-fn validate_cookie(cookie: &str) -> Result<(), BossError> {
+pub(crate) fn validate_cookie(cookie: &str) -> Result<(), BossError> {
     if cookie.is_empty()
         || cookie.len() > MAX_COOKIE_BYTES
         || cookie.contains(['\r', '\n', '\0'])

@@ -340,6 +340,40 @@ fn login_import_status_logout_and_non_tty_fallback_are_local_and_redacted() {
 
 #[cfg(unix)]
 #[test]
+fn non_tty_login_does_not_start_qr_or_a_user_configured_browser() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().expect("temporary directory");
+    let marker = directory.path().join("browser-launch-marker");
+    let probe = directory.path().join("browser-probe");
+    std::fs::write(&probe, format!("#!/bin/sh\ntouch {}\n", marker.display()))
+        .expect("write probe");
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+        .expect("make probe executable");
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_BROWSER", &probe)
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .env_remove("BOSS_ZHILIAN_COOKIE")
+        .env_remove("BOSS_QIANCHENG_COOKIE")
+        .args(["login", "--platform", "zhipin"])
+        .output()
+        .expect("login");
+    assert!(output.status.success());
+    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
+    assert_eq!(
+        login["data"]["results"][0]["state"],
+        "manual_login_required"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains('█'));
+    assert!(!marker.exists());
+    assert!(!directory.path().join(".auth").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn login_without_arguments_imports_all_private_default_exports_without_leaking_values() {
     use std::os::unix::fs::PermissionsExt;
 
