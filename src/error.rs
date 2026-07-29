@@ -73,6 +73,27 @@ pub enum BossError {
     /// Local keyword-reply rule persistence or lookup failed.
     #[error("reply rule failed: {0}")]
     Reply(String),
+    /// Local campaign policy, template, blacklist, or review-plan operation failed.
+    #[error("campaign failed: {0}")]
+    Campaign(String),
+    /// Local AI profile metadata operation failed without exposing credentials.
+    #[error("AI profile failed: {0}")]
+    Ai(String),
+    /// The runtime-only model API key was not supplied.
+    #[error("AI model API key is not configured")]
+    AiApiKeyMissing,
+    /// The confirmed model request could not reach its HTTPS endpoint.
+    #[error("AI model request failed")]
+    AiNetwork,
+    /// The model endpoint returned a non-success response without exposing its body.
+    #[error("AI model returned HTTP {status}")]
+    AiHttp { status: u16 },
+    /// The model response did not match the bounded expected shape.
+    #[error("AI model response failed: {0}")]
+    AiResponse(&'static str),
+    /// Notification configuration, audit, or confirmed delivery failed without revealing a URL.
+    #[error("notification failed: {0}")]
+    Notification(&'static str),
     /// Guarded cleanup failed.
     #[error("cleanup failed: {0}")]
     Cleanup(String),
@@ -111,6 +132,13 @@ impl BossError {
             Self::Watch(_) => "watch_error",
             Self::Resume(_) => "resume_error",
             Self::Reply(_) => "reply_error",
+            Self::Campaign(_) => "campaign_error",
+            Self::Ai(_) => "ai_error",
+            Self::AiApiKeyMissing => "ai_api_key_missing",
+            Self::AiNetwork => "ai_network_error",
+            Self::AiHttp { .. } => "ai_http_error",
+            Self::AiResponse(_) => "ai_response_error",
+            Self::Notification(_) => "notification_error",
             Self::Cleanup(_) => "cleanup_error",
             Self::Authentication(_) => "authentication_error",
         }
@@ -127,6 +155,11 @@ impl BossError {
                 | Self::Watch(_)
                 | Self::Resume(_)
                 | Self::Reply(_)
+                | Self::Campaign(_)
+                | Self::Ai(_)
+                | Self::AiApiKeyMissing
+                | Self::AiResponse(_)
+                | Self::Notification(_)
                 | Self::Cleanup(_)
         )
     }

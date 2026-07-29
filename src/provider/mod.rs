@@ -5,7 +5,7 @@ mod zhilian;
 mod zhipin;
 
 use async_trait::async_trait;
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, header::CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 
 use crate::{BossError, Job, Platform};
@@ -78,10 +78,27 @@ pub(crate) async fn send_json(
                 .to_owned(),
         });
     }
+    if !json_content_type(response.headers().get(CONTENT_TYPE)) {
+        return Err(BossError::Http {
+            status: 403,
+            message: "provider returned non-JSON challenge content".to_owned(),
+        });
+    }
     response
         .json()
         .await
         .map_err(|error| BossError::Parse(error.to_string()))
+}
+
+fn json_content_type(value: Option<&reqwest::header::HeaderValue>) -> bool {
+    value.is_none_or(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                let media_type = media_type.trim();
+                media_type.ends_with("/json") || media_type.ends_with("+json")
+            })
+        })
+    })
 }
 
 pub(crate) async fn send_text(request: reqwest::RequestBuilder) -> Result<String, BossError> {
@@ -173,5 +190,28 @@ pub(crate) fn overlay_text(target: &mut String, value: String) {
 pub(crate) fn overlay_list(target: &mut Vec<String>, value: Vec<String>) {
     if !value.is_empty() {
         *target = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_content_type_accepts_json_media_types_and_missing_headers() {
+        assert!(json_content_type(None));
+        assert!(json_content_type(Some(
+            &reqwest::header::HeaderValue::from_static("application/json; charset=utf-8")
+        )));
+        assert!(json_content_type(Some(
+            &reqwest::header::HeaderValue::from_static("application/problem+json")
+        )));
+    }
+
+    #[test]
+    fn json_content_type_rejects_html_challenge_content() {
+        assert!(!json_content_type(Some(
+            &reqwest::header::HeaderValue::from_static("text/html")
+        )));
     }
 }

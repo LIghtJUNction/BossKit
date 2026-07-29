@@ -27,6 +27,14 @@ boss reply add "面试" "感谢您的联系，我会尽快回复。"
 boss reply ls                    # 可见别名：list
 boss reply match "您方便参加面试吗？"
 boss reply rm "面试"             # 可见别名：remove
+boss campaign policy add rust-remote --include title:rust --include skills:rust --welfare 远程 --monthly-salary-min 20000 --minimum-score 50
+boss campaign blacklist add company "不考虑的公司"
+boss campaign template add brief "您好，我关注到 {{company}} 的 {{title}} 职位。"
+boss campaign plan create rust-remote --template brief --resume-name local --limit 20
+boss campaign plan ls
+boss campaign plan transition <本地职位 ID> approved --yes --note "已人工复核"
+boss campaign plan transition <本地职位 ID> recorded_submitted --yes
+boss campaign stats
 boss watch add daily --preset rust-backend
 boss watch run daily
 boss watch run --all
@@ -34,6 +42,14 @@ boss resume init local --title "Rust Engineer"
 boss resume set local basics.email person@example.test
 boss resume skills local --add Rust --add Linux
 boss resume diff local tailored
+boss ai profile add local https://model.example/v1 example-model
+boss ai profile ls
+boss ai profile show local
+boss ai draft local <本地职位 ID> local --yes
+boss ai score local <本地职位 ID> local --yes
+boss notify preview campaign.ready
+export BOSS_NOTIFY_WEBHOOK_URL='https://notify.example.test/hooks/boss'
+boss notify send campaign.ready --yes
 boss stats --days 30
 boss clean --target all             # 仅预览
 boss clean --target history --yes   # Linux：将已知 history.json 移入可恢复归档事务
@@ -51,7 +67,7 @@ boss config set page_size 30
 boss config reset page_size
 boss config reset
 
-boss login                         # 自动尝试全部平台的本地来源；无来源时在 TTY 先显示平台二维码，再打开隔离浏览器
+boss login                         # 自动尝试全部平台的本地来源；无来源时在 TTY 打开隔离浏览器
 boss login --platform zhilian --manual
 boss logout --platform zhipin --yes
 
@@ -97,6 +113,12 @@ boss mcp
 - `history.json`：BossKit 本地搜索尝试审计，最多保留最新 200 条
 - `presets.json`：完整、已验证的命名搜索规范
 - `reply_rules.json`：关键词到建议回复的严格本地规则，按添加顺序保存
+- `campaign_policies.json`：仅针对 `jobs.json` 缓存的可复用筛选策略
+- `campaign_blacklist.json`：本地公司、职位描述和职位黑名单规则
+- `greeting_templates.json`：只允许职位字段和显式绑定简历占位符的本地问候模板
+- `application_plans.json`：去重后的本地人工工作流计划；仅记录绑定简历的名称和更新时间，绝不保存简历副本或自动投递
+- `ai_profiles.json`：仅保存名称、HTTPS 模型 API 基址、模型名和时间戳；绝不保存 API Key、Token、Header、提示词或模型响应
+- `notification_audit.json`：最多 200 条 webhook 通知审计；每条只保存有界事件类型、成功/失败状态和时间戳，绝不保存 URL、请求负载、响应体、响应头或密钥
 - `watches.json`：显式前台监视、完整去重的已见稳定 ID 和最后成功运行时间；不会截断后遗忘旧 ID
 - `resumes.json`：单一严格类型的本地简历集合
 - `.auth/sessions.json`：仅本机私有的登录 Cookie 会话；Unix 下目录为 `0700`、文件为 `0600`
@@ -121,6 +143,21 @@ boss mcp
 多个规则命中时选择关键词最长的规则，同长度时选择最早保存的规则。`match` 只返回建议文本，
 绝不会获取会话、调用平台消息接口或发送平台消息。
 
+`boss campaign` 只读取现有 `jobs.json` 缓存并写入本地 JSON。策略的 `include` 规则按匹配比例计算
+`score`，`--minimum-score` 可设置门槛；`exclude`、福利要求和月薪范围均为硬性排除条件。模板只支持
+`{{title}}`、`{{company}}`、`{{city}}`、`{{salary}}`、`{{welfare}}`，以及 `{{resume_title}}`、
+`{{resume_summary}}`、`{{resume_skills}}`；后面三种要求 `plan create --resume-name <本地简历名>` 显式绑定
+已有类型化简历，否则本地渲染会拒绝该计划。计划只记录该简历的名称和创建当时的 `updated_at`，不复制简历内容；
+创建响应中的候选人上下文问候预览是临时结果，绝不会写入 `application_plans.json`。
+新计划固定标记为 `manual_review` 与 `dry_run`，并按职位 ID 去重。状态只能按 `manual_review` → `approved` 或
+`rejected`，再由 `approved` → `recorded_submitted` 或 `rejected` 变化；每次变化写入本地时间和可选备注，终态
+不能改变。`recorded_submitted` 只是用户对外部手动操作的本地声明，不会执行请求。除显式确认的 `boss ai draft` /
+`boss ai score` 外，活动功能不会投递职位、发送消息、调用模型、读取 API Key、触碰浏览器或联系任何平台。黑名单的 `description` 类型只匹配缓存职位的规范化描述字段；
+BossKit 不保存或推断招聘者身份。
+
+`boss notify preview <event>` 仅从当前本地统计渲染有界聚合计数，不读取 webhook、不会联网，也不会创建审计记录。
+`boss notify send <event> --yes` 是唯一的通知远端写操作：它只在调用时读取 `BOSS_NOTIFY_WEBHOOK_URL`，且只接受长度受限、无用户名、密码、查询串、片段或百分号编码的 HTTPS URL。发送的 JSON 只有事件类型和缓存职位、短名单、预设、监视、简历、campaign 计划的计数；绝不包含职位、简历、Cookie、AI 内容或 URL。MCP 对应调用必须传 `confirm: true`。响应体会被丢弃，URL 永不输出、写入或记录。
+
 `boss export` 完全本地运行。无 `--output` 时，即使请求 CSV/HTML，也只在 JSON 信封中返回
 结构化脱敏职位和格式元数据；指定路径时才原子写入对应 JSON、CSV 或 HTML 文件。
 现有文件默认拒绝覆盖，必须显式 `--force`。默认保留本地稳定 ID 并省略远端 ID，
@@ -132,19 +169,19 @@ boss mcp
 
 `boss login` 会保存可用的本地 Cookie 会话；无参数调用会依次尝试全部三个平台，每个平台的自动顺序是：环境变量、已保存会话。`--manual` 会直接进入隐藏 Cookie 粘贴输入。
 
-若没有来源成功且 stdin 与 stderr 都是 TTY，默认 `boss login` 会先为该平台执行受限的、用户驱动的二维码登录：BOSS 直聘需要手机扫描和第二次确认，智联招聘使用微信二维码并只在获得 `at`、`rt` 会话 Cookie 后成功，前程无忧使用页面 GUID、二维码轮询和受限登录跳转。二维码只以 Unicode 图案写入 stderr；结构化 stdout 仍只输出 JSON，绝不会输出二维码载荷、Cookie、会话令牌、GUID 或响应内容。过期、取消、拒绝、风险提示、验证码/SMS 要求、协议不完整或超时都会停止二维码流程，随后才进入浏览器兜底；BossKit 不会绕过这些检查。`--manual` 保留原有的隐藏 Cookie 粘贴输入，且不会启动二维码或浏览器流程。任一流不是 TTY 时不会创建认证状态、启动浏览器或访问二维码端点，而是返回 `manual_login_required`。
+若没有来源成功且 stdin 与 stderr 都是 TTY，默认 `boss login` 会打开隔离浏览器，由用户完成平台登录；BossKit 不会自动填充凭据或绕过验证码、SMS 或风险控制。`--manual` 保留原有的隐藏 Cookie 粘贴输入，且不会启动浏览器。任一流不是 TTY 时不会创建认证状态或启动浏览器，而是返回 `manual_login_required`。
 
-环境变量和已保存会话的自动选择完全本地；交互式二维码和浏览器兜底会产生用户可见的平台流量，但 BossKit 不会发起额外的 Provider 验证请求。二维码成功结果仍是 `stored_unverified`（顶层标记为 `qr_interactive_provider_unverified`）；浏览器成功时仍标记为 `browser_interactive_provider_unverified`；后续正常的只读搜索请求才会体现 Cookie 是否仍有效。
+环境变量和已保存会话的自动选择完全本地；交互式浏览器兜底会产生用户可见的平台流量，但 BossKit 不会发起额外的 Provider 验证请求。浏览器成功时仍标记为 `browser_interactive_provider_unverified`；后续正常的只读搜索请求才会体现 Cookie 是否仍有效。
 
 当前交互式浏览器兜底仅支持 Linux：它依赖 Unix 私有目录权限，并只在 `PATH` 中按固定顺序尝试 `google-chrome`、`google-chrome-stable`、`chromium`、`chromium-browser`、`microsoft-edge`、`microsoft-edge-stable`。可通过 `BOSS_BROWSER=/绝对或可执行文件名` 显式指定兼容 Chromium DevTools Protocol 的浏览器；BossKit 不会打印该值，也不会自动搜索 macOS 或 Windows 的浏览器路径。
 
 ```bash
 boss login --platform zhipin --manual     # 仅 TTY，隐藏粘贴 Cookie；不会打开浏览器
-boss login                                # 依次尝试全部三平台；无本地来源时先显示二维码、失败后由用户在隔离浏览器完成登录
+boss login                                # 依次尝试全部三平台；无本地来源时由用户在隔离浏览器完成登录
 boss logout --platform zhipin --yes       # 只撤销本地保存的会话
 ```
 
-BossKit **不会**读取外部 Cookie 导出文件，也不会扫描、遍历、读取、解密或破解桌面客户端、既有浏览器配置、SQLite、系统钥匙串或其他私有凭据库；它也不会输出 Cookie 值、浏览器可执行路径或 DevTools 地址，亦不会将这些操作暴露给 MCP。交互式兜底只启动 BossKit 在私有 `.auth` 目录下创建的全新临时浏览器配置，不自动填充凭据、不绕过扫码或验证码，并在浏览器退出或被终止后清理。
+BossKit **不会**读取外部 Cookie 导出文件，也不会扫描、遍历、读取、解密或破解桌面客户端、既有浏览器配置、SQLite、系统钥匙串或其他私有凭据库；它也不会输出 Cookie 值、浏览器可执行路径或 DevTools 地址，亦不会将这些操作暴露给 MCP。交互式兜底只启动 BossKit 在私有 `.auth` 目录下创建的全新临时浏览器配置，不自动填充凭据、不绕过验证码，并在浏览器退出或被终止后清理。
 
 仍可使用环境变量；环境 Cookie 在正常 Provider 请求和 `boss login` 自动尝试中优先于本地保存会话：
 
@@ -169,24 +206,37 @@ MCP 客户端命令为 `boss mcp`。stdio 服务支持 MCP `2025-03-26` 的 `ini
 - `preset_add`, `preset_list`, `preset_show`, `preset_remove`
 - `watch_add`, `watch_list`, `watch_show`, `watch_run`, `watch_remove`
 - `resume_init`, `resume_list`, `resume_show`, `resume_set`, `resume_skills`, `resume_clone`, `resume_diff`, `resume_remove`
+- `ai_profile_add`, `ai_profile_list`, `ai_profile_show`, `ai_profile_remove`, `ai_draft`, `ai_score`
+- `notify_preview`, `notify_send`
 - `keyword_reply_add`, `keyword_reply_list`, `keyword_reply_remove`, `keyword_reply_match`
+- `campaign_policy_add`, `campaign_policy_list`, `campaign_policy_show`, `campaign_policy_remove`
+- `campaign_blacklist_add`, `campaign_blacklist_list`, `campaign_blacklist_remove`
+- `campaign_template_add`, `campaign_template_list`, `campaign_template_show`, `campaign_template_remove`, `campaign_template_render`
+- `campaign_plan_create`, `campaign_plan_list`, `campaign_plan_transition`, `campaign_stats`
 - `stats`, `clean_preview`
 
 `export_jobs` 只返回结构化数据，不接受输出路径，也不会通过 MCP 写文件。
 `login` 与 `logout` 特意仅保留在本机 CLI，MCP 没有对应工具、参数或凭据文件入口。
 `clean_preview` 永远只预览，MCP 不会移动或移除文件。CLI 的确认 clean 仅在 Linux 可用：
-它把七个已知活动 JSON 文件原子移动到 `.bosskit-clean-archive/<事务>/`，返回每个恢复路径，
+它把十三个已知活动 JSON 文件（含全部 campaign、AI profile 和通知审计文件）原子移动到 `.bosskit-clean-archive/<事务>/`，返回每个恢复路径，
 不执行 unlink。若并发写入阻止错误回滚，文件会移动到数据根目录下经过验证的私有
 `.bosskit-clean-recovery-<事务>/`，错误仅报告验证成功的恢复路径；其他平台仅支持预览。
 监视仅在显式调用 `watch run` 时顺序执行只读搜索，
 没有后台调度。简历功能只管理 `resumes.json` 中的本地类型化文档，不与招聘平台同步。关键词回复
-只管理 `reply_rules.json` 并返回本地建议，永不发送平台消息。
+只管理 `reply_rules.json` 并返回本地建议，永不发送平台消息。除显式确认的 AI 模型工具及 `notify_send` 外，活动工具同样只处理本地缓存与本地
+计划，不会经由 MCP 或 CLI 接触招聘平台。`notify_send` 是已确认的远端 webhook 写操作，不接触招聘平台。
 
 参数采用严格 JSON Schema；畸形参数返回 JSON-RPC `-32602`，有效调用中的执行错误才返回 `isError: true`。
 
+## AI 草稿与评分：隐私和确认边界
+
+`boss ai profile` 只管理 `ai_profiles.json` 中的模型元数据。profile 只接受无用户名、密码、查询串或片段的 HTTPS URL；BossKit 以路径段安全追加 `/chat/completions`。它不接受、显示、落盘或记录任何 API Key。唯一支持的密钥来源是调用时的 `BOSS_LLM_API_KEY` 环境变量，缺失时请求会在联网前失败。
+
+`boss ai draft <profile> <job_id> <resume_name> --yes` 和 `boss ai score <profile> <job_id> <resume_name> --yes` 只读取一条现有 `jobs.json` 缓存职位和一份严格类型化本地简历，并把有界上下文发送到所选模型服务；不会请求招聘平台、写入 campaign 计划、发送平台消息，也不保存原始提示词或模型响应。`draft` 只返回文本草稿；`score` 只接受并返回严格的 `{score: 0..100, reasons: [nonblank strings]}`。MCP 中同类工具必须传 `confirm: true`，否则在任何模型请求前被拒绝。调用模型是已确认的远程操作，即使不构成招聘平台写操作，因此 native schema 不会把所有远程操作标为只读。
+
 ## 安全边界与进度
 
-远端能力只读。本项目不实现自动打招呼、投递、聊天、平台简历同步、招聘者个人数据采集或其他招聘平台写操作。当前与上游的证据化差异见 [docs/PARITY.md](docs/PARITY.md)。
+招聘平台远端能力只读。本项目不实现自动打招呼、投递、聊天、平台简历同步、招聘者个人数据采集或其他招聘平台写操作。仅有显式确认的模型草稿/评分会向用户配置的 HTTPS 模型端点发送有界职位和简历上下文；另有显式确认的 `notify send` 向运行时 webhook 发送聚合计数。当前与上游的证据化差异见 [docs/PARITY.md](docs/PARITY.md)。
 
 ## 致谢与许可
 

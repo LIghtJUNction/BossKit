@@ -5,6 +5,12 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 use crate::BossError;
+use crate::ai::MAX_AI_BASE_URL_CHARS;
+use crate::campaign::{
+    MAX_CAMPAIGN_NAME_CHARS, MAX_PLANS_PER_BUILD, MAX_RULE_VALUE_CHARS, MAX_STATE_NOTE_CHARS,
+    MAX_TEMPLATE_CHARS,
+};
+use crate::notify::MAX_NOTIFICATION_EVENT_CHARS;
 use crate::reply::{MAX_KEYWORD_CHARS, MAX_MESSAGE_CHARS, MAX_REPLY_CHARS};
 
 /// Supported capability schema wrapper.
@@ -240,6 +246,50 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             },"additionalProperties":false}),
         ),
         tool(
+            "ai_profile_add",
+            "Add or update credential-free local HTTPS OpenAI-compatible model metadata",
+            json!({"type":"object","required":["name","base_url","model"],"properties":{
+                "name":{"type":"string","minLength":1,"maxLength":64},
+                "base_url":{"type":"string","minLength":9,"maxLength":MAX_AI_BASE_URL_CHARS},
+                "model":{"type":"string","minLength":1,"maxLength":256}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "ai_profile_list",
+            "List credential-free local AI model profiles",
+            empty(),
+        ),
+        tool(
+            "ai_profile_show",
+            "Show one credential-free local AI model profile",
+            name_schema(false),
+        ),
+        tool(
+            "ai_profile_remove",
+            "Remove one credential-free local AI model profile",
+            name_schema(false),
+        ),
+        tool(
+            "ai_draft",
+            "Confirmed remote model call: generate text from one cached job and one typed local resume; never contacts a job platform",
+            ai_operation_schema(),
+        ),
+        tool(
+            "ai_score",
+            "Confirmed remote model call: return strict fit score JSON for one cached job and one typed local resume; never contacts a job platform",
+            ai_operation_schema(),
+        ),
+        tool(
+            "notify_preview",
+            "Render a bounded local notification summary; it never reads a webhook or uses network",
+            notification_event_schema(false),
+        ),
+        tool(
+            "notify_send",
+            "Confirmed remote webhook notification with aggregate counts only; endpoint and response body are never stored",
+            notification_event_schema(true),
+        ),
+        tool(
             "keyword_reply_add",
             "Add or update a local keyword-reply rule; it never sends a platform message",
             json!({"type":"object","required":["keyword","reply"],"properties":{
@@ -267,6 +317,102 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             },"additionalProperties":false}),
         ),
         tool(
+            "campaign_policy_add",
+            "Add or update a reusable local-only cached-job campaign policy",
+            campaign_policy_schema(),
+        ),
+        tool(
+            "campaign_policy_list",
+            "List local campaign policies",
+            empty(),
+        ),
+        tool(
+            "campaign_policy_show",
+            "Show one local campaign policy",
+            name_schema(false),
+        ),
+        tool(
+            "campaign_policy_remove",
+            "Remove one local campaign policy",
+            name_schema(false),
+        ),
+        tool(
+            "campaign_blacklist_add",
+            "Add a local company, description, or job blacklist rule",
+            blacklist_schema(),
+        ),
+        tool(
+            "campaign_blacklist_list",
+            "List local campaign blacklist rules",
+            empty(),
+        ),
+        tool(
+            "campaign_blacklist_remove",
+            "Remove a local campaign blacklist rule",
+            blacklist_schema(),
+        ),
+        tool(
+            "campaign_template_add",
+            "Add or update a local greeting template with allow-listed placeholders only",
+            json!({"type":"object","required":["name","body"],"properties":{
+                "name":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "body":{"type":"string","minLength":1,"maxLength":MAX_TEMPLATE_CHARS}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "campaign_template_list",
+            "List local greeting templates",
+            empty(),
+        ),
+        tool(
+            "campaign_template_show",
+            "Show one local greeting template",
+            name_schema(false),
+        ),
+        tool(
+            "campaign_template_remove",
+            "Remove one local greeting template",
+            name_schema(false),
+        ),
+        tool(
+            "campaign_template_render",
+            "Render a local greeting preview from one cached job; it never sends a message",
+            json!({"type":"object","required":["name","job_id"],"properties":{
+                "name":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "job_id":{"type":"string","minLength":1}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "campaign_plan_create",
+            "Create local manual-review dry-run plans from cached jobs; it never contacts a platform",
+            json!({"type":"object","required":["policy"],"properties":{
+                "policy":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "template":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "resume_name":{"type":"string","minLength":1,"maxLength":64},
+                "limit":{"type":"integer","minimum":1,"maximum":MAX_PLANS_PER_BUILD}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "campaign_plan_list",
+            "List local-only campaign plans and their human workflow state",
+            empty(),
+        ),
+        tool(
+            "campaign_plan_transition",
+            "Record a confirmed local human workflow transition; recorded_submitted is an attestation only and never contacts a platform",
+            json!({"type":"object","required":["job_id","state","confirm"],"properties":{
+                "job_id":{"type":"string","minLength":1,"maxLength":MAX_RULE_VALUE_CHARS},
+                "state":{"type":"string","enum":["approved","rejected","recorded_submitted"]},
+                "note":{"type":"string","minLength":1,"maxLength":MAX_STATE_NOTE_CHARS},
+                "confirm":{"const":true}
+            },"additionalProperties":false}),
+        ),
+        tool(
+            "campaign_stats",
+            "Summarize strictly local campaign policies, rules, templates, and plans",
+            empty(),
+        ),
+        tool(
             "stats",
             "Summarize exact strictly local workflow data",
             json!({"type":"object","properties":{
@@ -277,7 +423,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "clean_preview",
             "Preview exact known local files; MCP never archives or removes them",
             json!({"type":"object","required":["target"],"properties":{
-                "target":{"type":"string","enum":["jobs","history","shortlist","presets","reply_rules","watches","resumes","all"]}
+                "target":{"type":"string","enum":["jobs","history","shortlist","presets","reply_rules","watches","resumes","campaign_policies","campaign_blacklist","greeting_templates","application_plans","ai_profiles","notification_audit","all"]}
             },"additionalProperties":false}),
         ),
     ]
@@ -317,6 +463,43 @@ fn search_named_schema(include_preset: bool) -> Value {
     }
 }
 
+fn campaign_policy_schema() -> Value {
+    let fields = [
+        "title",
+        "company",
+        "city",
+        "district",
+        "salary",
+        "experience",
+        "education",
+        "employment_type",
+        "skills",
+        "welfare",
+        "description",
+        "address",
+    ];
+    let rule = json!({"type":"object","required":["field","value"],"properties":{
+        "field":{"type":"string","enum":fields},
+        "value":{"type":"string","minLength":1,"maxLength":MAX_RULE_VALUE_CHARS}
+    },"additionalProperties":false});
+    json!({"type":"object","required":["name"],"properties":{
+        "name":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+        "include":{"type":"array","maxItems":32,"items":rule},
+        "exclude":{"type":"array","maxItems":32,"items":rule},
+        "required_welfare":{"type":"array","maxItems":16,"items":{"type":"string","minLength":1,"maxLength":MAX_RULE_VALUE_CHARS}},
+        "monthly_salary_min":{"type":"integer","minimum":1},
+        "monthly_salary_max":{"type":"integer","minimum":1},
+        "minimum_score":{"type":"integer","minimum":0,"maximum":100}
+    },"additionalProperties":false})
+}
+
+fn blacklist_schema() -> Value {
+    json!({"type":"object","required":["kind","value"],"properties":{
+        "kind":{"type":"string","enum":["company","description","job"]},
+        "value":{"type":"string","minLength":1,"maxLength":MAX_RULE_VALUE_CHARS}
+    },"additionalProperties":false})
+}
+
 /// Renders one requested schema wrapper.
 pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
     let tools = tool_registry();
@@ -329,7 +512,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                 .collect();
             json!({
                 "name":"boss",
-                "read_only_remote":true,
+                "read_only_remote":false,
                 "platforms":["zhipin","zhilian","qiancheng"],
                 "commands":commands,
                 "mcp_tools":tools,
@@ -337,9 +520,15 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                    "authentication":"login and logout are CLI-only private credential operations. Automatic sources are local; if none resolve on an interactive terminal, a user-driven platform QR flow runs before the isolated browser fallback. QR art is stderr-only, failures fall through without saving credentials, and authentication remains unavailable through MCP. BossKit does not send a separate provider verification request."
+                "authentication":"login and logout are CLI-only private credential operations. Automatic sources are local; if none resolve on an interactive terminal, BossKit can use an isolated browser login flow. Authentication remains unavailable through MCP, and BossKit does not send a separate provider verification request."
                 },
-                "risk":{"remote_writes":false,"local_writes":local_writes}
+                "risk":{
+                    "remote_writes":true,
+                    "confirmed_remote_notifications":["notify send"],
+                    "confirmed_model_calls":["ai draft","ai score"],
+                    "all_remote_operations_read_only":false,
+                    "local_writes":local_writes
+                }
             })
         }
         SchemaFormat::OpenaiTools => Value::Array(
@@ -369,6 +558,29 @@ fn platform_schema() -> Value {
     json!({"type":"object","properties":{
         "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]}
     },"additionalProperties":false})
+}
+
+fn ai_operation_schema() -> Value {
+    json!({"type":"object","required":["profile","job_id","resume_name","confirm"],"properties":{
+        "profile":{"type":"string","minLength":1,"maxLength":64},
+        "job_id":{"type":"string","minLength":1},
+        "resume_name":{"type":"string","minLength":1,"maxLength":64},
+        "confirm":{"const":true}
+    },"additionalProperties":false})
+}
+
+fn notification_event_schema(confirm: bool) -> Value {
+    let mut properties = json!({
+        "event":{"type":"string","minLength":1,"maxLength":MAX_NOTIFICATION_EVENT_CHARS,
+            "pattern":"^[a-z0-9][a-z0-9._-]{0,63}$"}
+    });
+    let mut required = vec!["event"];
+    if confirm {
+        properties["confirm"] = json!({"const":true});
+        required.push("confirm");
+    }
+    json!({"type":"object","required":required,"properties":properties,
+        "additionalProperties":false})
 }
 
 #[derive(Serialize)]
@@ -411,6 +623,22 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("reply ls", &[]),
         ("reply rm", &["reply_rules"]),
         ("reply match", &[]),
+        ("campaign policy add", &["campaign_policies"]),
+        ("campaign policy ls", &[]),
+        ("campaign policy show", &[]),
+        ("campaign policy rm", &["campaign_policies"]),
+        ("campaign blacklist add", &["campaign_blacklist"]),
+        ("campaign blacklist ls", &[]),
+        ("campaign blacklist rm", &["campaign_blacklist"]),
+        ("campaign template add", &["greeting_templates"]),
+        ("campaign template ls", &[]),
+        ("campaign template show", &[]),
+        ("campaign template rm", &["greeting_templates"]),
+        ("campaign template render", &[]),
+        ("campaign plan create", &["application_plans"]),
+        ("campaign plan ls", &[]),
+        ("campaign plan transition", &["application_plans"]),
+        ("campaign stats", &[]),
         ("watch add", &["watches"]),
         ("watch ls", &[]),
         ("watch show", &[]),
@@ -426,6 +654,14 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("resume import", &["resumes"]),
         ("resume export", &["resume_export_target"]),
         ("resume rm", &["resumes"]),
+        ("ai profile add", &["ai_profiles"]),
+        ("ai profile ls", &[]),
+        ("ai profile show", &[]),
+        ("ai profile rm", &["ai_profiles"]),
+        ("ai draft", &[]),
+        ("ai score", &[]),
+        ("notify preview", &[]),
+        ("notify send", &["notification_audit"]),
         ("stats", &[]),
         (
             "clean",
@@ -437,6 +673,12 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "reply_rules",
                 "watches",
                 "resumes",
+                "campaign_policies",
+                "campaign_blacklist",
+                "greeting_templates",
+                "application_plans",
+                "ai_profiles",
+                "notification_audit",
             ],
         ),
         (
@@ -450,13 +692,19 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "reply_rules",
                 "watches",
                 "resumes",
+                "campaign_policies",
+                "campaign_blacklist",
+                "greeting_templates",
+                "application_plans",
+                "ai_profiles",
+                "notification_audit",
             ],
         ),
     ]
     .into_iter()
     .map(|(name, local_write_targets)| CommandDefinition {
         name,
-        remote_write: false,
+        remote_write: matches!(name, "notify send" | "mcp"),
         local_write: !local_write_targets.is_empty(),
         local_write_targets,
     })
@@ -478,12 +726,18 @@ mod tests {
     #[test]
     fn native_registry_contains_every_mcp_tool() {
         let native = render(SchemaFormat::Native).expect("native");
+        assert_eq!(native["mcp_tools"], json!(tool_registry()));
+    }
+
+    #[test]
+    fn ai_profile_schema_reuses_the_shared_base_url_bound() {
+        let profile_add = tool_registry()
+            .into_iter()
+            .find(|tool| tool.name == "ai_profile_add")
+            .expect("AI profile tool");
         assert_eq!(
-            (
-                native["mcp_tools"].as_array().map(Vec::len),
-                tool_registry().len(),
-            ),
-            (Some(39), 39)
+            profile_add.input_schema["properties"]["base_url"]["maxLength"],
+            json!(MAX_AI_BASE_URL_CHARS)
         );
     }
 

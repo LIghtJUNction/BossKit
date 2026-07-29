@@ -10,15 +10,25 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reqwest::redirect::Policy as RedirectPolicy;
 use serde_json::{Value, json};
 
+use crate::ai::{AiProfile, AiProfileStore, AiScore};
 use crate::auth::{AuthStore, read_manual_cookie};
+use crate::campaign::{
+    ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
+    CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult,
+};
 use crate::config::{AppConfig, ConfigChange, ConfigEntry, ConfigStore};
 use crate::export::{ExportOptions, ExportResult, ExportSource, structured_jobs, write_export};
 use crate::history::{HistoryProviderSummary, SearchHistoryEntry, SearchHistoryStore};
 use crate::model::{ProviderFailure, ProviderResult, SearchSpecPatch};
+use crate::notify::{
+    NotificationPayload, NotificationStatus, NotificationStore, NotificationSummary,
+    webhook_url_from_environment,
+};
 use crate::preset::{Preset, PresetStore};
 use crate::provider::{
     JobProvider, QianchengProvider, SearchRequest, ZhilianProvider, ZhipinProvider, http_client,
@@ -109,6 +119,8 @@ pub struct BossService {
     reply_rules: ReplyStore,
     watches: WatchStore,
     resumes: ResumeStore,
+    campaigns: CampaignStore,
+    ai_profiles: AiProfileStore,
     auth: AuthStore,
     providers: Vec<Box<dyn JobProvider>>,
 }
@@ -134,6 +146,8 @@ impl BossService {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             paths,
             config,
             auth,
@@ -249,7 +263,7 @@ impl BossService {
         diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
     }
 
-    /// Resolves a local Cookie source, then tries terminal QR and browser fallbacks.
+    /// Resolves a local Cookie source, then tries browser and manual fallbacks.
     pub async fn login(
         &mut self,
         platform: Option<Platform>,
@@ -259,19 +273,12 @@ impl BossService {
         for selected in selected_platforms(platform) {
             results.push(self.login_platform(selected, manual).await?);
         }
-        let interactive_qr_used = results
-            .iter()
-            .any(|result| result.get("source").and_then(Value::as_str) == Some("interactive_qr"));
         let interactive_browser_used = results.iter().any(|result| {
             result.get("source").and_then(Value::as_str) == Some("interactive_browser")
         });
         Ok(json!({
             "network_checked":false,
-            "verification":if interactive_qr_used && interactive_browser_used {
-                "interactive_provider_unverified"
-            } else if interactive_qr_used {
-                "qr_interactive_provider_unverified"
-            } else if interactive_browser_used {
+            "verification":if interactive_browser_used {
                 "browser_interactive_provider_unverified"
             } else {
                 "local_unverified"
@@ -316,17 +323,6 @@ impl BossService {
                 platform,
                 "stored_unverified",
                 "stored_session",
-            ));
-        }
-        if std::io::stdin().is_terminal()
-            && std::io::stderr().is_terminal()
-            && let Some(cookie) = crate::qr_login::interactive_login(platform).await
-        {
-            self.auth.store_session(platform, cookie)?;
-            return Ok(login_outcome(
-                platform,
-                "stored_unverified",
-                "interactive_qr",
             ));
         }
         self.browser_or_manual_result(
@@ -723,6 +719,128 @@ impl BossService {
         self.reply_rules.match_message(message)
     }
 
+    /// Adds or updates a reusable local-only campaign policy.
+    pub fn campaign_policy_add(&self, policy: CampaignPolicy) -> Result<CampaignPolicy, BossError> {
+        self.campaigns.add_policy(policy)
+    }
+
+    /// Lists reusable local-only campaign policies.
+    pub fn campaign_policy_list(&self) -> Result<Vec<CampaignPolicy>, BossError> {
+        self.campaigns.list_policies()
+    }
+
+    /// Shows one local-only campaign policy.
+    pub fn campaign_policy_show(&self, name: &str) -> Result<CampaignPolicy, BossError> {
+        self.campaigns.show_policy(name)
+    }
+
+    /// Removes one local-only campaign policy.
+    pub fn campaign_policy_remove(&self, name: &str) -> Result<CampaignPolicy, BossError> {
+        self.campaigns.remove_policy(name)
+    }
+
+    /// Adds one local campaign blacklist rule.
+    pub fn campaign_blacklist_add(
+        &self,
+        kind: BlacklistKind,
+        value: &str,
+    ) -> Result<BlacklistRule, BossError> {
+        self.campaigns.add_blacklist(kind, value, now_seconds()?)
+    }
+
+    /// Lists local campaign blacklist rules.
+    pub fn campaign_blacklist_list(&self) -> Result<Vec<BlacklistRule>, BossError> {
+        self.campaigns.list_blacklist()
+    }
+
+    /// Removes one local campaign blacklist rule.
+    pub fn campaign_blacklist_remove(
+        &self,
+        kind: BlacklistKind,
+        value: &str,
+    ) -> Result<BlacklistRule, BossError> {
+        self.campaigns.remove_blacklist(kind, value)
+    }
+
+    /// Adds or updates an allow-listed local greeting template.
+    pub fn campaign_template_add(
+        &self,
+        name: &str,
+        body: &str,
+    ) -> Result<GreetingTemplate, BossError> {
+        self.campaigns.add_template(name, body, now_seconds()?)
+    }
+
+    /// Lists local greeting templates.
+    pub fn campaign_template_list(&self) -> Result<Vec<GreetingTemplate>, BossError> {
+        self.campaigns.list_templates()
+    }
+
+    /// Shows one local greeting template.
+    pub fn campaign_template_show(&self, name: &str) -> Result<GreetingTemplate, BossError> {
+        self.campaigns.show_template(name)
+    }
+
+    /// Removes one local greeting template.
+    pub fn campaign_template_remove(&self, name: &str) -> Result<GreetingTemplate, BossError> {
+        self.campaigns.remove_template(name)
+    }
+
+    /// Renders a local template against one cached job without sending it.
+    pub fn campaign_template_render(&self, name: &str, job_id: &str) -> Result<String, BossError> {
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument(format!("job not found: {job_id}")))?;
+        self.campaigns.render_template(name, &job)
+    }
+
+    /// Builds local manual-review dry-run plans from cached jobs only.
+    pub fn campaign_plan_create(
+        &self,
+        policy_name: &str,
+        template_name: Option<&str>,
+        resume_name: Option<&str>,
+        limit: usize,
+    ) -> Result<PlanBuildResult, BossError> {
+        let policy = self.campaigns.show_policy(policy_name)?;
+        let template = template_name
+            .map(|name| self.campaigns.show_template(name))
+            .transpose()?;
+        let resume = resume_name
+            .map(|name| self.resumes.show(name))
+            .transpose()?;
+        self.campaigns.build_plans(
+            &self.cache.all()?,
+            &policy,
+            template.as_ref(),
+            resume.as_ref(),
+            limit,
+            now_seconds()?,
+        )
+    }
+
+    /// Lists immutable local manual-review dry-run plans.
+    pub fn campaign_plan_list(&self) -> Result<Vec<ApplicationPlan>, BossError> {
+        self.campaigns.list_plans()
+    }
+
+    /// Records a confirmed human plan-state transition without making a remote request.
+    pub fn campaign_plan_transition(
+        &self,
+        job_id: &str,
+        state: ApplicationPlanState,
+        note: Option<String>,
+    ) -> Result<ApplicationPlan, BossError> {
+        self.campaigns
+            .transition_plan(job_id, state, note, now_seconds()?)
+    }
+
+    /// Returns exact counts for local campaign data only.
+    pub fn campaign_stats(&self) -> Result<CampaignStats, BossError> {
+        self.campaigns.stats()
+    }
+
     /// Adds a foreground watch with a copied search snapshot.
     pub fn watch_add(&self, name: &str, spec: SearchSpec) -> Result<Watch, BossError> {
         let spec = self.validate_search_spec(spec)?;
@@ -926,6 +1044,142 @@ impl BossService {
         self.resumes.remove(name)
     }
 
+    /// Adds or updates a credential-free local AI model profile.
+    pub fn ai_profile_add(
+        &self,
+        name: &str,
+        base_url: &str,
+        model: &str,
+    ) -> Result<AiProfile, BossError> {
+        self.ai_profiles.add(name, base_url, model, now_seconds()?)
+    }
+
+    /// Lists credential-free local AI model profiles.
+    pub fn ai_profile_list(&self) -> Result<Vec<AiProfile>, BossError> {
+        self.ai_profiles.list()
+    }
+
+    /// Shows one credential-free local AI model profile.
+    pub fn ai_profile_show(&self, name: &str) -> Result<AiProfile, BossError> {
+        self.ai_profiles.show(name)
+    }
+
+    /// Removes one credential-free local AI model profile.
+    pub fn ai_profile_remove(&self, name: &str) -> Result<AiProfile, BossError> {
+        self.ai_profiles.remove(name)
+    }
+
+    /// Generates one AI draft only after explicit confirmation.
+    pub async fn ai_draft(
+        &self,
+        profile_name: &str,
+        job_id: &str,
+        resume_name: &str,
+        confirm: bool,
+    ) -> Result<String, BossError> {
+        if !confirm {
+            return Err(BossError::InvalidArgument(
+                "AI draft requires explicit confirmation".to_owned(),
+            ));
+        }
+        let profile = self.ai_profiles.show(profile_name)?;
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument("cached job not found".to_owned()))?;
+        let resume = self.resumes.show(resume_name)?;
+        crate::ai::draft(&profile, &job, &resume).await
+    }
+
+    /// Scores one cached job against one local resume only after confirmation.
+    pub async fn ai_score(
+        &self,
+        profile_name: &str,
+        job_id: &str,
+        resume_name: &str,
+        confirm: bool,
+    ) -> Result<AiScore, BossError> {
+        if !confirm {
+            return Err(BossError::InvalidArgument(
+                "AI score requires explicit confirmation".to_owned(),
+            ));
+        }
+        let profile = self.ai_profiles.show(profile_name)?;
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument("cached job not found".to_owned()))?;
+        let resume = self.resumes.show(resume_name)?;
+        crate::ai::score(&profile, &job, &resume).await
+    }
+
+    /// Renders a bounded local notification payload without reading environment or using network.
+    pub fn notification_preview(&self, event: &str) -> Result<NotificationPayload, BossError> {
+        NotificationPayload::new(event, NotificationSummary::from_stats(&self.stats(30)?)?)
+    }
+
+    /// Sends one minimal webhook payload only after explicit confirmation.
+    ///
+    /// The webhook endpoint is runtime-only. Every attempted confirmed delivery records only
+    /// event, success/failure status, and timestamp locally; response bodies are never read.
+    pub async fn notification_send(
+        &self,
+        event: &str,
+        confirmed: bool,
+    ) -> Result<Value, BossError> {
+        if !confirmed {
+            return Err(BossError::InvalidArgument(
+                "notification send requires explicit confirmation".to_owned(),
+            ));
+        }
+        let payload = self.notification_preview(event)?;
+        let audit_store = NotificationStore::from_paths(&self.paths);
+        let endpoint = match webhook_url_from_environment() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                audit_store.record(&payload.event, NotificationStatus::Failure)?;
+                return Err(error);
+            }
+        };
+        let client = match reqwest::Client::builder()
+            .https_only(true)
+            .redirect(RedirectPolicy::none())
+            .timeout(Duration::from_secs(
+                self.effective_config().request_timeout_secs,
+            ))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                audit_store.record(&payload.event, NotificationStatus::Failure)?;
+                return Err(BossError::Notification(
+                    "notification transport is unavailable",
+                ));
+            }
+        };
+        let response = client.post(endpoint).json(&payload).send().await;
+        let success = response
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success());
+        let status = if success {
+            NotificationStatus::Success
+        } else {
+            NotificationStatus::Failure
+        };
+        let audit = audit_store.record(&payload.event, status)?;
+        if !success {
+            return Err(BossError::Notification(
+                "notification delivery was not accepted",
+            ));
+        }
+        Ok(json!({
+            "mode":"confirmed_remote_notification",
+            "sent":true,
+            "payload":payload,
+            "audit":audit
+        }))
+    }
+
     /// Returns exact local workflow statistics.
     pub fn stats(&self, days: u64) -> Result<Value, BossError> {
         if days == 0 {
@@ -958,6 +1212,8 @@ impl BossService {
             })
             .count();
         let sizes = known_file_sizes(&self.paths)?;
+        let campaign = self.campaign_stats()?;
+        let notification_audit = NotificationStore::from_paths(&self.paths).list()?.len();
         Ok(json!({
             "days":days,
             "jobs":{"total":jobs.len(),"by_platform":by_platform,
@@ -969,6 +1225,9 @@ impl BossService {
             "reply_rules":self.reply_rules.list()?.len(),
             "watches":self.watches.list()?.len(),
             "resumes":self.resumes.list()?.len(),
+            "ai_profiles":self.ai_profiles.list()?.len(),
+            "campaign":campaign,
+            "notification_audit":notification_audit,
             "file_bytes":sizes
         }))
     }
@@ -1727,6 +1986,12 @@ fn known_file_sizes(paths: &DataPaths) -> Result<Value, BossError> {
         ("reply_rules", paths.reply_rules()),
         ("watches", paths.watches()),
         ("resumes", paths.resumes()),
+        ("campaign_policies", paths.campaign_policies()),
+        ("campaign_blacklist", paths.campaign_blacklist()),
+        ("greeting_templates", paths.greeting_templates()),
+        ("application_plans", paths.application_plans()),
+        ("ai_profiles", paths.ai_profiles()),
+        ("notification_audit", paths.notification_audit()),
         ("config", paths.config()),
     ] {
         let bytes = match fs::symlink_metadata(path) {
@@ -1755,6 +2020,12 @@ fn clean_targets(
             ("reply_rules", paths.reply_rules()),
             ("watches", paths.watches()),
             ("resumes", paths.resumes()),
+            ("campaign_policies", paths.campaign_policies()),
+            ("campaign_blacklist", paths.campaign_blacklist()),
+            ("greeting_templates", paths.greeting_templates()),
+            ("application_plans", paths.application_plans()),
+            ("ai_profiles", paths.ai_profiles()),
+            ("notification_audit", paths.notification_audit()),
         ]
     };
     if target == "all" {
@@ -2041,6 +2312,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            campaigns: CampaignStore::from_paths(&DataPaths::new(directory.path())),
+            ai_profiles: AiProfileStore::from_paths(&DataPaths::new(directory.path())),
             auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![
                 Box::new(MockProvider {
@@ -2085,6 +2358,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            campaigns: CampaignStore::from_paths(&DataPaths::new(directory.path())),
+            ai_profiles: AiProfileStore::from_paths(&DataPaths::new(directory.path())),
             auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2110,6 +2385,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
             watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
             resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
+            campaigns: CampaignStore::from_paths(&DataPaths::new(directory.path())),
+            ai_profiles: AiProfileStore::from_paths(&DataPaths::new(directory.path())),
             auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2220,6 +2497,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2253,6 +2532,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2286,6 +2567,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2744,6 +3027,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             auth: AuthStore::from_paths(&paths),
             providers: vec![Box::new(MockProvider {
                 platform: Platform::Zhipin,
@@ -2781,6 +3066,8 @@ mod tests {
             reply_rules: ReplyStore::from_paths(&paths),
             watches: WatchStore::from_paths(&paths),
             resumes: ResumeStore::from_paths(&paths),
+            campaigns: CampaignStore::from_paths(&paths),
+            ai_profiles: AiProfileStore::from_paths(&paths),
             auth: AuthStore::from_paths(&paths),
             providers: vec![
                 Box::new(MockProvider {

@@ -3,6 +3,9 @@ use std::process::ExitCode;
 
 use std::path::PathBuf;
 
+use bosskit::campaign::{
+    ApplicationPlanState, BlacklistKind, CampaignField, CampaignPolicy, CampaignRule,
+};
 use bosskit::export::{ExportFormat, ExportOptions, ExportSource};
 use bosskit::model::ErrorBody;
 use bosskit::schema::SchemaFormat;
@@ -40,6 +43,11 @@ enum Command {
         #[command(subcommand)]
         command: ReplyCommand,
     },
+    /// 管理仅基于本地缓存的人工复核求职计划
+    Campaign {
+        #[command(subcommand)]
+        command: CampaignCommand,
+    },
     /// 管理显式前台职位监视
     Watch {
         #[command(subcommand)]
@@ -49,6 +57,16 @@ enum Command {
     Resume {
         #[command(subcommand)]
         command: ResumeCommand,
+    },
+    /// Manage credential-free local AI profiles and explicitly confirmed model calls
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
+    },
+    /// Preview or explicitly send a minimal notification webhook summary
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommand,
     },
     /// 汇总严格本地工作流统计
     Stats {
@@ -106,7 +124,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 保存本地 Cookie；无可用来源时先显示终端二维码，再打开隔离浏览器
+    /// 保存本地 Cookie；无可用来源时打开隔离浏览器
     Login {
         #[arg(long, value_enum)]
         platform: Option<PlatformArg>,
@@ -204,6 +222,121 @@ enum ReplyCommand {
     Rm { keyword: String },
     /// 按本地消息文本返回建议，不发送平台消息
     Match { message: String },
+}
+
+#[derive(Subcommand)]
+enum CampaignCommand {
+    /// 管理可复用的本地筛选策略
+    Policy {
+        #[command(subcommand)]
+        command: CampaignPolicyCommand,
+    },
+    /// 管理本地公司、缓存职位描述或职位黑名单
+    Blacklist {
+        #[command(subcommand)]
+        command: CampaignBlacklistCommand,
+    },
+    /// 管理只渲染不发送的问候模板
+    Template {
+        #[command(subcommand)]
+        command: CampaignTemplateCommand,
+    },
+    /// 生成或查看人工复核 dry-run 计划
+    Plan {
+        #[command(subcommand)]
+        command: CampaignPlanCommand,
+    },
+    /// 汇总本地活动数据
+    Stats,
+}
+
+#[derive(Subcommand)]
+enum CampaignPolicyCommand {
+    /// 添加或更新策略；规则格式为 field:value
+    Add {
+        name: String,
+        #[arg(long = "include")]
+        include: Vec<String>,
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        #[arg(long = "welfare", value_delimiter = ',')]
+        required_welfare: Vec<String>,
+        #[arg(long = "monthly-salary-min")]
+        monthly_salary_min: Option<NonZeroU32>,
+        #[arg(long = "monthly-salary-max")]
+        monthly_salary_max: Option<NonZeroU32>,
+        #[arg(long = "minimum-score")]
+        minimum_score: Option<u8>,
+    },
+    /// 列出策略
+    #[command(visible_alias = "list")]
+    Ls,
+    /// 查看策略
+    Show { name: String },
+    /// 移除策略
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum CampaignBlacklistCommand {
+    /// 添加本地黑名单规则
+    Add {
+        kind: BlacklistKindArg,
+        value: String,
+    },
+    /// 列出本地黑名单规则
+    #[command(visible_alias = "list")]
+    Ls,
+    /// 移除本地黑名单规则
+    #[command(visible_alias = "remove")]
+    Rm {
+        kind: BlacklistKindArg,
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CampaignTemplateCommand {
+    /// 添加或更新允许占位符的本地模板
+    Add { name: String, body: String },
+    /// 列出本地模板
+    #[command(visible_alias = "list")]
+    Ls,
+    /// 查看模板
+    Show { name: String },
+    /// 移除模板
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
+    /// 使用一条缓存职位本地渲染模板，不发送
+    Render { name: String, job_id: String },
+}
+
+#[derive(Subcommand)]
+enum CampaignPlanCommand {
+    /// 从缓存职位建立人工复核 dry-run 计划
+    Create {
+        policy: String,
+        #[arg(long)]
+        template: Option<String>,
+        /// Bind one existing local typed resume without copying its content into the plan.
+        #[arg(long)]
+        resume_name: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: NonZeroUsize,
+    },
+    /// 列出现有人工复核计划
+    #[command(visible_alias = "list")]
+    Ls,
+    /// 记录一项已确认的本地人工工作流状态变化，不会提交到平台
+    Transition {
+        job_id: String,
+        state: CampaignPlanStateArg,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -312,6 +445,61 @@ enum ResumeCommand {
 }
 
 #[derive(Subcommand)]
+enum AiCommand {
+    /// Add or update a credential-free HTTPS OpenAI-compatible profile
+    Profile {
+        #[command(subcommand)]
+        command: AiProfileCommand,
+    },
+    /// Generate an AI draft from one cached job and one typed local resume
+    Draft {
+        profile: String,
+        job_id: String,
+        resume_name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Score one cached job against one typed local resume
+    Score {
+        profile: String,
+        job_id: String,
+        resume_name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AiProfileCommand {
+    /// Add or update profile metadata only; no key is accepted or stored
+    Add {
+        name: String,
+        base_url: String,
+        model: String,
+    },
+    /// List local profiles
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Show one local profile
+    Show { name: String },
+    /// Remove one local profile
+    #[command(visible_alias = "remove")]
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum NotifyCommand {
+    /// Render the bounded local payload only; it never reads a webhook or uses network
+    Preview { event: String },
+    /// Send the bounded payload to the runtime-only webhook after explicit confirmation
+    Send {
+        event: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
     /// 列出所有安全配置
     #[command(visible_alias = "list")]
@@ -368,6 +556,23 @@ enum PlatformArg {
     All,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum BlacklistKindArg {
+    Company,
+    Description,
+    Job,
+}
+
+impl From<BlacklistKindArg> for BlacklistKind {
+    fn from(value: BlacklistKindArg) -> Self {
+        match value {
+            BlacklistKindArg::Company => Self::Company,
+            BlacklistKindArg::Description => Self::Description,
+            BlacklistKindArg::Job => Self::Job,
+        }
+    }
+}
+
 impl PlatformArg {
     const fn selected(self) -> Option<Platform> {
         match self {
@@ -398,6 +603,18 @@ enum CleanTargetArg {
     ReplyRules,
     Watches,
     Resumes,
+    #[value(name = "campaign_policies", alias = "campaign-policies")]
+    CampaignPolicies,
+    #[value(name = "campaign_blacklist", alias = "campaign-blacklist")]
+    CampaignBlacklist,
+    #[value(name = "greeting_templates", alias = "greeting-templates")]
+    GreetingTemplates,
+    #[value(name = "application_plans", alias = "application-plans")]
+    ApplicationPlans,
+    #[value(name = "ai_profiles", alias = "ai-profiles")]
+    AiProfiles,
+    #[value(name = "notification_audit", alias = "notification-audit")]
+    NotificationAudit,
     All,
 }
 
@@ -411,7 +628,31 @@ impl CleanTargetArg {
             Self::ReplyRules => "reply_rules",
             Self::Watches => "watches",
             Self::Resumes => "resumes",
+            Self::CampaignPolicies => "campaign_policies",
+            Self::CampaignBlacklist => "campaign_blacklist",
+            Self::GreetingTemplates => "greeting_templates",
+            Self::ApplicationPlans => "application_plans",
+            Self::AiProfiles => "ai_profiles",
+            Self::NotificationAudit => "notification_audit",
             Self::All => "all",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CampaignPlanStateArg {
+    Approved,
+    Rejected,
+    #[value(name = "recorded_submitted", alias = "recorded-submitted")]
+    RecordedSubmitted,
+}
+
+impl From<CampaignPlanStateArg> for ApplicationPlanState {
+    fn from(value: CampaignPlanStateArg) -> Self {
+        match value {
+            CampaignPlanStateArg::Approved => Self::Approved,
+            CampaignPlanStateArg::Rejected => Self::Rejected,
+            CampaignPlanStateArg::RecordedSubmitted => Self::RecordedSubmitted,
         }
     }
 }
@@ -553,6 +794,115 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.reply_match(&message)?));
             }
         },
+        Command::Campaign { command } => match command {
+            CampaignCommand::Policy { command } => match command {
+                CampaignPolicyCommand::Add {
+                    name,
+                    include,
+                    exclude,
+                    required_welfare,
+                    monthly_salary_min,
+                    monthly_salary_max,
+                    minimum_score,
+                } => {
+                    let policy = CampaignPolicy {
+                        name,
+                        include: parse_campaign_rules(include, "include")?,
+                        exclude: parse_campaign_rules(exclude, "exclude")?,
+                        required_welfare,
+                        monthly_salary_min: monthly_salary_min.map(NonZeroU32::get),
+                        monthly_salary_max: monthly_salary_max.map(NonZeroU32::get),
+                        minimum_score,
+                    };
+                    print_json(&Envelope::success(service.campaign_policy_add(policy)?));
+                }
+                CampaignPolicyCommand::Ls => {
+                    print_json(&Envelope::success(service.campaign_policy_list()?));
+                }
+                CampaignPolicyCommand::Show { name } => {
+                    print_json(&Envelope::success(service.campaign_policy_show(&name)?));
+                }
+                CampaignPolicyCommand::Rm { name } => {
+                    print_json(&Envelope::success(service.campaign_policy_remove(&name)?));
+                }
+            },
+            CampaignCommand::Blacklist { command } => match command {
+                CampaignBlacklistCommand::Add { kind, value } => {
+                    print_json(&Envelope::success(
+                        service.campaign_blacklist_add(kind.into(), &value)?,
+                    ));
+                }
+                CampaignBlacklistCommand::Ls => {
+                    print_json(&Envelope::success(service.campaign_blacklist_list()?));
+                }
+                CampaignBlacklistCommand::Rm { kind, value } => {
+                    print_json(&Envelope::success(
+                        service.campaign_blacklist_remove(kind.into(), &value)?,
+                    ));
+                }
+            },
+            CampaignCommand::Template { command } => match command {
+                CampaignTemplateCommand::Add { name, body } => {
+                    print_json(&Envelope::success(
+                        service.campaign_template_add(&name, &body)?,
+                    ));
+                }
+                CampaignTemplateCommand::Ls => {
+                    print_json(&Envelope::success(service.campaign_template_list()?));
+                }
+                CampaignTemplateCommand::Show { name } => {
+                    print_json(&Envelope::success(service.campaign_template_show(&name)?));
+                }
+                CampaignTemplateCommand::Rm { name } => {
+                    print_json(&Envelope::success(service.campaign_template_remove(&name)?));
+                }
+                CampaignTemplateCommand::Render { name, job_id } => {
+                    print_json(&Envelope::success(json!({
+                        "mode":"local_render_only",
+                        "sent":false,
+                        "text":service.campaign_template_render(&name, &job_id)?
+                    })));
+                }
+            },
+            CampaignCommand::Plan { command } => match command {
+                CampaignPlanCommand::Create {
+                    policy,
+                    template,
+                    resume_name,
+                    limit,
+                } => {
+                    print_json(&Envelope::success(service.campaign_plan_create(
+                        &policy,
+                        template.as_deref(),
+                        resume_name.as_deref(),
+                        limit.get(),
+                    )?));
+                }
+                CampaignPlanCommand::Ls => {
+                    print_json(&Envelope::success(service.campaign_plan_list()?));
+                }
+                CampaignPlanCommand::Transition {
+                    job_id,
+                    state,
+                    yes,
+                    note,
+                } => {
+                    if !yes {
+                        return Err(BossError::InvalidArgument(
+                            "campaign plan transition requires --yes".to_owned(),
+                        ));
+                    }
+                    print_json(&Envelope::success(service.campaign_plan_transition(
+                        &job_id,
+                        state.into(),
+                        note,
+                    )?));
+                }
+            },
+            CampaignCommand::Stats => {
+                print_json(&Envelope::success(service.campaign_stats()?));
+            }
+        },
         Command::Watch { command } => match command {
             WatchCommand::Add {
                 name,
@@ -627,6 +977,58 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             )?)),
             ResumeCommand::Rm { name, yes } => {
                 print_json(&Envelope::success(service.resume_remove(&name, yes)?));
+            }
+        },
+        Command::Ai { command } => match command {
+            AiCommand::Profile { command } => match command {
+                AiProfileCommand::Add {
+                    name,
+                    base_url,
+                    model,
+                } => print_json(&Envelope::success(
+                    service.ai_profile_add(&name, &base_url, &model)?,
+                )),
+                AiProfileCommand::Ls => {
+                    print_json(&Envelope::success(service.ai_profile_list()?));
+                }
+                AiProfileCommand::Show { name } => {
+                    print_json(&Envelope::success(service.ai_profile_show(&name)?));
+                }
+                AiProfileCommand::Rm { name } => {
+                    print_json(&Envelope::success(service.ai_profile_remove(&name)?));
+                }
+            },
+            AiCommand::Draft {
+                profile,
+                job_id,
+                resume_name,
+                yes,
+            } => print_json(&Envelope::success(json!({
+                "mode":"confirmed_ai_draft",
+                "text":service.ai_draft(&profile, &job_id, &resume_name, yes).await?
+            }))),
+            AiCommand::Score {
+                profile,
+                job_id,
+                resume_name,
+                yes,
+            } => print_json(&Envelope::success(json!({
+                "mode":"confirmed_ai_score",
+                "score":service.ai_score(&profile, &job_id, &resume_name, yes).await?
+            }))),
+        },
+        Command::Notify { command } => match command {
+            NotifyCommand::Preview { event } => {
+                print_json(&Envelope::success(json!({
+                    "mode":"local_notification_preview",
+                    "sent":false,
+                    "payload":service.notification_preview(&event)?
+                })));
+            }
+            NotifyCommand::Send { event, yes } => {
+                print_json(&Envelope::success(
+                    service.notification_send(&event, yes).await?,
+                ));
             }
         },
         Command::Stats { days } => {
@@ -726,6 +1128,44 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         Command::Mcp => bosskit::mcp::run_stdio(&service).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_campaign_rules(
+    values: Vec<String>,
+    category: &str,
+) -> Result<Vec<CampaignRule>, BossError> {
+    values
+        .into_iter()
+        .map(|value| {
+            let (field, value) = value.split_once(':').ok_or_else(|| {
+                BossError::InvalidArgument(format!("{category} rules must use field:value syntax"))
+            })?;
+            Ok(CampaignRule {
+                field: parse_campaign_field(field)?,
+                value: value.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn parse_campaign_field(value: &str) -> Result<CampaignField, BossError> {
+    match value.trim() {
+        "title" => Ok(CampaignField::Title),
+        "company" => Ok(CampaignField::Company),
+        "city" => Ok(CampaignField::City),
+        "district" => Ok(CampaignField::District),
+        "salary" => Ok(CampaignField::Salary),
+        "experience" => Ok(CampaignField::Experience),
+        "education" => Ok(CampaignField::Education),
+        "employment_type" => Ok(CampaignField::EmploymentType),
+        "skills" => Ok(CampaignField::Skills),
+        "welfare" => Ok(CampaignField::Welfare),
+        "description" => Ok(CampaignField::Description),
+        "address" => Ok(CampaignField::Address),
+        other => Err(BossError::InvalidArgument(format!(
+            "unknown campaign field: {other}"
+        ))),
+    }
 }
 
 fn patch_from_options(options: SearchOptions) -> SearchSpecPatch {

@@ -46,6 +46,7 @@ impl ZhilianProvider {
             .pointer("/data/results")
             .and_then(Value::as_array)
             .ok_or_else(|| BossError::Parse("missing data.results".to_owned()))?;
+        reject_inconsistent_empty_results(value, items)?;
         items.iter().map(Self::parse_job).collect()
     }
 
@@ -162,6 +163,18 @@ impl ZhilianProvider {
     }
 }
 
+fn reject_inconsistent_empty_results(value: &Value, items: &[Value]) -> Result<(), BossError> {
+    let num_found = value.pointer("/data/numFound").and_then(Value::as_u64);
+    let num_total = value.pointer("/data/numTotal").and_then(Value::as_u64);
+    if items.is_empty() && num_found.is_some_and(|count| count > 0) && num_total == Some(0) {
+        return Err(BossError::Http {
+            status: 403,
+            message: "智联 returned an inconsistent empty result set".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl JobProvider for ZhilianProvider {
     fn platform(&self) -> Platform {
@@ -240,5 +253,15 @@ mod tests {
                 && detail.description == "Design and operate reliable backend services."
                 && invalid.is_err()
         );
+    }
+
+    #[test]
+    fn inconsistent_empty_results_are_reported_as_risk_control() {
+        let error = ZhilianProvider::parse(&serde_json::json!({
+            "data": {"numFound": 999_999, "numTotal": 0, "results": []}
+        }))
+        .expect_err("inconsistent provider response must not look successful");
+        assert!(matches!(error, BossError::Http { status: 403, message }
+            if message == "智联 returned an inconsistent empty result set"));
     }
 }

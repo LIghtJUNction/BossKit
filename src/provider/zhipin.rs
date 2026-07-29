@@ -39,6 +39,7 @@ impl ZhipinProvider {
     }
 
     fn parse(value: &Value) -> Result<Vec<Job>, BossError> {
+        reject_api_error(value)?;
         let items = value
             .pointer("/zpData/jobList")
             .and_then(Value::as_array)
@@ -81,6 +82,7 @@ impl ZhipinProvider {
     }
 
     fn parse_detail(base: &Job, value: &Value) -> Result<Job, BossError> {
+        reject_api_error(value)?;
         let data = value
             .pointer("/zpData")
             .ok_or_else(|| BossError::Parse("missing zpData detail".to_owned()))?;
@@ -157,6 +159,19 @@ impl ZhipinProvider {
     }
 }
 
+fn reject_api_error(value: &Value) -> Result<(), BossError> {
+    let Some(code) = value.get("code").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    if code == 0 {
+        return Ok(());
+    }
+    Err(BossError::Http {
+        status: 403,
+        message: format!("BOSS rejected the request with API code {code}"),
+    })
+}
+
 #[async_trait]
 impl JobProvider for ZhipinProvider {
     fn platform(&self) -> Platform {
@@ -199,6 +214,7 @@ fn text(value: &Value, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn url_and_response_are_normalized() {
@@ -223,6 +239,23 @@ mod tests {
             ),
             (&"sanitized-zp-001".to_owned(), &"3-5年".to_owned(), 2)
         );
+    }
+
+    #[test]
+    fn api_rejection_is_reported_as_risk_control() {
+        let error = ZhipinProvider::parse(&json!({
+            "code": 37,
+            "message": "provider message is intentionally not surfaced",
+            "zpData": {"name": "blocked", "seed": "opaque", "ts": 1}
+        }))
+        .expect_err("nonzero BOSS code must not be parsed as jobs");
+        assert!(matches!(
+            error,
+            BossError::Http {
+                status: 403,
+                message
+            } if message == "BOSS rejected the request with API code 37"
+        ));
     }
 
     #[test]

@@ -9,6 +9,8 @@ fn run_json(data_dir: &std::path::Path, args: &[&str]) -> Value {
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
         .env_remove("BOSS_QIANCHENG_COOKIE")
+        .env_remove("BOSS_LLM_API_KEY")
+        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .args(args)
         .output()
         .expect("run");
@@ -34,6 +36,7 @@ fn run_mcp(data_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
         .env_remove("BOSS_QIANCHENG_COOKIE")
+        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .arg("mcp")
         .write_stdin(input)
         .output()
@@ -190,6 +193,81 @@ fn cities_reports_exact_shared_mapping() {
 }
 
 #[test]
+fn notification_preview_is_local_and_send_requires_confirmation_or_runtime_configuration() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let preview = run_json(directory.path(), &["notify", "preview", "campaign.ready"]);
+    assert_eq!(
+        (
+            preview["data"]["mode"].as_str(),
+            preview["data"]["sent"].as_bool(),
+            preview["data"]["payload"]["summary"]["cached_jobs"].as_u64(),
+        ),
+        (Some("local_notification_preview"), Some(false), Some(3))
+    );
+    assert!(!directory.path().join("notification_audit.json").exists());
+
+    let unconfirmed = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
+        .args(["notify", "send", "campaign.ready"])
+        .output()
+        .expect("run");
+    assert!(!unconfirmed.status.success());
+    let value: Value = serde_json::from_slice(&unconfirmed.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!directory.path().join("notification_audit.json").exists());
+
+    let unconfigured = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
+        .args(["notify", "send", "campaign.ready", "--yes"])
+        .output()
+        .expect("run");
+    assert!(!unconfigured.status.success());
+    let value: Value = serde_json::from_slice(&unconfigured.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "notification_error");
+    let audit: Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("notification_audit.json")).expect("audit"),
+    )
+    .expect("audit json");
+    assert_eq!(
+        audit,
+        serde_json::json!([{
+            "event":"campaign.ready", "status":"failure", "timestamp":audit[0]["timestamp"]
+        }])
+    );
+}
+
+#[test]
+fn mcp_notification_tools_match_schema_and_reject_unconfirmed_send_without_network() {
+    let directory = tempdir().expect("temporary directory");
+    let responses = run_mcp(
+        directory.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"notify_preview","arguments":{"event":"watch.complete"}
+            }}),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"notify_send","arguments":{"event":"watch.complete","confirm":false}
+            }}),
+        ],
+    );
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools");
+    let send = tools
+        .iter()
+        .find(|tool| tool["name"] == "notify_send")
+        .expect("notify send schema");
+    assert_eq!(send["inputSchema"]["properties"]["confirm"]["const"], true);
+    assert_eq!(responses[1]["result"]["isError"], false);
+    assert_eq!(responses[2]["error"]["code"], -32602);
+    assert!(!directory.path().join("notification_audit.json").exists());
+}
+
+#[test]
 fn config_lifecycle_and_defaults_affect_ls() {
     let directory = tempdir().expect("temporary directory");
     seed_jobs(directory.path());
@@ -329,7 +407,7 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
 
 #[cfg(unix)]
 #[test]
-fn non_tty_login_does_not_start_qr_or_a_user_configured_browser() {
+fn non_tty_login_does_not_start_a_user_configured_browser() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempdir().expect("temporary directory");
@@ -356,7 +434,6 @@ fn non_tty_login_does_not_start_qr_or_a_user_configured_browser() {
         login["data"]["results"][0]["state"],
         "manual_login_required"
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains('█'));
     assert!(!marker.exists());
     assert!(!directory.path().join(".auth").exists());
 }
@@ -505,6 +582,188 @@ fn keyword_reply_cli_lifecycle_returns_local_suggestions() {
 }
 
 #[test]
+fn campaign_cli_creates_only_deduplicated_local_manual_review_dry_runs() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let jobs_before = std::fs::read(directory.path().join("jobs.json")).expect("cached jobs");
+    run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "policy",
+            "add",
+            "all-rust",
+            "--include",
+            "title:Rust",
+            "--minimum-score",
+            "100",
+        ],
+    );
+    run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "template",
+            "add",
+            "brief",
+            "您好，{{company}} 的 {{title}} 职位。",
+        ],
+    );
+    let first = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "plan",
+            "create",
+            "all-rust",
+            "--template",
+            "brief",
+            "--limit",
+            "3",
+        ],
+    );
+    let listed = run_json(directory.path(), &["campaign", "plan", "list"]);
+    let second = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "plan",
+            "create",
+            "all-rust",
+            "--template",
+            "brief",
+            "--limit",
+            "3",
+        ],
+    );
+    assert!(
+        first["data"]["mode"] == "manual_review"
+            && first["data"]["dry_run"] == true
+            && first["data"]["planned"] == 3
+            && listed["data"].as_array().map(Vec::len) == Some(3)
+            && listed["data"].as_array().is_some_and(|plans| plans
+                .iter()
+                .all(|plan| { plan["state"] == "manual_review" && plan["dry_run"] == true }))
+            && second["data"]["planned"] == 0
+            && second["data"]["skipped_existing"] == 3
+            && std::fs::read(directory.path().join("jobs.json")).expect("cached jobs")
+                == jobs_before
+    );
+}
+
+#[test]
+fn campaign_cli_binds_local_resume_and_records_human_transition_lifecycle() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    run_json(
+        directory.path(),
+        &["resume", "init", "candidate", "--title", "Rust Engineer"],
+    );
+    run_json(
+        directory.path(),
+        &["resume", "set", "candidate", "summary", "Local profile"],
+    );
+    run_json(
+        directory.path(),
+        &[
+            "resume",
+            "skills",
+            "candidate",
+            "--add",
+            "Rust",
+            "--add",
+            "Tokio",
+        ],
+    );
+    run_json(directory.path(), &["campaign", "policy", "add", "all"]);
+    run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "template",
+            "add",
+            "resume-brief",
+            "{{resume_title}}: {{resume_summary}} ({{resume_skills}})",
+        ],
+    );
+    let created = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "plan",
+            "create",
+            "all",
+            "--template",
+            "resume-brief",
+            "--resume-name",
+            "candidate",
+        ],
+    );
+    let without_confirmation = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["campaign", "plan", "transition", "zhipin-job", "approved"])
+        .output()
+        .expect("transition without confirmation");
+    assert!(!without_confirmation.status.success());
+    let approved = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "plan",
+            "transition",
+            "zhipin-job",
+            "approved",
+            "--yes",
+            "--note",
+            "reviewed locally",
+        ],
+    );
+    let recorded = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "plan",
+            "transition",
+            "zhipin-job",
+            "recorded_submitted",
+            "--yes",
+        ],
+    );
+    let terminal = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "campaign",
+            "plan",
+            "transition",
+            "zhipin-job",
+            "rejected",
+            "--yes",
+        ])
+        .output()
+        .expect("terminal transition");
+    let stats = run_json(directory.path(), &["campaign", "stats"]);
+    let stored = std::fs::read_to_string(directory.path().join("application_plans.json"))
+        .expect("stored plans");
+    assert!(
+        created["data"]["plans"][0]["resume_name"] == "candidate"
+            && created["data"]["plans"][0]["resume_updated_at"].is_u64()
+            && created["data"]["greeting_previews"][0]["text"]
+                == "Rust Engineer: Local profile (Rust、Tokio)"
+            && approved["data"]["state"] == "approved"
+            && approved["data"]["state_note"] == "reviewed locally"
+            && recorded["data"]["state"] == "recorded_submitted"
+            && recorded["data"]["dry_run"] == true
+            && !terminal.status.success()
+            && stats["data"]["plans"]["recorded_submitted"] == 1
+            && !stored.contains("Rust Engineer")
+            && !stored.contains("Local profile")
+            && !stored.contains("Rust、Tokio")
+    );
+}
+
+#[test]
 fn resume_cli_is_typed_and_requires_deletion_confirmation() {
     let directory = tempdir().expect("temporary directory");
     run_json(
@@ -535,6 +794,63 @@ fn resume_cli_is_typed_and_requires_deletion_confirmation() {
     assert!(!output.status.success());
     let removed = run_json(directory.path(), &["resume", "rm", "base", "--yes"]);
     assert_eq!(removed["data"]["name"], "base");
+}
+
+#[test]
+fn ai_profile_lifecycle_and_confirmation_gate_never_need_a_network() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    run_json(
+        directory.path(),
+        &["resume", "init", "candidate", "--title", "Rust Engineer"],
+    );
+    let profile = run_json(
+        directory.path(),
+        &[
+            "ai",
+            "profile",
+            "add",
+            "local",
+            "https://model.example/v1/",
+            "example-model",
+        ],
+    );
+    let listed = run_json(directory.path(), &["ai", "profile", "ls"]);
+    let shown = run_json(directory.path(), &["ai", "profile", "show", "local"]);
+    let stored =
+        std::fs::read_to_string(directory.path().join("ai_profiles.json")).expect("profile store");
+    assert!(
+        profile["data"]["base_url"] == "https://model.example/v1"
+            && listed["data"].as_array().map(Vec::len) == Some(1)
+            && shown["data"]["model"] == "example-model"
+            && !stored.contains("BOSS_LLM_API_KEY")
+            && !stored.contains("api_key")
+    );
+
+    let unconfirmed = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_LLM_API_KEY")
+        .args(["ai", "draft", "local", "zhipin-job", "candidate"])
+        .output()
+        .expect("unconfirmed draft");
+    assert!(!unconfirmed.status.success());
+    let unconfirmed: Value = serde_json::from_slice(&unconfirmed.stdout).expect("error json");
+    assert_eq!(unconfirmed["error"]["code"], "invalid_argument");
+
+    let missing_key = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_LLM_API_KEY")
+        .args(["ai", "score", "local", "zhipin-job", "candidate", "--yes"])
+        .output()
+        .expect("missing key score");
+    assert!(!missing_key.status.success());
+    let missing_key: Value = serde_json::from_slice(&missing_key.stdout).expect("error json");
+    assert_eq!(missing_key["error"]["code"], "ai_api_key_missing");
+
+    let removed = run_json(directory.path(), &["ai", "profile", "rm", "local"]);
+    assert_eq!(removed["data"]["name"], "local");
 }
 
 #[test]
@@ -578,7 +894,7 @@ fn clean_preview_and_archive_preserve_config_and_report_recovery_paths() {
     )
     .expect("clean preview json");
     assert!(
-        cleaned["data"]["files"].as_array().map(Vec::len) == Some(7)
+        cleaned["data"]["files"].as_array().map(Vec::len) == Some(13)
             && reply_preview["data"]["files"].as_array().map(Vec::len) == Some(1)
             && reply_preview["data"]["files"][0]["target"] == "reply_rules"
             && cleaned["data"]["action"] == "archive"

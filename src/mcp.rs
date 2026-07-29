@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::campaign::{ApplicationPlanState, BlacklistKind, CampaignPolicy, MAX_PLANS_PER_BUILD};
 use crate::export::{ExportFormat, ExportOptions, ExportSource};
+use crate::notify::normalize_event;
 use crate::schema::{SchemaFormat, tool_registry};
 use crate::{BossError, BossService, Platform, PlatformSelector, SearchSpecPatch};
 
@@ -50,6 +52,15 @@ const WATCH_ADD_FIELDS: &[&str] = &[
     "education",
     "job_type",
     "welfare",
+];
+const CAMPAIGN_POLICY_FIELDS: &[&str] = &[
+    "name",
+    "include",
+    "exclude",
+    "required_welfare",
+    "monthly_salary_min",
+    "monthly_salary_max",
+    "minimum_score",
 ];
 
 /// Runs newline-delimited JSON-RPC over stdin/stdout.
@@ -620,6 +631,124 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 .map_err(ToolCallError::Execution)?;
             Ok((success_value(document), false))
         }
+        "ai_profile_add" => {
+            validate_allowed(&arguments, &["name", "base_url", "model"])?;
+            Ok((
+                success_value(
+                    service
+                        .ai_profile_add(
+                            required_string(&arguments, "name")?,
+                            required_string(&arguments, "base_url")?,
+                            required_string(&arguments, "model")?,
+                        )
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "ai_profile_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(
+                    service
+                        .ai_profile_list()
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "ai_profile_show" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .ai_profile_show(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "ai_profile_remove" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .ai_profile_remove(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "ai_draft" => {
+            validate_allowed(&arguments, &["profile", "job_id", "resume_name", "confirm"])?;
+            if !optional_bool(&arguments, "confirm", false)? {
+                return Err(ToolCallError::InvalidArguments(
+                    "ai_draft requires confirm=true".to_owned(),
+                ));
+            }
+            Ok((
+                success_value(json!({
+                    "mode":"confirmed_ai_draft",
+                    "text":service.ai_draft(
+                        required_string(&arguments, "profile")?,
+                        required_string(&arguments, "job_id")?,
+                        required_string(&arguments, "resume_name")?,
+                        true,
+                    ).await.map_err(ToolCallError::Execution)?
+                })),
+                false,
+            ))
+        }
+        "ai_score" => {
+            validate_allowed(&arguments, &["profile", "job_id", "resume_name", "confirm"])?;
+            if !optional_bool(&arguments, "confirm", false)? {
+                return Err(ToolCallError::InvalidArguments(
+                    "ai_score requires confirm=true".to_owned(),
+                ));
+            }
+            Ok((
+                success_value(json!({
+                    "mode":"confirmed_ai_score",
+                    "score":service.ai_score(
+                        required_string(&arguments, "profile")?,
+                        required_string(&arguments, "job_id")?,
+                        required_string(&arguments, "resume_name")?,
+                        true,
+                    ).await.map_err(ToolCallError::Execution)?
+                })),
+                false,
+            ))
+        }
+        "notify_preview" => {
+            validate_allowed(&arguments, &["event"])?;
+            let event = notification_event(&arguments)?;
+            Ok((
+                success_value(json!({
+                    "mode":"local_notification_preview",
+                    "sent":false,
+                    "payload":service.notification_preview(&event).map_err(ToolCallError::Execution)?
+                })),
+                false,
+            ))
+        }
+        "notify_send" => {
+            validate_allowed(&arguments, &["event", "confirm"])?;
+            if !optional_bool(&arguments, "confirm", false)? {
+                return Err(ToolCallError::InvalidArguments(
+                    "notify_send requires confirm=true".to_owned(),
+                ));
+            }
+            let event = notification_event(&arguments)?;
+            Ok((
+                success_value(
+                    service
+                        .notification_send(&event, true)
+                        .await
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
         "keyword_reply_add" => {
             validate_allowed(&arguments, &["keyword", "reply"])?;
             let rule = service
@@ -651,6 +780,211 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 .map_err(ToolCallError::Execution)?;
             Ok((success_value(suggestion), false))
         }
+        "campaign_policy_add" => {
+            validate_allowed(&arguments, CAMPAIGN_POLICY_FIELDS)?;
+            let policy: CampaignPolicy =
+                serde_json::from_value(arguments.clone()).map_err(|error| {
+                    ToolCallError::InvalidArguments(format!("invalid campaign policy: {error}"))
+                })?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_policy_add(policy)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_policy_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_policy_list()
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_policy_show" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_policy_show(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_policy_remove" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_policy_remove(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_blacklist_add" => {
+            validate_allowed(&arguments, &["kind", "value"])?;
+            let kind = campaign_blacklist_kind(required_string(&arguments, "kind")?)?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_blacklist_add(kind, required_string(&arguments, "value")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_blacklist_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_blacklist_list()
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_blacklist_remove" => {
+            validate_allowed(&arguments, &["kind", "value"])?;
+            let kind = campaign_blacklist_kind(required_string(&arguments, "kind")?)?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_blacklist_remove(kind, required_string(&arguments, "value")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_template_add" => {
+            validate_allowed(&arguments, &["name", "body"])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_template_add(
+                            required_string(&arguments, "name")?,
+                            required_string(&arguments, "body")?,
+                        )
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_template_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_template_list()
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_template_show" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_template_show(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_template_remove" => {
+            validate_allowed(&arguments, &["name"])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_template_remove(required_string(&arguments, "name")?)
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_template_render" => {
+            validate_allowed(&arguments, &["name", "job_id"])?;
+            Ok((
+                success_value(json!({
+                    "mode":"local_render_only",
+                    "sent":false,
+                    "text":service.campaign_template_render(
+                        required_string(&arguments, "name")?,
+                        required_string(&arguments, "job_id")?,
+                    ).map_err(ToolCallError::Execution)?
+                })),
+                false,
+            ))
+        }
+        "campaign_plan_create" => {
+            validate_allowed(&arguments, &["policy", "template", "resume_name", "limit"])?;
+            let limit = positive_usize(&arguments, "limit", 20)?;
+            if limit > MAX_PLANS_PER_BUILD {
+                return Err(ToolCallError::InvalidArguments(format!(
+                    "limit must be at most {MAX_PLANS_PER_BUILD}"
+                )));
+            }
+            Ok((
+                success_value(
+                    service
+                        .campaign_plan_create(
+                            required_string(&arguments, "policy")?,
+                            optional_nonblank_owned_string(&arguments, "template")?.as_deref(),
+                            optional_nonblank_owned_string(&arguments, "resume_name")?.as_deref(),
+                            limit,
+                        )
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_plan_list" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_plan_list()
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_plan_transition" => {
+            validate_allowed(&arguments, &["job_id", "state", "note", "confirm"])?;
+            if !optional_bool(&arguments, "confirm", false)? {
+                return Err(ToolCallError::InvalidArguments(
+                    "campaign_plan_transition requires confirm=true".to_owned(),
+                ));
+            }
+            let state = campaign_transition_state(required_string(&arguments, "state")?)?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_plan_transition(
+                            required_string(&arguments, "job_id")?,
+                            state,
+                            optional_nonblank_owned_string(&arguments, "note")?,
+                        )
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
+        "campaign_stats" => {
+            validate_allowed(&arguments, &[])?;
+            Ok((
+                success_value(service.campaign_stats().map_err(ToolCallError::Execution)?),
+                false,
+            ))
+        }
         "stats" => {
             validate_allowed(&arguments, &["days"])?;
             let days = positive_u32(&arguments, "days", 30)?;
@@ -674,6 +1008,11 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 "reply_rules",
                 "watches",
                 "resumes",
+                "campaign_policies",
+                "campaign_blacklist",
+                "greeting_templates",
+                "application_plans",
+                "ai_profiles",
                 "all",
             ]
             .contains(&target)
@@ -692,6 +1031,28 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
             ))
         }
         _ => Err(ToolCallError::UnknownTool(name.to_owned())),
+    }
+}
+
+fn campaign_blacklist_kind(value: &str) -> Result<BlacklistKind, ToolCallError> {
+    match value {
+        "company" => Ok(BlacklistKind::Company),
+        "description" => Ok(BlacklistKind::Description),
+        "job" => Ok(BlacklistKind::Job),
+        other => Err(ToolCallError::InvalidArguments(format!(
+            "unknown blacklist kind: {other}"
+        ))),
+    }
+}
+
+fn campaign_transition_state(value: &str) -> Result<ApplicationPlanState, ToolCallError> {
+    match value {
+        "approved" => Ok(ApplicationPlanState::Approved),
+        "rejected" => Ok(ApplicationPlanState::Rejected),
+        "recorded_submitted" => Ok(ApplicationPlanState::RecordedSubmitted),
+        other => Err(ToolCallError::InvalidArguments(format!(
+            "unknown campaign plan transition target: {other}"
+        ))),
     }
 }
 
@@ -758,6 +1119,11 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, ToolCal
             "{field} must be a string"
         ))),
     }
+}
+
+fn notification_event(value: &Value) -> Result<String, ToolCallError> {
+    let event = required_string(value, "event")?;
+    normalize_event(event).map_err(|error| ToolCallError::InvalidArguments(error.to_string()))
 }
 
 fn required_string_allow_empty<'a>(
@@ -940,6 +1306,72 @@ mod tests {
         .await
         .expect("response");
         assert_eq!(response["result"]["tools"], json!(tool_registry()));
+    }
+
+    #[tokio::test]
+    async fn tools_list_exactly_matches_the_mcp_schema_wrapper() {
+        let directory = tempdir().expect("tempdir");
+        let service =
+            BossService::from_paths(crate::DataPaths::new(directory.path())).expect("service");
+        let response = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .expect("response");
+        assert_eq!(
+            response["result"]["tools"],
+            service
+                .schema(SchemaFormat::McpTools)
+                .expect("mcp schema wrapper")
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_tools_require_confirmation_reject_unknown_arguments_and_match_registry() {
+        let directory = tempdir().expect("tempdir");
+        let service =
+            BossService::from_paths(crate::DataPaths::new(directory.path())).expect("service");
+        let listed = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .expect("list");
+        for name in [
+            "ai_profile_add",
+            "ai_profile_list",
+            "ai_profile_show",
+            "ai_profile_remove",
+            "ai_draft",
+            "ai_score",
+        ] {
+            assert!(
+                listed["result"]["tools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+            );
+        }
+        let draft = listed["result"]["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == "ai_draft"))
+            .expect("draft tool");
+        assert_eq!(draft["inputSchema"]["properties"]["confirm"]["const"], true);
+
+        for arguments in [
+            json!({"profile":"local","job_id":"cached","resume_name":"base","confirm":false}),
+            json!({"profile":"local","job_id":"cached","resume_name":"base","confirm":true,"unexpected":true}),
+        ] {
+            let response = handle_input(
+                &service,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"ai_draft","arguments":arguments
+                }}),
+            )
+            .await
+            .expect("response");
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+        }
     }
 
     #[test]
@@ -1137,6 +1569,162 @@ mod tests {
             .await
             .expect("response");
             assert_eq!(response["error"]["code"], -32602, "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn campaign_plan_transition_schema_matches_tools_list_and_requires_confirmation() {
+        let directory = tempdir().expect("tempdir");
+        let paths = crate::DataPaths::new(directory.path());
+        let job = crate::Job::new(
+            "candidate-job",
+            Platform::Zhipin,
+            "remote",
+            "Rust",
+            "https://example.test/job",
+        );
+        crate::JobCache::from_paths(&paths)
+            .save(&[job])
+            .expect("seed cache");
+        let service = BossService::from_paths(paths).expect("service");
+        service
+            .campaign_policy_add(CampaignPolicy {
+                name: "all".to_owned(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+                required_welfare: Vec::new(),
+                monthly_salary_min: None,
+                monthly_salary_max: None,
+                minimum_score: None,
+            })
+            .expect("policy");
+        service
+            .campaign_plan_create("all", None, None, 1)
+            .expect("plan");
+
+        let listed = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .expect("tools list");
+        let schema = listed["result"]["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"] == "campaign_plan_transition")
+            })
+            .expect("transition tool");
+        assert_eq!(
+            (
+                schema["inputSchema"]["required"].as_array().map(Vec::len),
+                schema["inputSchema"]["properties"]["confirm"]["const"].as_bool(),
+                schema["inputSchema"]["properties"]["state"]["enum"].clone(),
+            ),
+            (
+                Some(3),
+                Some(true),
+                json!(["approved", "rejected", "recorded_submitted"]),
+            )
+        );
+
+        for arguments in [
+            json!({"job_id":"candidate-job","state":"approved","confirm":false}),
+            json!({"job_id":"candidate-job","state":"approved","confirm":true,"extra":true}),
+            json!({"job_id":"candidate-job","state":"manual_review","confirm":true}),
+            json!({"job_id":"candidate-job","state":"unknown","confirm":true}),
+        ] {
+            let rejected = handle_input(
+                &service,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"campaign_plan_transition","arguments":arguments
+                }}),
+            )
+            .await
+            .expect("rejected response");
+            assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+        }
+
+        let transitioned = handle_input(
+            &service,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"campaign_plan_transition","arguments":{
+                    "job_id":"candidate-job","state":"approved","confirm":true,"note":"human review"
+                }
+            }}),
+        )
+        .await
+        .expect("transition response");
+        let result: Value = serde_json::from_str(
+            transitioned["result"]["content"][0]["text"]
+                .as_str()
+                .expect("transition text"),
+        )
+        .expect("transition json");
+        assert_eq!(
+            (
+                result["data"]["state"].as_str(),
+                result["data"]["state_note"].as_str()
+            ),
+            (Some("approved"), Some("human review"))
+        );
+    }
+
+    #[test]
+    fn campaign_transition_runtime_targets_match_the_schema_enum() {
+        let parsed = ["approved", "rejected", "recorded_submitted"]
+            .into_iter()
+            .map(campaign_transition_state)
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(parsed) = parsed else {
+            panic!("schema targets should parse");
+        };
+        assert_eq!(
+            parsed,
+            vec![
+                ApplicationPlanState::Approved,
+                ApplicationPlanState::Rejected,
+                ApplicationPlanState::RecordedSubmitted,
+            ]
+        );
+        assert!(campaign_transition_state("manual_review").is_err());
+    }
+
+    #[tokio::test]
+    async fn campaign_clean_preview_targets_are_local_and_non_destructive() {
+        let directory = tempdir().expect("tempdir");
+        let paths = crate::DataPaths::new(directory.path());
+        let targets = [
+            ("campaign_policies", paths.campaign_policies()),
+            ("campaign_blacklist", paths.campaign_blacklist()),
+            ("greeting_templates", paths.greeting_templates()),
+            ("application_plans", paths.application_plans()),
+        ];
+        for (_, path) in &targets {
+            std::fs::write(path, b"[]").expect("seed campaign data");
+        }
+        let service = BossService::from_paths(paths).expect("service");
+        for (target, path) in targets {
+            let preview = handle_input(
+                &service,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"clean_preview","arguments":{"target":target}
+                }}),
+            )
+            .await
+            .expect("preview response");
+            let data: Value = serde_json::from_str(
+                preview["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("preview text"),
+            )
+            .expect("preview json");
+            assert!(
+                data["data"]["action"] == "preview"
+                    && data["data"]["files"][0]["target"] == target
+                    && path.is_file()
+            );
         }
     }
 
