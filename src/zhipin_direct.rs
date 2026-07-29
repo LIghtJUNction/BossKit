@@ -16,6 +16,10 @@ const MAX_CHAT_MESSAGE_CHARS: usize = 200;
 pub(crate) const MAX_CHAT_HISTORY_MESSAGES: usize = 20;
 const MAX_CHAT_HISTORY_TEXT_CHARS: usize = 2000;
 const MAX_CHAT_HISTORY_RESPONSE_BYTES: usize = 60 * 1024;
+pub(crate) const MAX_CHAT_INBOX_CONVERSATIONS: usize = 5;
+const MAX_CHAT_INBOX_TEXT_CHARS: usize = 512;
+const MAX_CHAT_INBOX_RESPONSE_BYTES: usize = 60 * 1024;
+const MAX_ZHIPIN_REMOTE_ID_CHARS: usize = 2048;
 
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
@@ -47,12 +51,35 @@ struct HistoryRequest<'a> {
     limit: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct InboxRequest<'a> {
+    action: &'static str,
+    cookie: &'a str,
+    remote_ids: &'a [&'a str],
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectChatMessage {
     pub(crate) direction: String,
     pub(crate) text: String,
     pub(crate) timestamp_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectInboxLatest {
+    pub(crate) direction: String,
+    pub(crate) text: String,
+    pub(crate) timestamp_ms: u64,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperInboxConversation {
+    remote_id: String,
+    latest: Option<DirectInboxLatest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +100,8 @@ struct HelperResponse {
     count: Option<usize>,
     #[serde(default)]
     messages: Option<Vec<DirectChatMessage>>,
+    #[serde(default)]
+    conversations: Option<Vec<HelperInboxConversation>>,
 }
 
 /// A verified session refresh whose Cookie remains private to the service.
@@ -104,6 +133,14 @@ pub(crate) struct DirectHistory {
     pub(crate) cookie: String,
     pub(crate) verification: String,
     pub(crate) messages: Vec<DirectChatMessage>,
+}
+
+/// Latest safe text for a bounded ordered set of exact conversations.
+#[derive(Debug)]
+pub(crate) struct DirectInbox {
+    pub(crate) cookie: String,
+    pub(crate) verification: String,
+    pub(crate) conversations: Vec<Option<DirectInboxLatest>>,
 }
 
 /// Refreshes and verifies one stored Zhipin Cookie without a browser process.
@@ -191,6 +228,18 @@ pub(crate) fn history(
     parse_history_response(&invoke_helper(&request)?)
 }
 
+/// Reads the latest safe text for up to five existing exact conversations.
+pub(crate) fn inbox(cookie: &str, remote_ids: &[&str]) -> Result<DirectInbox, BossError> {
+    validate_inbox_remote_ids(remote_ids)?;
+    let request = serde_json::to_vec(&InboxRequest {
+        action: "inbox",
+        cookie,
+        remote_ids,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_inbox_response(&invoke_helper(&request)?, remote_ids)
+}
+
 fn invoke_helper(request: &[u8]) -> Result<Vec<u8>, BossError> {
     let mut child = Command::new("uv")
         .args([
@@ -253,6 +302,7 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
         || response.state.is_some()
         || response.count.is_some()
         || response.messages.is_some()
+        || response.conversations.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -291,6 +341,7 @@ fn parse_greet_response(bytes: &[u8]) -> Result<DirectGreeting, BossError> {
     if response.action.as_deref() != Some("greet")
         || response.count.is_some()
         || response.messages.is_some()
+        || response.conversations.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -328,6 +379,7 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
     if response.action.as_deref() != Some("send")
         || response.count.is_some()
         || response.messages.is_some()
+        || response.conversations.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -367,7 +419,10 @@ fn parse_history_response(bytes: &[u8]) -> Result<DirectHistory, BossError> {
                 .unwrap_or("direct Zhipin history failed"),
         ));
     }
-    if response.action.as_deref() != Some("history") || response.state.is_some() {
+    if response.action.as_deref() != Some("history")
+        || response.state.is_some()
+        || response.conversations.is_some()
+    {
         return Err(transport_error("direct transport action mismatch"));
     }
     let cookie = response
@@ -402,6 +457,94 @@ fn parse_history_response(bytes: &[u8]) -> Result<DirectHistory, BossError> {
         cookie,
         verification,
         messages,
+    })
+}
+
+fn validate_inbox_remote_ids(remote_ids: &[&str]) -> Result<(), BossError> {
+    if !(1..=MAX_CHAT_INBOX_CONVERSATIONS).contains(&remote_ids.len()) {
+        return Err(BossError::InvalidArgument(
+            "chat inbox requires between 1 and 5 jobs".to_owned(),
+        ));
+    }
+    let mut unique = std::collections::HashSet::with_capacity(remote_ids.len());
+    if remote_ids.iter().any(|remote_id| {
+        remote_id.is_empty()
+            || remote_id.chars().count() > MAX_ZHIPIN_REMOTE_ID_CHARS
+            || !unique.insert(*remote_id)
+    }) {
+        return Err(BossError::InvalidArgument(
+            "chat inbox requires unique valid Zhipin job identifiers".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox, BossError> {
+    if bytes.len() > MAX_CHAT_INBOX_RESPONSE_BYTES {
+        return Err(transport_error(
+            "direct inbox result exceeded the safe output budget",
+        ));
+    }
+    validate_inbox_remote_ids(remote_ids)?;
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("direct Zhipin inbox failed"),
+        ));
+    }
+    if response.action.as_deref() != Some("inbox")
+        || response.state.is_some()
+        || response.messages.is_some()
+        || response.error.is_some()
+    {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| value == "exact_encrypt_job_ids_and_user_id")
+        .ok_or_else(|| transport_error("direct inbox verification was invalid"))?;
+    let conversations = response
+        .conversations
+        .filter(|items| items.len() == remote_ids.len())
+        .ok_or_else(|| transport_error("direct inbox conversations were invalid"))?;
+    if response.count != Some(conversations.len())
+        || conversations
+            .iter()
+            .zip(remote_ids)
+            .any(|(conversation, expected)| {
+                conversation.remote_id != *expected
+                    || conversation.latest.as_ref().is_some_and(|latest| {
+                        !matches!(latest.direction.as_str(), "incoming" | "outgoing")
+                            || latest.text.is_empty()
+                            || latest.text.chars().count() > MAX_CHAT_INBOX_TEXT_CHARS
+                            || latest
+                                .text
+                                .chars()
+                                .any(|character| !is_safe_history_character(character))
+                            || latest.timestamp_ms == 0
+                            || (latest.truncated
+                                && latest.text.chars().count() != MAX_CHAT_INBOX_TEXT_CHARS)
+                    })
+            })
+    {
+        return Err(transport_error("direct inbox conversations were invalid"));
+    }
+    Ok(DirectInbox {
+        cookie,
+        verification,
+        conversations: conversations
+            .into_iter()
+            .map(|conversation| conversation.latest)
+            .collect(),
     })
 }
 
@@ -582,6 +725,109 @@ mod tests {
     }
 
     #[test]
+    fn parses_ordered_inbox_with_nullable_latest_text() {
+        let truncated = "界".repeat(MAX_CHAT_INBOX_TEXT_CHARS);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "ok":true,
+            "action":"inbox",
+            "verification":"exact_encrypt_job_ids_and_user_id",
+            "updated_cookie":"wt2=secret",
+            "count":2,
+            "conversations":[
+                {"remote_id":"remote-1","latest":null},
+                {"remote_id":"remote-2","latest":{
+                    "direction":"incoming",
+                    "text":truncated,
+                    "timestamp_ms":20,
+                    "truncated":true
+                }}
+            ]
+        }))
+        .expect("payload");
+        let result =
+            parse_inbox_response(&payload, &["remote-1", "remote-2"]).expect("verified inbox");
+        assert_eq!(result.verification, "exact_encrypt_job_ids_and_user_id");
+        assert!(result.conversations[0].is_none());
+        let latest = result.conversations[1].as_ref().expect("latest");
+        assert_eq!(latest.direction, "incoming");
+        assert_eq!(latest.text.chars().count(), MAX_CHAT_INBOX_TEXT_CHARS);
+        assert!(latest.truncated);
+    }
+
+    #[test]
+    fn inbox_parser_rejects_invalid_identity_fields_and_latest_text() {
+        for payload in [
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":1,
+                "conversations":[{"remote_id":"wrong","latest":null}]
+            }),
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":2,
+                "conversations":[{"remote_id":"remote-1","latest":null}]
+            }),
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":1,"state":"verified",
+                "conversations":[{"remote_id":"remote-1","latest":null}]
+            }),
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":1,"messages":[],
+                "conversations":[{"remote_id":"remote-1","latest":null}]
+            }),
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":1,
+                "conversations":[{"remote_id":"remote-1","latest":{
+                    "direction":"incoming","text":"short",
+                    "timestamp_ms":10,"truncated":true
+                }}]
+            }),
+            serde_json::json!({
+                "ok":true,"action":"inbox",
+                "verification":"exact_encrypt_job_ids_and_user_id",
+                "updated_cookie":"wt2=secret","count":1,
+                "conversations":[{"remote_id":"remote-1","latest":{
+                    "direction":"incoming","text":"\u{202e}private",
+                    "timestamp_ms":10,"truncated":false
+                }}]
+            }),
+        ] {
+            let encoded = serde_json::to_vec(&payload).expect("payload");
+            assert!(parse_inbox_response(&encoded, &["remote-1"]).is_err());
+        }
+    }
+
+    #[test]
+    fn inbox_request_rejects_empty_duplicate_oversized_or_excess_ids() {
+        assert!(validate_inbox_remote_ids(&[]).is_err());
+        assert!(validate_inbox_remote_ids(&["remote", "remote"]).is_err());
+        assert!(validate_inbox_remote_ids(&["", "remote"]).is_err());
+        let oversized = "x".repeat(MAX_ZHIPIN_REMOTE_ID_CHARS + 1);
+        assert!(validate_inbox_remote_ids(&[oversized.as_str()]).is_err());
+        assert!(validate_inbox_remote_ids(&["1", "2", "3", "4", "5", "6"]).is_err());
+    }
+
+    #[test]
+    fn existing_action_parsers_reject_inbox_only_fields() {
+        assert!(parse_refresh_response(
+            br#"{"ok":true,"action":"refresh","verification":"authenticated_api_code_0","updated_cookie":"wt2=secret","conversations":[]}"#
+        )
+        .is_err());
+        assert!(parse_history_response(
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":0,"messages":[],"conversations":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn python_helper_encodes_the_minimal_techwolf_wire_shape() {
         let encoded =
             run_pure_helper("print(scope['encode_protocol'](1,2,'boss',3,'Hi',4,5).hex())");
@@ -595,6 +841,14 @@ mod tests {
     fn python_helper_bounds_history_by_final_utf8_response_bytes() {
         let result = run_pure_helper(
             "items=[{'direction':'incoming','text':'界'*2000,'timestamp_ms':i+1} for i in range(20)]\nresponse=scope['bounded_history_response']('wt2=secret',items)\nencoded=scope['json'].dumps(response,ensure_ascii=False,separators=(',',':')).encode('utf-8')\nassert len(encoded)+1 <= scope['MAX_HISTORY_RESPONSE_BYTES']\nassert 0 < len(response['messages']) < 20\nassert response['messages'][-1]['timestamp_ms'] == 20\nprint('bounded')",
+        );
+        assert_eq!(result, "bounded");
+    }
+
+    #[test]
+    fn python_helper_validates_inbox_ids_and_never_drops_conversations() {
+        let result = run_pure_helper(
+            "ids=scope['validate_inbox_remote_ids'](['one','two'])\nassert ids == ['one','two']\nitems=[{'remote_id':'one','latest':None},{'remote_id':'two','latest':{'direction':'incoming','text':'界'*512,'timestamp_ms':1,'truncated':True}}]\nresponse=scope['bounded_inbox_response']('wt2=secret',items)\nassert response['count'] == 2 and len(response['conversations']) == 2\nfor invalid in [[],['same','same'],['1','2','3','4','5','6']]:\n try:\n  scope['validate_inbox_remote_ids'](invalid)\n  raise AssertionError('accepted invalid inbox ids')\n except scope['SafeFailure']:\n  pass\nprint('bounded')",
         );
         assert_eq!(result, "bounded");
     }

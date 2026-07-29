@@ -472,7 +472,7 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
             .iter()
             .all(|tool| !matches!(
                 tool["name"].as_str(),
-                Some("chat_greet" | "chat_send" | "chat_history")
+                Some("chat_greet" | "chat_send" | "chat_history" | "chat_inbox")
             ))
     );
 
@@ -490,6 +490,10 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
         .iter()
         .find(|command| command["name"] == "chat history")
         .expect("native history");
+    let inbox = commands
+        .iter()
+        .find(|command| command["name"] == "chat inbox")
+        .expect("native inbox");
     assert!(
         greet["remote_write"] == true
             && greet["local_write"] == true
@@ -497,6 +501,8 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
             && send["local_write"] == true
             && history["remote_write"] == false
             && history["local_write"] == true
+            && inbox["remote_write"] == false
+            && inbox["local_write"] == true
     );
     assert_eq!(
         schema["data"]["risk"]["confirmed_platform_messages"],
@@ -521,6 +527,48 @@ fn chat_history_is_read_only_and_rejects_missing_jobs_before_credentials() {
     assert_eq!(value["error"]["code"], "invalid_argument");
     assert!(!rendered.contains(secret));
     assert!(!directory.path().join(".auth").exists());
+}
+
+#[test]
+fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let secret = "wt2=INBOX_COOKIE_MUST_NOT_APPEAR";
+
+    for args in [
+        vec!["chat", "inbox", "missing-job"],
+        vec!["chat", "inbox", "zhipin-job", "zhipin-job"],
+        vec!["chat", "inbox", "zhilian-job"],
+    ] {
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .env("BOSS_ZHIPIN_COOKIE", secret)
+            .args(args)
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(value["error"]["code"], "invalid_argument");
+        assert!(!rendered.contains(secret));
+        assert!(!directory.path().join(".auth").exists());
+    }
+
+    for args in [
+        vec!["chat", "inbox"],
+        vec!["chat", "inbox", "a", "b", "c", "d", "e", "f"],
+    ] {
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .args(args)
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(value["error"]["code"], "invalid_argument");
+    }
 }
 
 #[test]

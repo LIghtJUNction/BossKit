@@ -470,6 +470,68 @@ impl BossService {
         }))
     }
 
+    /// Reads the latest safe text for up to five exact Zhipin conversations.
+    pub fn chat_inbox(&mut self, job_ids: &[String]) -> Result<Value, BossError> {
+        if !(1..=crate::zhipin_direct::MAX_CHAT_INBOX_CONVERSATIONS).contains(&job_ids.len()) {
+            return Err(BossError::InvalidArgument(
+                "chat inbox requires between 1 and 5 jobs".to_owned(),
+            ));
+        }
+        let mut local_ids = std::collections::HashSet::with_capacity(job_ids.len());
+        if job_ids.iter().any(|job_id| !local_ids.insert(job_id)) {
+            return Err(BossError::InvalidArgument(
+                "chat inbox requires unique local job IDs".to_owned(),
+            ));
+        }
+
+        let mut jobs = Vec::with_capacity(job_ids.len());
+        let mut remote_ids = std::collections::HashSet::with_capacity(job_ids.len());
+        for job_id in job_ids {
+            let job = self
+                .cache
+                .show(job_id)?
+                .ok_or_else(|| BossError::InvalidArgument(format!("job not found: {job_id}")))?;
+            if job.platform != Platform::Zhipin {
+                return Err(BossError::InvalidArgument(
+                    "chat inbox supports only cached Zhipin jobs".to_owned(),
+                ));
+            }
+            if job.remote_id.trim().is_empty() || !remote_ids.insert(job.remote_id.clone()) {
+                return Err(BossError::InvalidArgument(
+                    "chat inbox requires unique direct chat metadata".to_owned(),
+                ));
+            }
+            jobs.push(job);
+        }
+
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "chat inbox requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        let requested_remote_ids: Vec<&str> =
+            jobs.iter().map(|job| job.remote_id.as_str()).collect();
+        let inbox = crate::zhipin_direct::inbox(&cookie, &requested_remote_ids)?;
+        self.auth.store_session(Platform::Zhipin, inbox.cookie)?;
+        let conversations: Vec<Value> = jobs
+            .into_iter()
+            .zip(inbox.conversations)
+            .map(|(job, latest)| {
+                json!({
+                    "job_id":job.id,
+                    "latest":latest
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count":conversations.len(),
+            "conversations":conversations,
+            "network_checked":true,
+            "verification":inbox.verification,
+            "resume_submitted":false
+        }))
+    }
+
     /// Renders the shared capability registry.
     pub fn schema(&self, format: SchemaFormat) -> Result<Value, BossError> {
         render(format)

@@ -34,6 +34,10 @@ MAX_MESSAGE_CHARS = 200
 MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_TEXT_CHARS = 2000
 MAX_HISTORY_RESPONSE_BYTES = 60 * 1024
+MAX_INBOX_CONVERSATIONS = 5
+MAX_INBOX_TEXT_CHARS = 512
+MAX_INBOX_RESPONSE_BYTES = 60 * 1024
+MAX_REMOTE_ID_CHARS = 2048
 MAX_OPAQUE_VALUE_CHARS = 4096
 SEND_DEADLINE_SECONDS = 50.0
 USER_AGENT = (
@@ -353,6 +357,54 @@ def exact_friend(
     return match
 
 
+def validate_inbox_remote_ids(value: object) -> list[str]:
+    if type(value) is not list or not 1 <= len(value) <= MAX_INBOX_CONVERSATIONS:
+        raise SafeFailure("chat inbox requires between 1 and 5 jobs")
+    remote_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if (
+            type(item) is not str
+            or not item
+            or len(item) > MAX_REMOTE_ID_CHARS
+            or not item.isprintable()
+            or item in seen
+        ):
+            raise SafeFailure(
+                "chat inbox requires unique valid Zhipin job identifiers"
+            )
+        seen.add(item)
+        remote_ids.append(item)
+    return remote_ids
+
+
+def exact_friends(
+    session: requests.Session,
+    remote_ids: list[str],
+    deadline: float,
+) -> list[dict]:
+    requested = set(remote_ids)
+    matches: dict[str, dict] = {}
+    for page in range(1, MAX_LOOKUP_PAGES + 1):
+        payload = friend_list(session, page, deadline)
+        code = api_code(payload, "Zhipin friend list")
+        if code != 0:
+            raise SafeFailure(f"Zhipin friend list failed with API code {code!r}")
+        items = result_items(payload, "Zhipin friend list")
+        for item in items:
+            remote_id = friend_job_id(item)
+            if remote_id not in requested:
+                continue
+            if remote_id in matches:
+                raise SafeFailure("Zhipin conversation lookup was ambiguous")
+            matches[remote_id] = item
+        if not items:
+            break
+    if len(matches) != len(remote_ids):
+        raise SafeFailure("chat inbox requires existing exact Zhipin conversations")
+    return [matches[remote_id] for remote_id in remote_ids]
+
+
 def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
     return exact_friend(session, remote_id) is not None
 
@@ -517,6 +569,35 @@ def history_messages(
     return messages
 
 
+def recent_history_page(
+    session: requests.Session,
+    boss_id: str,
+    deadline: float,
+) -> list[dict]:
+    payload = request_json(
+        session.get(
+            HISTORY_URL,
+            headers=HEADERS,
+            params={
+                "bossId": boss_id,
+                "c": str(HISTORY_PAGE_SIZE),
+                "page": "1",
+            },
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin chat history",
+    )
+    data = response_data(payload, "Zhipin chat history")
+    messages = data.get("messages")
+    if messages is None and not data:
+        return []
+    if not isinstance(messages, list) or not all(
+        isinstance(item, dict) for item in messages
+    ):
+        raise SafeFailure("Zhipin chat history returned invalid messages")
+    return messages
+
+
 def has_exact_outgoing_text(
     messages: list[dict], user_id: int, message: str
 ) -> bool:
@@ -556,6 +637,32 @@ def unsafe_history_character(character: str) -> bool:
         or 0x1D173 <= codepoint <= 0x1D17A
         or 0xE0020 <= codepoint <= 0xE007F
     )
+
+
+def readable_message(item: dict, user_id: int) -> dict | None:
+    sender = item.get("from")
+    body = item.get("body")
+    timestamp_ms = item.get("time")
+    if not isinstance(sender, dict) or not isinstance(body, dict):
+        return None
+    sender_id = sender.get("uid")
+    text = body.get("text")
+    if (
+        type(sender_id) is not int
+        or sender_id <= 0
+        or not isinstance(text, str)
+        or not text
+        or any(unsafe_history_character(character) for character in text)
+        or type(timestamp_ms) is not int
+        or timestamp_ms <= 0
+        or timestamp_ms > 2**63 - 1
+    ):
+        return None
+    return {
+        "direction": "outgoing" if sender_id == user_id else "incoming",
+        "text": text,
+        "timestamp_ms": timestamp_ms,
+    }
 
 
 def bounded_history_response(updated_cookie: str, readable: list[dict]) -> dict:
@@ -605,36 +712,74 @@ def readable_history(
 
     readable: list[dict] = []
     for item in history_messages(session, boss_id, deadline):
-        sender = item.get("from")
-        body = item.get("body")
-        timestamp_ms = item.get("time")
-        if not isinstance(sender, dict) or not isinstance(body, dict):
+        message = readable_message(item, user_id)
+        if message is None or len(message["text"]) > MAX_HISTORY_TEXT_CHARS:
             continue
-        sender_id = sender.get("uid")
-        text = body.get("text")
-        if (
-            type(sender_id) is not int
-            or sender_id <= 0
-            or not isinstance(text, str)
-            or not text
-            or len(text) > MAX_HISTORY_TEXT_CHARS
-            or any(unsafe_history_character(character) for character in text)
-            or type(timestamp_ms) is not int
-            or timestamp_ms <= 0
-            or timestamp_ms > 2**63 - 1
-        ):
-            continue
-        readable.append(
-            {
-                "direction": "outgoing" if sender_id == user_id else "incoming",
-                "text": text,
-                "timestamp_ms": timestamp_ms,
-            }
-        )
+        readable.append(message)
 
     readable.sort(key=lambda item: item["timestamp_ms"])
     readable = readable[-limit:]
     return bounded_history_response(cookie_header(pairs), readable)
+
+
+def bounded_inbox_response(updated_cookie: str, conversations: list[dict]) -> dict:
+    response = {
+        "ok": True,
+        "action": "inbox",
+        "verification": "exact_encrypt_job_ids_and_user_id",
+        "count": len(conversations),
+        "conversations": conversations,
+        "updated_cookie": updated_cookie,
+    }
+    encoded = json.dumps(
+        response, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) + 1 > MAX_INBOX_RESPONSE_BYTES:
+        raise SafeFailure("Zhipin chat inbox result exceeded the safe output budget")
+    return response
+
+
+def readable_inbox(cookie: str, remote_ids: list[str]) -> dict:
+    deadline = time.monotonic() + SEND_DEADLINE_SECONDS
+    remote_ids = validate_inbox_remote_ids(remote_ids)
+    session, pairs, _ = prepare_session(cookie, deadline)
+    friends = exact_friends(session, remote_ids, deadline)
+
+    user_payload = request_json(
+        session.get(
+            USER_INFO_URL,
+            headers=HEADERS,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin user info",
+    )
+    user_data = response_data(user_payload, "Zhipin user info")
+    user_id = positive_int(user_data.get("userId"), "user id")
+
+    conversations: list[dict] = []
+    for remote_id, friend in zip(remote_ids, friends, strict=True):
+        boss_id = bounded_string(friend.get("encryptBossId"), "encrypted boss id")
+        readable = [
+            message
+            for item in recent_history_page(session, boss_id, deadline)
+            if (message := readable_message(item, user_id)) is not None
+        ]
+        latest = (
+            max(readable, key=lambda item: item["timestamp_ms"])
+            if readable
+            else None
+        )
+        if latest is not None:
+            text = latest["text"]
+            latest = {
+                "direction": latest["direction"],
+                "text": text[:MAX_INBOX_TEXT_CHARS],
+                "timestamp_ms": latest["timestamp_ms"],
+                "truncated": len(text) > MAX_INBOX_TEXT_CHARS,
+            }
+        conversations.append({"remote_id": remote_id, "latest": latest})
+
+    return bounded_inbox_response(cookie_header(pairs), conversations)
 
 
 def encode_varint(value: int) -> bytes:
@@ -858,7 +1003,7 @@ def main() -> int:
         if not isinstance(request, dict):
             raise SafeFailure("transport request must be an object")
         action = request.get("action")
-        if action not in {"refresh", "greet", "send", "history"}:
+        if action not in {"refresh", "greet", "send", "history", "inbox"}:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
         if not isinstance(cookie, str) or not cookie:
@@ -887,7 +1032,7 @@ def main() -> int:
             if not isinstance(message, str):
                 raise SafeFailure("chat message must be text")
             response = send(cookie, remote_id, message)
-        else:
+        elif action == "history":
             if set(request) != {"action", "cookie", "remote_id", "limit"}:
                 raise SafeFailure("transport request contains unsupported fields")
             remote_id = request.get("remote_id")
@@ -895,6 +1040,13 @@ def main() -> int:
             if not isinstance(remote_id, str) or not remote_id:
                 raise SafeFailure("cached Zhipin job identifier is required")
             response = readable_history(cookie, remote_id, limit)
+        else:
+            if set(request) != {"action", "cookie", "remote_ids"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = readable_inbox(
+                cookie,
+                validate_inbox_remote_ids(request.get("remote_ids")),
+            )
     except SafeFailure as error:
         response = {"ok": False, "error": str(error)}
     except Exception:

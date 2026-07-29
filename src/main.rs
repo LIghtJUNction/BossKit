@@ -226,6 +226,12 @@ enum ChatCommand {
         #[arg(long, default_value = "20")]
         limit: NonZeroUsize,
     },
+    /// 批量读取既有精确职位会话的最新文本；不轮询、回复或投递简历
+    Inbox {
+        /// 1 至 5 个本地缓存职位 ID
+        #[arg(required = true, num_args = 1..=5, value_name = "LOCAL_JOB_ID")]
+        job_ids: Vec<String>,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -854,7 +860,8 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             }
             ChatCommand::Greet { yes: true, .. }
             | ChatCommand::Send { yes: true, .. }
-            | ChatCommand::History { .. } => {}
+            | ChatCommand::History { .. }
+            | ChatCommand::Inbox { .. } => {}
         }
     }
     let mut service = BossService::discover()?;
@@ -1227,6 +1234,9 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(
                     service.chat_history(&job_id, limit.get())?,
                 ));
+            }
+            ChatCommand::Inbox { job_ids } => {
+                print_json(&Envelope::success(service.chat_inbox(&job_ids)?));
             }
         },
         Command::Logout { platform, yes } => print_json(&Envelope::success(
