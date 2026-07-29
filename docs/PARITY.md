@@ -25,6 +25,7 @@ BossKit is an independently developed Rust 2024 product with its own command pro
 | Resume screening | `boss campaign screen`, MCP `campaign_screen` | Deterministic local-only title and skill matching over cached job title, skills, and description; policy and blacklist gates run first; creates only deduplicated `manual_review` / `dry_run` plans |
 | Campaign review plans | `boss campaign plan ...`, matching MCP tools | Local policy, blacklist, bounded ephemeral greeting previews, and human-recorded state transitions; never applies or chats |
 | Default Zhipin greeting | `boss chat greet <LOCAL_JOB_ID> --yes` | CLI-only browserless initial contact for one exact cached job; verifies the exact encrypted job ID, sends no custom text or resume, and is unavailable through MCP |
+| Existing Zhipin chat | `boss chat send <LOCAL_JOB_ID> --message <TEXT> --yes` | CLI-only browserless single text to an existing exact conversation; bounded printable text, one QoS 1 publish with no automatic retry, exact outgoing-history verification, no resume/application, and no MCP surface |
 | Statistics | `boss stats`, MCP `stats` | Exact local counts, time-window history outcomes, and known-file sizes |
 | Recoverable cleanup | `boss clean`, MCP `clean_preview` | Preview by default; Linux confirmation atomically archives only six known mutable JSON files and returns verified recovery paths, using a private root-level rescue transaction if rollback is blocked; no unlink; non-Linux and MCP are preview-only |
 | MCP transport | `boss mcp` | MCP 2025-03-26 stdio, strict arguments, batch requests |
@@ -41,7 +42,7 @@ BossKit is an independently developed Rust 2024 product with its own command pro
 
 ## Pending
 
-Remote platform browsing history, platform resume synchronization, background scheduling, crawling, custom chat messages, batch greeting orchestration, reply polling, automatic conversations, and platform application workflows are not implemented.
+Remote platform browsing history, platform resume synchronization, background scheduling, crawling, batch greeting or message orchestration, reply polling, automatic conversations, and platform application workflows are not implemented.
 
 ## Policy-blocked / intentionally unimplemented
 

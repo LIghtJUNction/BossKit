@@ -389,6 +389,49 @@ impl BossService {
         }))
     }
 
+    /// Sends one explicitly confirmed message to an existing Zhipin conversation.
+    pub fn chat_send(
+        &mut self,
+        job_id: &str,
+        message: &str,
+        yes: bool,
+    ) -> Result<Value, BossError> {
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "chat send requires --yes".to_owned(),
+            ));
+        }
+        let message = crate::zhipin_direct::normalize_message(message)?;
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument(format!("job not found: {job_id}")))?;
+        if job.platform != Platform::Zhipin {
+            return Err(BossError::InvalidArgument(
+                "chat send supports only cached Zhipin jobs".to_owned(),
+            ));
+        }
+        if job.remote_id.trim().is_empty() {
+            return Err(BossError::InvalidArgument(
+                "cached Zhipin job is missing direct chat metadata".to_owned(),
+            ));
+        }
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "chat send requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        let sent = crate::zhipin_direct::send(&cookie, &job.remote_id, &message)?;
+        self.auth.store_session(Platform::Zhipin, sent.cookie)?;
+        Ok(json!({
+            "job_id":job.id,
+            "state":sent.state,
+            "verification":sent.verification,
+            "network_checked":true,
+            "resume_submitted":false
+        }))
+    }
+
     /// Renders the shared capability registry.
     pub fn schema(&self, format: SchemaFormat) -> Result<Value, BossError> {
         render(format)

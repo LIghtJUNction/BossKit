@@ -420,7 +420,46 @@ fn chat_greet_requires_yes_before_using_runtime_credentials() {
 }
 
 #[test]
-fn direct_greeting_is_cli_only_and_schema_marks_the_remote_write() {
+fn chat_send_requires_yes_before_service_discovery_and_never_echoes_text() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    std::fs::write(directory.path().join("config.json"), b"{invalid").expect("invalid config");
+    let secret = "MESSAGE_BODY_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", "wt2=COOKIE_MUST_NOT_APPEAR")
+        .args(["chat", "send", "zhipin-job", "--message", secret])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!rendered.contains(secret) && !rendered.contains("COOKIE_MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn chat_send_rejects_invalid_text_before_credentials_without_echoing_it() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let secret = "PRIVATE_LINE\nMUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .args(["chat", "send", "zhipin-job", "--message", secret, "--yes"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!rendered.contains("PRIVATE_LINE") && !rendered.contains("MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn direct_chat_is_cli_only_and_schema_marks_both_remote_writes() {
     let directory = tempdir().expect("temporary directory");
     let responses = run_mcp(
         directory.path(),
@@ -440,15 +479,19 @@ fn direct_greeting_is_cli_only_and_schema_marks_the_remote_write() {
         .iter()
         .find(|command| command["name"] == "chat greet")
         .expect("native greet");
-    assert!(greet["remote_write"] == true && greet["local_write"] == true);
+    let send = commands
+        .iter()
+        .find(|command| command["name"] == "chat send")
+        .expect("native send");
     assert!(
-        commands
-            .iter()
-            .all(|command| command["name"] != "chat send")
+        greet["remote_write"] == true
+            && greet["local_write"] == true
+            && send["remote_write"] == true
+            && send["local_write"] == true
     );
     assert_eq!(
         schema["data"]["risk"]["confirmed_platform_messages"],
-        serde_json::json!(["chat greet"])
+        serde_json::json!(["chat greet", "chat send"])
     );
 }
 

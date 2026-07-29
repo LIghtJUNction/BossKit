@@ -207,6 +207,17 @@ enum ChatCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// 向已建立的精确职位会话发送一条文本；不发送简历
+    Send {
+        /// 本地缓存职位 ID
+        job_id: String,
+        /// 单行可打印文本，最多 200 个 Unicode 字符
+        #[arg(long)]
+        message: String,
+        /// 明确确认本次平台写操作
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -821,15 +832,20 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         )));
         return Ok(ExitCode::SUCCESS);
     }
-    if matches!(
-        &cli.command,
-        Command::Chat {
-            command: ChatCommand::Greet { yes: false, .. }
+    if let Command::Chat { command } = &cli.command {
+        match command {
+            ChatCommand::Greet { yes: false, .. } => {
+                return Err(BossError::InvalidArgument(
+                    "chat greet requires --yes".to_owned(),
+                ));
+            }
+            ChatCommand::Send { yes: false, .. } => {
+                return Err(BossError::InvalidArgument(
+                    "chat send requires --yes".to_owned(),
+                ));
+            }
+            ChatCommand::Greet { yes: true, .. } | ChatCommand::Send { yes: true, .. } => {}
         }
-    ) {
-        return Err(BossError::InvalidArgument(
-            "chat greet requires --yes".to_owned(),
-        ));
     }
     let mut service = BossService::discover()?;
     match cli.command {
@@ -1187,6 +1203,15 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         Command::Chat { command } => match command {
             ChatCommand::Greet { job_id, yes } => {
                 print_json(&Envelope::success(service.chat_greet(&job_id, yes)?));
+            }
+            ChatCommand::Send {
+                job_id,
+                message,
+                yes,
+            } => {
+                print_json(&Envelope::success(
+                    service.chat_send(&job_id, &message, yes)?,
+                ));
             }
         },
         Command::Logout { platform, yes } => print_json(&Envelope::success(

@@ -10,31 +10,29 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import ssl
 import sys
+import time
 from http.cookies import SimpleCookie
+from threading import Event
 from urllib.parse import quote
-
-import requests
-
-saved_stdout = os.dup(sys.stdout.fileno())
-try:
-    with open(os.devnull, "w", encoding="utf-8") as sink:
-        sys.stdout.flush()
-        os.dup2(sink.fileno(), sys.stdout.fileno())
-        import iv8
-        sys.stdout.flush()
-finally:
-    os.dup2(saved_stdout, sys.stdout.fileno())
-    os.close(saved_stdout)
 
 FRIEND_LIST_URL = (
     "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json"
 )
 FRIEND_ADD_URL = "https://www.zhipin.com/wapi/zpgeek/friend/add.json"
 API_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
+USER_INFO_URL = "https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json"
+WT_URL = "https://www.zhipin.com/wapi/zppassport/get/wt"
+HISTORY_URL = "https://www.zhipin.com/wapi/zpchat/geek/historyMsg"
 BASE_URL = "https://www.zhipin.com"
 MAX_LOOKUP_PAGES = 3
 LOOKUP_PAGE_SIZE = 30
+HISTORY_PAGE_SIZE = 20
+MAX_MESSAGE_CHARS = 200
+MAX_OPAQUE_VALUE_CHARS = 4096
+SEND_DEADLINE_SECONDS = 50.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -59,6 +57,15 @@ SEARCH_DATA = {
 
 class SafeFailure(Exception):
     """An expected failure whose message contains no credential material."""
+
+
+def request_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return 15.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.25:
+        raise SafeFailure("Zhipin direct message operation timed out")
+    return min(5.0, remaining)
 
 
 def cookie_pairs(header: str) -> list[tuple[str, str]]:
@@ -99,7 +106,22 @@ def api_code(payload: dict, action: str) -> int:
     return code
 
 
-def challenge_token(seed: str, name: str, timestamp: int) -> str:
+def challenge_token(
+    seed: str, name: str, timestamp: int, deadline: float | None
+) -> str:
+    import requests
+
+    saved_stdout = os.dup(sys.stdout.fileno())
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as sink:
+            sys.stdout.flush()
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+            import iv8
+            sys.stdout.flush()
+    finally:
+        os.dup2(saved_stdout, sys.stdout.fileno())
+        os.close(saved_stdout)
+
     if (
         not seed
         or len(seed) > 4096
@@ -116,7 +138,7 @@ def challenge_token(seed: str, name: str, timestamp: int) -> str:
     response = requests.get(
         js_url,
         headers={"User-Agent": USER_AGENT},
-        timeout=15,
+        timeout=request_timeout(deadline),
     )
     if response.status_code != 200 or not response.text:
         raise SafeFailure("unable to load Zhipin security challenge")
@@ -170,6 +192,7 @@ def apply_challenge(
     payload: dict,
     pairs: list[tuple[str, str]],
     session: requests.Session,
+    deadline: float | None,
 ) -> list[tuple[str, str]]:
     challenge = payload.get("zpData")
     if not isinstance(challenge, dict):
@@ -179,7 +202,7 @@ def apply_challenge(
     timestamp = challenge.get("ts")
     if not isinstance(seed, str) or not isinstance(name, str):
         raise SafeFailure("Zhipin security challenge is incomplete")
-    token = challenge_token(seed, name, timestamp)
+    token = challenge_token(seed, name, timestamp, deadline)
     pairs = replace_cookie(pairs, "__zp_stoken__", token)
     session.cookies.set(
         "__zp_stoken__",
@@ -190,13 +213,15 @@ def apply_challenge(
     return pairs
 
 
-def friend_list(session: requests.Session, page: int) -> dict:
+def friend_list(
+    session: requests.Session, page: int, deadline: float | None = None
+) -> dict:
     return request_json(
         session.get(
             FRIEND_LIST_URL,
             headers=HEADERS,
             params={"page": str(page)},
-            timeout=15,
+            timeout=request_timeout(deadline),
         ),
         "Zhipin friend list",
     )
@@ -204,7 +229,10 @@ def friend_list(session: requests.Session, page: int) -> dict:
 
 def prepare_session(
     cookie: str,
+    deadline: float | None = None,
 ) -> tuple[requests.Session, list[tuple[str, str]], bool]:
+    import requests
+
     pairs = cookie_pairs(cookie)
     session = requests.Session()
     for name, value in pairs:
@@ -215,21 +243,21 @@ def prepare_session(
             API_URL,
             headers=HEADERS,
             data=SEARCH_DATA,
-            timeout=15,
+            timeout=request_timeout(deadline),
         ),
         "Zhipin session check",
     )
     code = api_code(initial, "Zhipin session check")
     token_refreshed = False
     if code == 37:
-        pairs = apply_challenge(initial, pairs, session)
+        pairs = apply_challenge(initial, pairs, session, deadline)
         token_refreshed = True
         verified = request_json(
             session.post(
                 API_URL,
                 headers=HEADERS,
                 data=SEARCH_DATA,
-                timeout=15,
+                timeout=request_timeout(deadline),
             ),
             "Zhipin refreshed security check",
         )
@@ -241,12 +269,12 @@ def prepare_session(
     elif code != 0:
         raise SafeFailure(f"Zhipin session check failed with API code {code!r}")
 
-    authenticated = friend_list(session, 1)
+    authenticated = friend_list(session, 1, deadline)
     authenticated_code = api_code(authenticated, "Zhipin authenticated session check")
     if authenticated_code == 37:
-        pairs = apply_challenge(authenticated, pairs, session)
+        pairs = apply_challenge(authenticated, pairs, session, deadline)
         token_refreshed = True
-        authenticated = friend_list(session, 1)
+        authenticated = friend_list(session, 1, deadline)
         authenticated_code = api_code(
             authenticated,
             "Zhipin authenticated session check",
@@ -299,18 +327,31 @@ def friend_job_id(item: dict) -> str | None:
     return None
 
 
-def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
+def exact_friend(
+    session: requests.Session,
+    remote_id: str,
+    deadline: float | None = None,
+) -> dict | None:
+    match: dict | None = None
     for page in range(1, MAX_LOOKUP_PAGES + 1):
-        payload = friend_list(session, page)
+        payload = friend_list(session, page, deadline)
         code = api_code(payload, "Zhipin friend list")
         if code != 0:
             raise SafeFailure(f"Zhipin friend list failed with API code {code!r}")
         items = result_items(payload, "Zhipin friend list")
-        if any(friend_job_id(item) == remote_id for item in items):
-            return True
+        for item in items:
+            if friend_job_id(item) != remote_id:
+                continue
+            if match is not None:
+                raise SafeFailure("Zhipin conversation lookup was ambiguous")
+            match = item
         if not items:
-            return False
-    return False
+            break
+    return match
+
+
+def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
+    return exact_friend(session, remote_id) is not None
 
 
 def search_exact_job(
@@ -392,13 +433,327 @@ def greet(cookie: str, title: str, remote_id: str) -> dict:
     }
 
 
+def normalize_message(message: str) -> str:
+    normalized = message.strip()
+    if (
+        not normalized
+        or len(normalized) > MAX_MESSAGE_CHARS
+        or "\n" in normalized
+        or "\r" in normalized
+        or not normalized.isprintable()
+    ):
+        raise SafeFailure(
+            "chat message must contain 1 to 200 printable single-line characters"
+        )
+    return normalized
+
+
+def positive_int(value: object, field: str) -> int:
+    if type(value) is not int or value <= 0 or value > 2**63 - 1:
+        raise SafeFailure(f"Zhipin {field} is invalid")
+    return value
+
+
+def exact_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 0 or value > 2**31 - 1:
+        raise SafeFailure(f"Zhipin {field} is invalid")
+    return value
+
+
+def bounded_string(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_OPAQUE_VALUE_CHARS
+        or not value.isprintable()
+    ):
+        raise SafeFailure(f"Zhipin {field} is invalid")
+    return value
+
+
+def response_data(payload: dict, action: str) -> dict:
+    if api_code(payload, action) != 0:
+        raise SafeFailure(f"{action} failed")
+    data = payload.get("zpData")
+    if not isinstance(data, dict):
+        raise SafeFailure(f"{action} returned no result data")
+    return data
+
+
+def history_messages(
+    session: requests.Session,
+    boss_id: str,
+    deadline: float,
+) -> list[dict]:
+    messages: list[dict] = []
+    for page_number in range(1, MAX_LOOKUP_PAGES + 1):
+        payload = request_json(
+            session.get(
+                HISTORY_URL,
+                headers=HEADERS,
+                params={
+                    "bossId": boss_id,
+                    "c": str(HISTORY_PAGE_SIZE),
+                    "page": str(page_number),
+                },
+                timeout=request_timeout(deadline),
+            ),
+            "Zhipin chat history",
+        )
+        data = response_data(payload, "Zhipin chat history")
+        page = data.get("messages")
+        if page is None and not data:
+            page = []
+        if not isinstance(page, list) or not all(
+            isinstance(item, dict) for item in page
+        ):
+            raise SafeFailure("Zhipin chat history returned invalid messages")
+        messages.extend(page)
+        if len(page) < HISTORY_PAGE_SIZE:
+            break
+    return messages
+
+
+def has_exact_outgoing_text(
+    messages: list[dict], user_id: int, message: str
+) -> bool:
+    for item in messages:
+        sender = item.get("from")
+        body = item.get("body")
+        if (
+            isinstance(sender, dict)
+            and isinstance(body, dict)
+            and type(sender.get("uid")) is int
+            and sender["uid"] == user_id
+            and isinstance(body.get("text"), str)
+            and body["text"] == message
+        ):
+            return True
+    return False
+
+
+def encode_varint(value: int) -> bytes:
+    if type(value) is not int or value < 0 or value > 2**64 - 1:
+        raise SafeFailure("protobuf unsigned integer is invalid")
+    encoded = bytearray()
+    while value >= 0x80:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def encode_varint_field(field: int, value: int) -> bytes:
+    if type(field) is not int or field <= 0 or field > 536_870_911:
+        raise SafeFailure("protobuf field number is invalid")
+    return encode_varint(field << 3) + encode_varint(value)
+
+
+def encode_bytes_field(field: int, value: bytes) -> bytes:
+    if type(field) is not int or field <= 0 or field > 536_870_911:
+        raise SafeFailure("protobuf field number is invalid")
+    if not isinstance(value, bytes) or len(value) > 64 * 1024:
+        raise SafeFailure("protobuf field payload is invalid")
+    return encode_varint((field << 3) | 2) + encode_varint(len(value)) + value
+
+
+def encode_text_field(field: int, value: str) -> bytes:
+    return encode_bytes_field(field, value.encode("utf-8"))
+
+
+def encode_user(uid: int, name: str | None, source: int) -> bytes:
+    payload = encode_varint_field(1, uid)
+    if name is not None:
+        payload += encode_text_field(2, name)
+    payload += encode_varint_field(7, source)
+    return payload
+
+
+def encode_body(message: str) -> bytes:
+    return (
+        encode_varint_field(1, 1)
+        + encode_varint_field(2, 1)
+        + encode_text_field(3, message)
+    )
+
+
+def encode_protocol(
+    user_id: int,
+    target_uid: int,
+    target_name: str,
+    target_source: int,
+    message: str,
+    timestamp_ms: int,
+    message_id: int,
+) -> bytes:
+    chat_message = (
+        encode_bytes_field(1, encode_user(user_id, None, 0))
+        + encode_bytes_field(
+            2, encode_user(target_uid, target_name, target_source)
+        )
+        + encode_varint_field(3, 1)
+        + encode_varint_field(4, message_id)
+        + encode_varint_field(5, timestamp_ms)
+        + encode_bytes_field(6, encode_body(message))
+        + encode_varint_field(11, message_id)
+        + encode_varint_field(20, 1)
+    )
+    return encode_varint_field(1, 1) + encode_bytes_field(3, chat_message)
+
+
+def publish_once(
+    payload: bytes,
+    cookie: str,
+    token: str,
+    wt2: str,
+    deadline: float,
+) -> None:
+    import paho.mqtt.client as mqtt
+
+    connection_finished = Event()
+    connection_result = {"accepted": False, "reason": "unknown"}
+
+    def on_connect(
+        client: mqtt.Client,
+        userdata: object,
+        flags: mqtt.ConnectFlags,
+        reason_code: mqtt.ReasonCode,
+        properties: mqtt.Properties | None,
+    ) -> None:
+        del client, userdata, flags, properties
+        if reason_code == 0:
+            connection_result["accepted"] = True
+            connection_result["reason"] = "success"
+        else:
+            connection_result["reason"] = str(reason_code)
+        connection_finished.set()
+
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"ws-{secrets.token_hex(8)}",
+        clean_session=True,
+        protocol=mqtt.MQTTv311,
+        transport="websockets",
+        reconnect_on_failure=False,
+    )
+    client.on_connect = on_connect
+    client.username_pw_set(f"{token}|0", wt2)
+    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+    client.ws_set_options(
+        path="/chatws",
+        headers={
+            "Cookie": cookie,
+            "Origin": BASE_URL,
+            "User-Agent": USER_AGENT,
+            "Sec-WebSocket-Protocol": wt2,
+        },
+    )
+    client.max_inflight_messages_set(1)
+    started = False
+    try:
+        if client.connect("ws.zhipin.com", 443, keepalive=30) != mqtt.MQTT_ERR_SUCCESS:
+            raise SafeFailure("Zhipin chat connection failed")
+        client.loop_start()
+        started = True
+        wait = request_timeout(deadline)
+        if not connection_finished.wait(wait):
+            raise SafeFailure("Zhipin chat connection timed out before acknowledgement")
+        if not connection_result["accepted"]:
+            raise SafeFailure(
+                f"Zhipin chat connection was rejected: {connection_result['reason']}"
+            )
+        published = client.publish("chat", payload, qos=1, retain=False)
+        if published.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise SafeFailure("Zhipin chat publish failed")
+        published.wait_for_publish(timeout=request_timeout(deadline))
+    finally:
+        if started:
+            client.disconnect()
+            client.loop_stop()
+
+
+def send(cookie: str, remote_id: str, message: str) -> dict:
+    deadline = time.monotonic() + SEND_DEADLINE_SECONDS
+    message = normalize_message(message)
+    session, pairs, _ = prepare_session(cookie, deadline)
+    friend = exact_friend(session, remote_id, deadline)
+    if friend is None:
+        raise SafeFailure("chat send requires an existing exact Zhipin conversation")
+
+    target_uid = positive_int(friend.get("uid"), "conversation uid")
+    target_name = bounded_string(friend.get("encryptBossId"), "encrypted boss id")
+    target_source = exact_int(friend.get("friendSource"), "conversation source")
+
+    user_payload = request_json(
+        session.get(
+            USER_INFO_URL,
+            headers=HEADERS,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin user info",
+    )
+    user_data = response_data(user_payload, "Zhipin user info")
+    user_id = positive_int(user_data.get("userId"), "user id")
+    token = bounded_string(user_data.get("token"), "user token")
+
+    wt_payload = request_json(
+        session.get(
+            WT_URL,
+            headers=HEADERS,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin websocket credential",
+    )
+    wt_data = response_data(wt_payload, "Zhipin websocket credential")
+    wt2 = bounded_string(wt_data.get("wt2"), "websocket credential")
+
+    before = history_messages(session, target_name, deadline)
+    if has_exact_outgoing_text(before, user_id, message):
+        return {
+            "ok": True,
+            "action": "send",
+            "state": "already_sent",
+            "verification": "exact_outgoing_text_in_history",
+            "updated_cookie": cookie_header(pairs),
+        }
+
+    timestamp_ms = int(time.time() * 1000)
+    message_id = user_id + timestamp_ms
+    if message_id > 2**63 - 1:
+        raise SafeFailure("Zhipin message identifier is invalid")
+    payload = encode_protocol(
+        user_id,
+        target_uid,
+        target_name,
+        target_source,
+        message,
+        timestamp_ms,
+        message_id,
+    )
+    publish_once(payload, cookie_header(pairs), token, wt2, deadline)
+
+    for attempt in range(3):
+        after = history_messages(session, target_name, deadline)
+        if has_exact_outgoing_text(after, user_id, message):
+            return {
+                "ok": True,
+                "action": "send",
+                "state": "message_verified",
+                "verification": "exact_outgoing_text_in_history",
+                "updated_cookie": cookie_header(pairs),
+            }
+        if attempt < 2:
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    raise SafeFailure("Zhipin message could not be verified")
+
+
 def main() -> int:
     try:
         request = json.load(sys.stdin)
         if not isinstance(request, dict):
             raise SafeFailure("transport request must be an object")
         action = request.get("action")
-        if action not in {"refresh", "greet"}:
+        if action not in {"refresh", "greet", "send"}:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
         if not isinstance(cookie, str) or not cookie:
@@ -407,7 +762,7 @@ def main() -> int:
             if set(request) != {"action", "cookie"}:
                 raise SafeFailure("transport request contains unsupported fields")
             response = refresh(cookie)
-        else:
+        elif action == "greet":
             if set(request) != {"action", "cookie", "title", "remote_id"}:
                 raise SafeFailure("transport request contains unsupported fields")
             title = request.get("title")
@@ -417,6 +772,16 @@ def main() -> int:
             if not isinstance(remote_id, str) or not remote_id:
                 raise SafeFailure("cached Zhipin job identifier is required")
             response = greet(cookie, title.strip(), remote_id)
+        else:
+            if set(request) != {"action", "cookie", "remote_id", "message"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            remote_id = request.get("remote_id")
+            message = request.get("message")
+            if not isinstance(remote_id, str) or not remote_id:
+                raise SafeFailure("cached Zhipin job identifier is required")
+            if not isinstance(message, str):
+                raise SafeFailure("chat message must be text")
+            response = send(cookie, remote_id, message)
     except SafeFailure as error:
         response = {"ok": False, "error": str(error)}
     except Exception:
