@@ -238,6 +238,7 @@ fn bare_invocation_and_help_print_the_same_complete_chinese_root_help() {
             "export",
             "config",
             "login",
+            "chat",
             "logout",
             "status",
             "doctor",
@@ -384,11 +385,11 @@ fn nested_help_screens_localize_generated_and_authored_text() {
 }
 
 #[test]
-fn unavailable_chat_command_is_a_message_free_json_error() {
+fn chat_rejects_custom_message_arguments_without_echoing_their_value() {
     let secret = "GREETING_SECRET_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
-        .args(["chat", "unknown", "--message", secret])
+        .args(["chat", "greet", "zhipin-job", "--message", secret])
         .output()
         .expect("run");
     assert!(!output.status.success());
@@ -399,7 +400,27 @@ fn unavailable_chat_command_is_a_message_free_json_error() {
 }
 
 #[test]
-fn direct_chat_is_not_advertised_before_transport_integration() {
+fn chat_greet_requires_yes_before_using_runtime_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    std::fs::write(directory.path().join("config.json"), b"{invalid").expect("invalid config");
+    let secret = "wt2=GREETING_COOKIE_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", secret)
+        .args(["chat", "greet", "zhipin-job"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!directory.path().join(".auth").exists());
+}
+
+#[test]
+fn direct_greeting_is_cli_only_and_schema_marks_the_remote_write() {
     let directory = tempdir().expect("temporary directory");
     let responses = run_mcp(
         directory.path(),
@@ -415,14 +436,19 @@ fn direct_chat_is_not_advertised_before_transport_integration() {
 
     let schema = run_json(directory.path(), &["schema", "--format", "native"]);
     let commands = schema["data"]["commands"].as_array().expect("commands");
+    let greet = commands
+        .iter()
+        .find(|command| command["name"] == "chat greet")
+        .expect("native greet");
+    assert!(greet["remote_write"] == true && greet["local_write"] == true);
     assert!(
         commands
             .iter()
-            .all(|command| !matches!(command["name"].as_str(), Some("chat greet" | "chat send")))
+            .all(|command| command["name"] != "chat send")
     );
     assert_eq!(
         schema["data"]["risk"]["confirmed_platform_messages"],
-        serde_json::json!([])
+        serde_json::json!(["chat greet"])
     );
 }
 

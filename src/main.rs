@@ -161,6 +161,11 @@ enum Command {
         #[arg(long)]
         manual: bool,
     },
+    /// 对一个本地缓存 BOSS 职位发送平台默认招呼
+    Chat {
+        #[command(subcommand)]
+        command: ChatCommand,
+    },
     /// 撤销本地保存的登录会话
     Logout {
         #[arg(long, value_enum)]
@@ -190,6 +195,18 @@ enum Command {
     },
     /// 启动 MCP stdio 服务
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum ChatCommand {
+    /// 建立一个职位会话；不发送自定义消息或简历
+    Greet {
+        /// 本地缓存职位 ID
+        job_id: String,
+        /// 明确确认本次平台写操作
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -804,6 +821,16 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         )));
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(
+        &cli.command,
+        Command::Chat {
+            command: ChatCommand::Greet { yes: false, .. }
+        }
+    ) {
+        return Err(BossError::InvalidArgument(
+            "chat greet requires --yes".to_owned(),
+        ));
+    }
     let mut service = BossService::discover()?;
     match cli.command {
         Command::Platforms => print_json(&Envelope::success(service.platforms())),
@@ -1157,6 +1184,11 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 .login(platform.and_then(PlatformArg::selected), manual)
                 .await?,
         )),
+        Command::Chat { command } => match command {
+            ChatCommand::Greet { job_id, yes } => {
+                print_json(&Envelope::success(service.chat_greet(&job_id, yes)?));
+            }
+        },
         Command::Logout { platform, yes } => print_json(&Envelope::success(
             service.logout(platform.and_then(PlatformArg::selected), yes)?,
         )),

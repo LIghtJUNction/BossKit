@@ -30,10 +30,11 @@ finally:
 FRIEND_LIST_URL = (
     "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json"
 )
-
-
+FRIEND_ADD_URL = "https://www.zhipin.com/wapi/zpgeek/friend/add.json"
 API_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 BASE_URL = "https://www.zhipin.com"
+MAX_LOOKUP_PAGES = 3
+LOOKUP_PAGE_SIZE = 30
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -98,11 +99,21 @@ def api_code(payload: dict, action: str) -> int:
     return code
 
 
-def challenge_token(seed: str, name: str, timestamp: int, session: requests.Session) -> str:
-    if not seed or not name or timestamp <= 0:
+def challenge_token(seed: str, name: str, timestamp: int) -> str:
+    if (
+        not seed
+        or len(seed) > 4096
+        or not name
+        or len(name) > 128
+        or not name.isascii()
+        or not all(character.isalnum() or character in "_-" for character in name)
+        or type(timestamp) is not int
+        or timestamp <= 0
+        or timestamp > 2**63 - 1
+    ):
         raise SafeFailure("Zhipin security challenge is incomplete")
     js_url = f"{BASE_URL}/web/common/security-js/{name}.js"
-    response = session.get(
+    response = requests.get(
         js_url,
         headers={"User-Agent": USER_AGENT},
         timeout=15,
@@ -112,7 +123,7 @@ def challenge_token(seed: str, name: str, timestamp: int, session: requests.Sess
 
     security_url = (
         f"{BASE_URL}/web/common/security-check.html"
-        f"?seed={quote(seed)}&name={name}&ts={timestamp}&callbackUrl=&srcReferer"
+        f"?seed={quote(seed, safe='')}&name={name}&ts={timestamp}&callbackUrl=&srcReferer"
     )
     environment = {
         "location": {
@@ -163,12 +174,12 @@ def apply_challenge(
     challenge = payload.get("zpData")
     if not isinstance(challenge, dict):
         raise SafeFailure("Zhipin security challenge is missing")
-    token = challenge_token(
-        str(challenge.get("seed") or ""),
-        str(challenge.get("name") or ""),
-        int(challenge.get("ts") or 0),
-        session,
-    )
+    seed = challenge.get("seed")
+    name = challenge.get("name")
+    timestamp = challenge.get("ts")
+    if not isinstance(seed, str) or not isinstance(name, str):
+        raise SafeFailure("Zhipin security challenge is incomplete")
+    token = challenge_token(seed, name, timestamp)
     pairs = replace_cookie(pairs, "__zp_stoken__", token)
     session.cookies.set(
         "__zp_stoken__",
@@ -179,19 +190,21 @@ def apply_challenge(
     return pairs
 
 
-def authenticated_check(session: requests.Session) -> dict:
+def friend_list(session: requests.Session, page: int) -> dict:
     return request_json(
         session.get(
             FRIEND_LIST_URL,
             headers=HEADERS,
-            params={"page": "1"},
+            params={"page": str(page)},
             timeout=15,
         ),
-        "Zhipin authenticated session check",
+        "Zhipin friend list",
     )
 
 
-def refresh(cookie: str) -> dict:
+def prepare_session(
+    cookie: str,
+) -> tuple[requests.Session, list[tuple[str, str]], bool]:
     pairs = cookie_pairs(cookie)
     session = requests.Session()
     for name, value in pairs:
@@ -228,12 +241,12 @@ def refresh(cookie: str) -> dict:
     elif code != 0:
         raise SafeFailure(f"Zhipin session check failed with API code {code!r}")
 
-    authenticated = authenticated_check(session)
+    authenticated = friend_list(session, 1)
     authenticated_code = api_code(authenticated, "Zhipin authenticated session check")
     if authenticated_code == 37:
         pairs = apply_challenge(authenticated, pairs, session)
         token_refreshed = True
-        authenticated = authenticated_check(session)
+        authenticated = friend_list(session, 1)
         authenticated_code = api_code(
             authenticated,
             "Zhipin authenticated session check",
@@ -242,6 +255,11 @@ def refresh(cookie: str) -> dict:
         raise SafeFailure(
             f"Zhipin authenticated session check failed with API code {authenticated_code!r}"
         )
+    return session, pairs, token_refreshed
+
+
+def refresh(cookie: str) -> dict:
+    _, pairs, token_refreshed = prepare_session(cookie)
     return {
         "ok": True,
         "action": "refresh",
@@ -254,17 +272,151 @@ def refresh(cookie: str) -> dict:
     }
 
 
+def result_items(payload: dict, action: str) -> list[dict]:
+    data = payload.get("zpData")
+    if not isinstance(data, dict):
+        raise SafeFailure(f"{action} returned no result data")
+    items = data.get("result")
+    if items is None and not data:
+        return []
+    if not isinstance(items, list):
+        raise SafeFailure(f"{action} returned an invalid result list")
+    if not all(isinstance(item, dict) for item in items):
+        raise SafeFailure(f"{action} returned invalid result entries")
+    return items
+
+
+def friend_job_id(item: dict) -> str | None:
+    direct = item.get("encryptJobId")
+    if isinstance(direct, str) and direct:
+        return direct
+    for key in ("jobInfo", "jobBaseInfo"):
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            value = nested.get("encryptJobId")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
+    for page in range(1, MAX_LOOKUP_PAGES + 1):
+        payload = friend_list(session, page)
+        code = api_code(payload, "Zhipin friend list")
+        if code != 0:
+            raise SafeFailure(f"Zhipin friend list failed with API code {code!r}")
+        items = result_items(payload, "Zhipin friend list")
+        if any(friend_job_id(item) == remote_id for item in items):
+            return True
+        if not items:
+            return False
+    return False
+
+
+def search_exact_job(
+    session: requests.Session, title: str, remote_id: str
+) -> tuple[str, str]:
+    matches: list[dict] = []
+    for page in range(1, MAX_LOOKUP_PAGES + 1):
+        data = {
+            "scene": "1",
+            "query": title,
+            "city": "",
+            "page": str(page),
+            "pageSize": str(LOOKUP_PAGE_SIZE),
+        }
+        payload = request_json(
+            session.post(API_URL, headers=HEADERS, data=data, timeout=15),
+            "Zhipin target search",
+        )
+        code = api_code(payload, "Zhipin target search")
+        if code != 0:
+            raise SafeFailure(f"Zhipin target search failed with API code {code!r}")
+        response_data = payload.get("zpData")
+        if not isinstance(response_data, dict):
+            raise SafeFailure("Zhipin target search returned no result data")
+        items = response_data.get("jobList")
+        if not isinstance(items, list) or not all(
+            isinstance(item, dict) for item in items
+        ):
+            raise SafeFailure("Zhipin target search returned an invalid job list")
+        matches.extend(
+            item for item in items if item.get("encryptJobId") == remote_id
+        )
+        if len(items) < LOOKUP_PAGE_SIZE:
+            break
+
+    if len(matches) != 1:
+        raise SafeFailure("cached Zhipin job could not be resolved exactly")
+    security_id = matches[0].get("securityId")
+    lid = matches[0].get("lid")
+    if not isinstance(security_id, str) or not security_id:
+        raise SafeFailure("resolved Zhipin job has no greeting authorization")
+    if not isinstance(lid, str) or not lid:
+        raise SafeFailure("resolved Zhipin job has no greeting lookup identifier")
+    return security_id, lid
+
+
+def greet(cookie: str, title: str, remote_id: str) -> dict:
+    session, pairs, _ = prepare_session(cookie)
+    if has_exact_friend(session, remote_id):
+        return {
+            "ok": True,
+            "action": "greet",
+            "state": "already_connected",
+            "verification": "exact_encrypt_job_id_in_friend_list",
+            "updated_cookie": cookie_header(pairs),
+        }
+
+    security_id, lid = search_exact_job(session, title, remote_id)
+    added = request_json(
+        session.get(
+            FRIEND_ADD_URL,
+            headers=HEADERS,
+            params={"securityId": security_id, "lid": lid},
+            timeout=15,
+        ),
+        "Zhipin greeting",
+    )
+    code = api_code(added, "Zhipin greeting")
+    if code != 0:
+        raise SafeFailure(f"Zhipin greeting failed with API code {code!r}")
+    if not has_exact_friend(session, remote_id):
+        raise SafeFailure("Zhipin greeting could not be verified")
+    return {
+        "ok": True,
+        "action": "greet",
+        "state": "greeting_verified",
+        "verification": "exact_encrypt_job_id_in_friend_list",
+        "updated_cookie": cookie_header(pairs),
+    }
+
+
 def main() -> int:
     try:
         request = json.load(sys.stdin)
         if not isinstance(request, dict):
             raise SafeFailure("transport request must be an object")
-        if request.get("action") != "refresh":
+        action = request.get("action")
+        if action not in {"refresh", "greet"}:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
         if not isinstance(cookie, str) or not cookie:
             raise SafeFailure("Zhipin Cookie is required")
-        response = refresh(cookie)
+        if action == "refresh":
+            if set(request) != {"action", "cookie"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = refresh(cookie)
+        else:
+            if set(request) != {"action", "cookie", "title", "remote_id"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            title = request.get("title")
+            remote_id = request.get("remote_id")
+            if not isinstance(title, str) or not title.strip():
+                raise SafeFailure("cached Zhipin job title is required")
+            if not isinstance(remote_id, str) or not remote_id:
+                raise SafeFailure("cached Zhipin job identifier is required")
+            response = greet(cookie, title.strip(), remote_id)
     except SafeFailure as error:
         response = {"ok": False, "error": str(error)}
     except Exception:

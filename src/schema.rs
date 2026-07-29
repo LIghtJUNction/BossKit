@@ -531,14 +531,14 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                    "chat_messages":"Direct Zhipin greeting and text-message commands are being integrated and are not exposed through MCP.",
+                    "chat_messages":"chat greet is a CLI-only, explicitly confirmed, browserless default greeting for one cached Zhipin job. It sends no custom text, does not apply, and is not exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
                 "authentication":"login and logout are CLI-only private credential operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use environment, stored, or hidden manual Cookie input. Authentication remains unavailable through MCP."
                 },
                 "risk":{
                     "remote_writes":true,
                     "confirmed_remote_notifications":["notify send"],
-                    "confirmed_platform_messages":[],
+                    "confirmed_platform_messages":["chat greet"],
                     "confirmed_model_calls":["ai draft","ai score"],
                     "all_remote_operations_read_only":false,
                     "local_writes":local_writes
@@ -620,6 +620,7 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("config set", &["config"]),
         ("config reset", &["config"]),
         ("login", &["private_auth_store"]),
+        ("chat greet", &["private_auth_store"]),
         ("logout", &["private_auth_store"]),
         ("status", &[]),
         ("doctor", &["doctor_probe"]),
@@ -719,7 +720,7 @@ fn command_registry() -> Vec<CommandDefinition> {
     .into_iter()
     .map(|(name, local_write_targets)| CommandDefinition {
         name,
-        remote_write: matches!(name, "notify send" | "mcp"),
+        remote_write: matches!(name, "chat greet" | "notify send" | "mcp"),
         local_write: !local_write_targets.is_empty(),
         local_write_targets,
     })
@@ -770,16 +771,18 @@ mod tests {
     }
 
     #[test]
-    fn direct_chat_is_not_advertised_before_transport_integration() {
+    fn default_greeting_is_native_only_and_truthfully_risky() {
         let native = render(SchemaFormat::Native).expect("native");
         let commands = native["commands"].as_array().expect("commands");
-        assert!(
-            commands.iter().all(|command| !matches!(
-                command["name"].as_str(),
-                Some("chat greet" | "chat send")
-            ))
+        let greet = commands
+            .iter()
+            .find(|command| command["name"] == "chat greet")
+            .expect("native chat greet");
+        assert!(greet["remote_write"] == true && greet["local_write"] == true);
+        assert_eq!(
+            native["risk"]["confirmed_platform_messages"],
+            json!(["chat greet"])
         );
-        assert_eq!(native["risk"]["confirmed_platform_messages"], json!([]));
         assert!(
             tool_registry()
                 .iter()
