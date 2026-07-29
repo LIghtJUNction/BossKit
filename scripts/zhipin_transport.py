@@ -31,6 +31,9 @@ MAX_LOOKUP_PAGES = 3
 LOOKUP_PAGE_SIZE = 30
 HISTORY_PAGE_SIZE = 20
 MAX_MESSAGE_CHARS = 200
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_TEXT_CHARS = 2000
+MAX_HISTORY_RESPONSE_BYTES = 60 * 1024
 MAX_OPAQUE_VALUE_CHARS = 4096
 SEND_DEADLINE_SECONDS = 50.0
 USER_AGENT = (
@@ -532,6 +535,108 @@ def has_exact_outgoing_text(
     return False
 
 
+def unsafe_history_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        codepoint < 0x20
+        or 0x7F <= codepoint <= 0x9F
+        or codepoint == 0x00AD
+        or 0x0600 <= codepoint <= 0x0605
+        or codepoint in {0x061C, 0x06DD, 0x070F, 0x08E2, 0x180E}
+        or 0x0890 <= codepoint <= 0x0891
+        or 0x200B <= codepoint <= 0x200F
+        or 0x2028 <= codepoint <= 0x202E
+        or 0x2060 <= codepoint <= 0x206F
+        or 0xD800 <= codepoint <= 0xDFFF
+        or codepoint == 0xFEFF
+        or 0xFFF9 <= codepoint <= 0xFFFB
+        or codepoint in {0x110BD, 0x110CD, 0xE0001}
+        or 0x13430 <= codepoint <= 0x1343F
+        or 0x1BCA0 <= codepoint <= 0x1BCA3
+        or 0x1D173 <= codepoint <= 0x1D17A
+        or 0xE0020 <= codepoint <= 0xE007F
+    )
+
+
+def bounded_history_response(updated_cookie: str, readable: list[dict]) -> dict:
+    bounded = list(readable)
+    while True:
+        response = {
+            "ok": True,
+            "action": "history",
+            "verification": "exact_encrypt_job_id_and_user_id",
+            "count": len(bounded),
+            "messages": bounded,
+            "updated_cookie": updated_cookie,
+        }
+        encoded = json.dumps(
+            response, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) + 1 <= MAX_HISTORY_RESPONSE_BYTES:
+            return response
+        if not bounded:
+            raise SafeFailure("Zhipin chat history result exceeded the safe output budget")
+        bounded.pop(0)
+
+
+def readable_history(
+    cookie: str, remote_id: str, limit: int
+) -> dict:
+    deadline = time.monotonic() + SEND_DEADLINE_SECONDS
+    if type(limit) is not int or not 1 <= limit <= MAX_HISTORY_MESSAGES:
+        raise SafeFailure("chat history limit must be between 1 and 20")
+
+    session, pairs, _ = prepare_session(cookie, deadline)
+    friend = exact_friend(session, remote_id, deadline)
+    if friend is None:
+        raise SafeFailure("chat history requires an existing exact Zhipin conversation")
+    boss_id = bounded_string(friend.get("encryptBossId"), "encrypted boss id")
+
+    user_payload = request_json(
+        session.get(
+            USER_INFO_URL,
+            headers=HEADERS,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin user info",
+    )
+    user_data = response_data(user_payload, "Zhipin user info")
+    user_id = positive_int(user_data.get("userId"), "user id")
+
+    readable: list[dict] = []
+    for item in history_messages(session, boss_id, deadline):
+        sender = item.get("from")
+        body = item.get("body")
+        timestamp_ms = item.get("time")
+        if not isinstance(sender, dict) or not isinstance(body, dict):
+            continue
+        sender_id = sender.get("uid")
+        text = body.get("text")
+        if (
+            type(sender_id) is not int
+            or sender_id <= 0
+            or not isinstance(text, str)
+            or not text
+            or len(text) > MAX_HISTORY_TEXT_CHARS
+            or any(unsafe_history_character(character) for character in text)
+            or type(timestamp_ms) is not int
+            or timestamp_ms <= 0
+            or timestamp_ms > 2**63 - 1
+        ):
+            continue
+        readable.append(
+            {
+                "direction": "outgoing" if sender_id == user_id else "incoming",
+                "text": text,
+                "timestamp_ms": timestamp_ms,
+            }
+        )
+
+    readable.sort(key=lambda item: item["timestamp_ms"])
+    readable = readable[-limit:]
+    return bounded_history_response(cookie_header(pairs), readable)
+
+
 def encode_varint(value: int) -> bytes:
     if type(value) is not int or value < 0 or value > 2**64 - 1:
         raise SafeFailure("protobuf unsigned integer is invalid")
@@ -753,7 +858,7 @@ def main() -> int:
         if not isinstance(request, dict):
             raise SafeFailure("transport request must be an object")
         action = request.get("action")
-        if action not in {"refresh", "greet", "send"}:
+        if action not in {"refresh", "greet", "send", "history"}:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
         if not isinstance(cookie, str) or not cookie:
@@ -772,7 +877,7 @@ def main() -> int:
             if not isinstance(remote_id, str) or not remote_id:
                 raise SafeFailure("cached Zhipin job identifier is required")
             response = greet(cookie, title.strip(), remote_id)
-        else:
+        elif action == "send":
             if set(request) != {"action", "cookie", "remote_id", "message"}:
                 raise SafeFailure("transport request contains unsupported fields")
             remote_id = request.get("remote_id")
@@ -782,6 +887,14 @@ def main() -> int:
             if not isinstance(message, str):
                 raise SafeFailure("chat message must be text")
             response = send(cookie, remote_id, message)
+        else:
+            if set(request) != {"action", "cookie", "remote_id", "limit"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            remote_id = request.get("remote_id")
+            limit = request.get("limit")
+            if not isinstance(remote_id, str) or not remote_id:
+                raise SafeFailure("cached Zhipin job identifier is required")
+            response = readable_history(cookie, remote_id, limit)
     except SafeFailure as error:
         response = {"ok": False, "error": str(error)}
     except Exception:

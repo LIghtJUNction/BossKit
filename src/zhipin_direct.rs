@@ -13,6 +13,9 @@ const HELPER: &str = include_str!("../scripts/zhipin_transport.py");
 const HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_HELPER_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_CHAT_MESSAGE_CHARS: usize = 200;
+pub(crate) const MAX_CHAT_HISTORY_MESSAGES: usize = 20;
+const MAX_CHAT_HISTORY_TEXT_CHARS: usize = 2000;
+const MAX_CHAT_HISTORY_RESPONSE_BYTES: usize = 60 * 1024;
 
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
@@ -36,6 +39,22 @@ struct SendRequest<'a> {
     message: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct HistoryRequest<'a> {
+    action: &'static str,
+    cookie: &'a str,
+    remote_id: &'a str,
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectChatMessage {
+    pub(crate) direction: String,
+    pub(crate) text: String,
+    pub(crate) timestamp_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HelperResponse {
@@ -50,6 +69,10 @@ struct HelperResponse {
     state: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    messages: Option<Vec<DirectChatMessage>>,
 }
 
 /// A verified session refresh whose Cookie remains private to the service.
@@ -73,6 +96,14 @@ pub(crate) struct DirectMessage {
     pub(crate) cookie: String,
     pub(crate) state: String,
     pub(crate) verification: String,
+}
+
+/// A bounded, sanitized snapshot of one exact direct conversation.
+#[derive(Debug)]
+pub(crate) struct DirectHistory {
+    pub(crate) cookie: String,
+    pub(crate) verification: String,
+    pub(crate) messages: Vec<DirectChatMessage>,
 }
 
 /// Refreshes and verifies one stored Zhipin Cookie without a browser process.
@@ -139,6 +170,27 @@ pub(crate) fn send(
     parse_send_response(&invoke_helper(&request)?)
 }
 
+/// Reads a bounded text snapshot from one existing exact Zhipin conversation.
+pub(crate) fn history(
+    cookie: &str,
+    remote_id: &str,
+    limit: usize,
+) -> Result<DirectHistory, BossError> {
+    if !(1..=MAX_CHAT_HISTORY_MESSAGES).contains(&limit) {
+        return Err(BossError::InvalidArgument(
+            "chat history limit must be between 1 and 20".to_owned(),
+        ));
+    }
+    let request = serde_json::to_vec(&HistoryRequest {
+        action: "history",
+        cookie,
+        remote_id,
+        limit,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_history_response(&invoke_helper(&request)?)
+}
+
 fn invoke_helper(request: &[u8]) -> Result<Vec<u8>, BossError> {
     let mut child = Command::new("uv")
         .args([
@@ -197,7 +249,11 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
                 .unwrap_or("direct Zhipin session refresh failed"),
         ));
     }
-    if response.action.as_deref() != Some("refresh") {
+    if response.action.as_deref() != Some("refresh")
+        || response.state.is_some()
+        || response.count.is_some()
+        || response.messages.is_some()
+    {
         return Err(transport_error("direct transport action mismatch"));
     }
     let cookie = response
@@ -232,7 +288,10 @@ fn parse_greet_response(bytes: &[u8]) -> Result<DirectGreeting, BossError> {
                 .unwrap_or("direct Zhipin greeting failed"),
         ));
     }
-    if response.action.as_deref() != Some("greet") {
+    if response.action.as_deref() != Some("greet")
+        || response.count.is_some()
+        || response.messages.is_some()
+    {
         return Err(transport_error("direct transport action mismatch"));
     }
     let cookie = response
@@ -266,7 +325,10 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
                 .unwrap_or("direct Zhipin message failed"),
         ));
     }
-    if response.action.as_deref() != Some("send") {
+    if response.action.as_deref() != Some("send")
+        || response.count.is_some()
+        || response.messages.is_some()
+    {
         return Err(transport_error("direct transport action mismatch"));
     }
     let cookie = response
@@ -287,6 +349,79 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
         state,
         verification,
     })
+}
+
+fn parse_history_response(bytes: &[u8]) -> Result<DirectHistory, BossError> {
+    if bytes.len() > MAX_CHAT_HISTORY_RESPONSE_BYTES {
+        return Err(transport_error(
+            "direct history result exceeded the safe output budget",
+        ));
+    }
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("direct Zhipin history failed"),
+        ));
+    }
+    if response.action.as_deref() != Some("history") || response.state.is_some() {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| value == "exact_encrypt_job_id_and_user_id")
+        .ok_or_else(|| transport_error("direct history verification was invalid"))?;
+    let messages = response
+        .messages
+        .filter(|messages| {
+            messages.len() <= MAX_CHAT_HISTORY_MESSAGES
+                && messages.iter().all(|message| {
+                    matches!(message.direction.as_str(), "incoming" | "outgoing")
+                        && !message.text.is_empty()
+                        && message.text.chars().count() <= MAX_CHAT_HISTORY_TEXT_CHARS
+                        && message.text.chars().all(is_safe_history_character)
+                        && message.timestamp_ms > 0
+                })
+                && messages
+                    .windows(2)
+                    .all(|pair| pair[0].timestamp_ms <= pair[1].timestamp_ms)
+        })
+        .ok_or_else(|| transport_error("direct history messages were invalid"))?;
+    if response.count != Some(messages.len()) {
+        return Err(transport_error("direct history count was invalid"));
+    }
+    Ok(DirectHistory {
+        cookie,
+        verification,
+        messages,
+    })
+}
+
+fn is_safe_history_character(character: char) -> bool {
+    let codepoint = u32::from(character);
+    !character.is_control()
+        && codepoint != 0x00AD
+        && !(0x0600..=0x0605).contains(&codepoint)
+        && !matches!(codepoint, 0x061C | 0x06DD | 0x070F | 0x08E2 | 0x180E)
+        && !(0x0890..=0x0891).contains(&codepoint)
+        && !(0x200B..=0x200F).contains(&codepoint)
+        && !(0x2028..=0x202E).contains(&codepoint)
+        && !(0x2060..=0x206F).contains(&codepoint)
+        && codepoint != 0xFEFF
+        && !(0xFFF9..=0xFFFB).contains(&codepoint)
+        && !matches!(codepoint, 0x110BD | 0x110CD | 0xE0001)
+        && !(0x13430..=0x1343F).contains(&codepoint)
+        && !(0x1BCA0..=0x1BCA3).contains(&codepoint)
+        && !(0x1D173..=0x1D17A).contains(&codepoint)
+        && !(0xE0020..=0xE007F).contains(&codepoint)
 }
 
 fn transport_error(message: &str) -> BossError {
@@ -421,6 +556,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_bounded_chronological_history() {
+        let result = parse_history_response(
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":2,"messages":[{"direction":"incoming","text":"\u4f60\u597d","timestamp_ms":10},{"direction":"outgoing","text":"\u60a8\u597d","timestamp_ms":20}]}"#,
+        )
+        .expect("verified history");
+        assert_eq!(result.verification, "exact_encrypt_job_id_and_user_id");
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].direction, "incoming");
+        assert_eq!(result.messages[1].text, "您好");
+    }
+
+    #[test]
+    fn history_parser_rejects_unverified_or_ambiguous_results() {
+        for payload in [
+            br#"{"ok":true,"action":"history","verification":"friend_list","updated_cookie":"wt2=secret","count":0,"messages":[]}"#.as_slice(),
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":2,"messages":[]}"#.as_slice(),
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":1,"messages":[{"direction":"unknown","text":"private","timestamp_ms":10}]}"#.as_slice(),
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":1,"messages":[{"direction":"incoming","text":"\u202eprivate","timestamp_ms":10}]}"#.as_slice(),
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","count":2,"messages":[{"direction":"incoming","text":"later","timestamp_ms":20},{"direction":"outgoing","text":"earlier","timestamp_ms":10}]}"#.as_slice(),
+            br#"{"ok":true,"action":"history","verification":"exact_encrypt_job_id_and_user_id","updated_cookie":"wt2=secret","state":"verified","count":0,"messages":[]}"#.as_slice(),
+        ] {
+            assert!(parse_history_response(payload).is_err());
+        }
+    }
+
+    #[test]
     fn python_helper_encodes_the_minimal_techwolf_wire_shape() {
         let encoded =
             run_pure_helper("print(scope['encode_protocol'](1,2,'boss',3,'Hi',4,5).hex())");
@@ -428,6 +589,14 @@ mod tests {
             encoded,
             "08011a270a0408013800120a08021204626f737338031801200528043208080110011a0248695805a00101"
         );
+    }
+
+    #[test]
+    fn python_helper_bounds_history_by_final_utf8_response_bytes() {
+        let result = run_pure_helper(
+            "items=[{'direction':'incoming','text':'界'*2000,'timestamp_ms':i+1} for i in range(20)]\nresponse=scope['bounded_history_response']('wt2=secret',items)\nencoded=scope['json'].dumps(response,ensure_ascii=False,separators=(',',':')).encode('utf-8')\nassert len(encoded)+1 <= scope['MAX_HISTORY_RESPONSE_BYTES']\nassert 0 < len(response['messages']) < 20\nassert response['messages'][-1]['timestamp_ms'] == 20\nprint('bounded')",
+        );
+        assert_eq!(result, "bounded");
     }
 
     #[test]

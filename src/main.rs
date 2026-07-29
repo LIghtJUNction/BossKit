@@ -218,6 +218,14 @@ enum ChatCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// 读取既有精确职位会话的最近文本；不发送消息或简历
+    History {
+        /// 本地缓存职位 ID
+        job_id: String,
+        /// 最多返回的最近文本数
+        #[arg(long, default_value = "20")]
+        limit: NonZeroUsize,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -844,7 +852,9 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                     "chat send requires --yes".to_owned(),
                 ));
             }
-            ChatCommand::Greet { yes: true, .. } | ChatCommand::Send { yes: true, .. } => {}
+            ChatCommand::Greet { yes: true, .. }
+            | ChatCommand::Send { yes: true, .. }
+            | ChatCommand::History { .. } => {}
         }
     }
     let mut service = BossService::discover()?;
@@ -1211,6 +1221,11 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             } => {
                 print_json(&Envelope::success(
                     service.chat_send(&job_id, &message, yes)?,
+                ));
+            }
+            ChatCommand::History { job_id, limit } => {
+                print_json(&Envelope::success(
+                    service.chat_history(&job_id, limit.get())?,
                 ));
             }
         },

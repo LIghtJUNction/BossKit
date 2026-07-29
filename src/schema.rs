@@ -531,7 +531,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                    "chat_messages":"chat greet and chat send are CLI-only, explicitly confirmed, browserless operations for one cached Zhipin job. send requires an existing exact conversation, accepts one bounded single-line message, verifies exact outgoing history, never submits a resume, and neither command is exposed through MCP.",
+                    "chat_messages":"chat greet, chat send, and chat history are CLI-only browserless operations for one cached Zhipin job. greet and send are explicitly confirmed writes; history is a bounded exact-conversation read. send verifies exact outgoing history, none submits a resume, and no chat command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
                 "authentication":"login and logout are CLI-only private credential operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use environment, stored, or hidden manual Cookie input. Authentication remains unavailable through MCP."
                 },
@@ -622,6 +622,7 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("login", &["private_auth_store"]),
         ("chat greet", &["private_auth_store"]),
         ("chat send", &["private_auth_store"]),
+        ("chat history", &["private_auth_store"]),
         ("logout", &["private_auth_store"]),
         ("status", &[]),
         ("doctor", &["doctor_probe"]),
@@ -783,11 +784,17 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "chat send")
             .expect("native chat send");
+        let history = commands
+            .iter()
+            .find(|command| command["name"] == "chat history")
+            .expect("native chat history");
         assert!(
             greet["remote_write"] == true
                 && greet["local_write"] == true
                 && send["remote_write"] == true
                 && send["local_write"] == true
+                && history["remote_write"] == false
+                && history["local_write"] == true
         );
         assert_eq!(
             native["risk"]["confirmed_platform_messages"],
@@ -796,7 +803,7 @@ mod tests {
         assert!(
             tool_registry()
                 .iter()
-                .all(|tool| !matches!(tool.name, "chat_greet" | "chat_send"))
+                .all(|tool| !matches!(tool.name, "chat_greet" | "chat_send" | "chat_history"))
         );
     }
 

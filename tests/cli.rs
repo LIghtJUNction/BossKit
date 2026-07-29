@@ -459,7 +459,7 @@ fn chat_send_rejects_invalid_text_before_credentials_without_echoing_it() {
 }
 
 #[test]
-fn direct_chat_is_cli_only_and_schema_marks_both_remote_writes() {
+fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
     let directory = tempdir().expect("temporary directory");
     let responses = run_mcp(
         directory.path(),
@@ -470,7 +470,10 @@ fn direct_chat_is_cli_only_and_schema_marks_both_remote_writes() {
             .as_array()
             .expect("tools")
             .iter()
-            .all(|tool| !matches!(tool["name"].as_str(), Some("chat_greet" | "chat_send")))
+            .all(|tool| !matches!(
+                tool["name"].as_str(),
+                Some("chat_greet" | "chat_send" | "chat_history")
+            ))
     );
 
     let schema = run_json(directory.path(), &["schema", "--format", "native"]);
@@ -483,16 +486,41 @@ fn direct_chat_is_cli_only_and_schema_marks_both_remote_writes() {
         .iter()
         .find(|command| command["name"] == "chat send")
         .expect("native send");
+    let history = commands
+        .iter()
+        .find(|command| command["name"] == "chat history")
+        .expect("native history");
     assert!(
         greet["remote_write"] == true
             && greet["local_write"] == true
             && send["remote_write"] == true
             && send["local_write"] == true
+            && history["remote_write"] == false
+            && history["local_write"] == true
     );
     assert_eq!(
         schema["data"]["risk"]["confirmed_platform_messages"],
         serde_json::json!(["chat greet", "chat send"])
     );
+}
+
+#[test]
+fn chat_history_is_read_only_and_rejects_missing_jobs_before_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "wt2=HISTORY_COOKIE_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", secret)
+        .args(["chat", "history", "missing-job"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!rendered.contains(secret));
+    assert!(!directory.path().join(".auth").exists());
 }
 
 #[test]

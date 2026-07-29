@@ -432,6 +432,44 @@ impl BossService {
         }))
     }
 
+    /// Reads a bounded text snapshot from one existing exact Zhipin conversation.
+    pub fn chat_history(&mut self, job_id: &str, limit: usize) -> Result<Value, BossError> {
+        if !(1..=crate::zhipin_direct::MAX_CHAT_HISTORY_MESSAGES).contains(&limit) {
+            return Err(BossError::InvalidArgument(
+                "chat history limit must be between 1 and 20".to_owned(),
+            ));
+        }
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument(format!("job not found: {job_id}")))?;
+        if job.platform != Platform::Zhipin {
+            return Err(BossError::InvalidArgument(
+                "chat history supports only cached Zhipin jobs".to_owned(),
+            ));
+        }
+        if job.remote_id.trim().is_empty() {
+            return Err(BossError::InvalidArgument(
+                "cached Zhipin job is missing direct chat metadata".to_owned(),
+            ));
+        }
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "chat history requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        let history = crate::zhipin_direct::history(&cookie, &job.remote_id, limit)?;
+        self.auth.store_session(Platform::Zhipin, history.cookie)?;
+        Ok(json!({
+            "job_id":job.id,
+            "verification":history.verification,
+            "network_checked":true,
+            "count":history.messages.len(),
+            "messages":history.messages,
+            "resume_submitted":false
+        }))
+    }
+
     /// Renders the shared capability registry.
     pub fn schema(&self, format: SchemaFormat) -> Result<Value, BossError> {
         render(format)

@@ -2,7 +2,7 @@
 
 BossKit 是独立维护的 Rust 2024 招聘求职 CLI。可执行文件名为 `boss`，库名为 `bosskit`。
 
-当前可用的 `campaign screen` 只做本地简历筛选并生成 `manual_review` / `dry_run` 计划。BOSS 直聘登录会话可通过纯命令行 HTTPS 与本地 V8 挑战计算刷新并验证，全程不启动或依赖浏览器。`chat greet` 仅对一个本地缓存职位发送平台默认招呼；`chat send` 仅向同一职位的既有精确会话发送一条明确确认的文本。批量编排、自动回复和投递仍未开放。
+当前可用的 `campaign screen` 只做本地简历筛选并生成 `manual_review` / `dry_run` 计划。BOSS 直聘登录会话可通过纯命令行 HTTPS 与本地 V8 挑战计算刷新并验证，全程不启动或依赖浏览器。`chat greet` 仅对一个本地缓存职位发送平台默认招呼；`chat send` 仅向同一职位的既有精确会话发送一条明确确认的文本；`chat history` 只读取该精确会话最近的文本。批量编排、自动回复和投递仍未开放。
 
 ## 安装
 
@@ -199,6 +199,7 @@ boss login --platform zhipin
 boss search "AI Agent" --platform zhipin --limit 10
 boss chat greet <本地职位 ID> --yes
 boss chat send <本地职位 ID> --message "你好，想进一步了解这个职位" --yes
+boss chat history <本地职位 ID> --limit 20
 ```
 
 `login` 只刷新并验证已由环境变量、隐藏手工输入或 BossKit 私有存储提供的 Cookie；它不代替手机号、短信验证码或平台安全验证，也不绕过这些流程。搜索仍是只读操作。
@@ -207,7 +208,9 @@ boss chat send <本地职位 ID> --message "你好，想进一步了解这个职
 
 `chat send` 同样要求逐次 `--yes`，并且只接受 1–200 个 Unicode 字符的单行可打印文本。它不会替用户建立新会话：只有好友列表中存在同一 `encryptJobId` 时才准备 MQTT WebSocket；发送前先检查历史中的完全相同自发文本以避免重复，QoS 1 发布一次且不自动重试。Broker 的 PUBACK 只作为传输信号；无论是否及时返回，只有在只读历史中验证到完全相同的本人发出文本才算成功。
 
-两个命令的输出都不包含消息正文、Cookie、招聘者身份或平台授权参数；它们不点击投递入口，也不提交或上传简历。MCP 不暴露这两个操作。
+`chat history` 不需要 `--yes`，因为它不发送平台消息。它最多返回 20 条按时间升序排列的文本，只包含 `incoming` / `outgoing` 方向、正文和毫秒时间戳；不会返回 Cookie、用户 ID、招聘者身份、加密 Boss ID 或平台授权参数。
+
+`chat greet` 与 `chat send` 的输出不包含消息正文；三个命令都不点击投递入口，也不提交或上传简历。MCP 不暴露任何聊天操作。
 
 本地通知预览不会读取 webhook、联网或创建审计记录：
 
