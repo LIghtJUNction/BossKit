@@ -410,9 +410,13 @@ def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
 
 
 def search_exact_job(
-    session: requests.Session, title: str, remote_id: str
-) -> tuple[str, str]:
+    session: requests.Session,
+    pairs: list[tuple[str, str]],
+    title: str,
+    remote_id: str,
+) -> tuple[str, str, list[tuple[str, str]]]:
     matches: list[dict] = []
+    challenge_applied = False
     for page in range(1, MAX_LOOKUP_PAGES + 1):
         data = {
             "scene": "1",
@@ -426,6 +430,18 @@ def search_exact_job(
             "Zhipin target search",
         )
         code = api_code(payload, "Zhipin target search")
+        if code == 37:
+            if challenge_applied:
+                raise SafeFailure(
+                    "Zhipin target search repeated the security challenge"
+                )
+            pairs = apply_challenge(payload, pairs, session, None)
+            challenge_applied = True
+            payload = request_json(
+                session.post(API_URL, headers=HEADERS, data=data, timeout=15),
+                "Zhipin target search",
+            )
+            code = api_code(payload, "Zhipin target search")
         if code != 0:
             raise SafeFailure(f"Zhipin target search failed with API code {code!r}")
         response_data = payload.get("zpData")
@@ -450,7 +466,7 @@ def search_exact_job(
         raise SafeFailure("resolved Zhipin job has no greeting authorization")
     if not isinstance(lid, str) or not lid:
         raise SafeFailure("resolved Zhipin job has no greeting lookup identifier")
-    return security_id, lid
+    return security_id, lid, pairs
 
 
 def greet(cookie: str, title: str, remote_id: str) -> dict:
@@ -464,7 +480,12 @@ def greet(cookie: str, title: str, remote_id: str) -> dict:
             "updated_cookie": cookie_header(pairs),
         }
 
-    security_id, lid = search_exact_job(session, title, remote_id)
+    security_id, lid, pairs = search_exact_job(
+        session,
+        pairs,
+        title,
+        remote_id,
+    )
     added = request_json(
         session.get(
             FRIEND_ADD_URL,

@@ -828,6 +828,49 @@ mod tests {
     }
 
     #[test]
+    fn python_exact_job_search_retries_one_challenge_and_returns_updated_pairs() {
+        let result = run_pure_helper(
+            r#"
+class FakeResponse:
+ def __init__(self,payload):
+  self.payload=payload
+ def json(self):
+  return self.payload
+class FakeSession:
+ def __init__(self,payloads):
+  self.payloads=list(payloads)
+  self.calls=[]
+ def post(self,url,headers,data,timeout):
+  self.calls.append((url,dict(data),timeout))
+  return FakeResponse(self.payloads.pop(0))
+challenge={'code':37,'zpData':{'seed':'seed','name':'name','ts':1}}
+found={'code':0,'zpData':{'jobList':[{'encryptJobId':'target','securityId':'security','lid':'lid'}]}}
+challenge_calls=[]
+def fake_apply(payload,pairs,session,deadline):
+ challenge_calls.append((payload,list(pairs),deadline))
+ return list(pairs)+[('__zp_stoken__','fresh')]
+scope['apply_challenge']=fake_apply
+session=FakeSession([challenge,found])
+security,lid,pairs=scope['search_exact_job'](session,[('wt2','secret')],'Engineer','target')
+assert (security,lid) == ('security','lid')
+assert pairs == [('wt2','secret'),('__zp_stoken__','fresh')]
+assert len(challenge_calls) == 1 and len(session.calls) == 2
+assert session.calls[0] == session.calls[1]
+session=FakeSession([challenge,challenge])
+challenge_calls.clear()
+try:
+ scope['search_exact_job'](session,[('wt2','secret')],'Engineer','target')
+ raise AssertionError('accepted repeated challenge')
+except scope['SafeFailure']:
+ pass
+assert len(challenge_calls) == 1 and len(session.calls) == 2
+print('bounded')
+"#,
+        );
+        assert_eq!(result, "bounded");
+    }
+
+    #[test]
     fn python_helper_encodes_the_minimal_techwolf_wire_shape() {
         let encoded =
             run_pure_helper("print(scope['encode_protocol'](1,2,'boss',3,'Hi',4,5).hex())");
