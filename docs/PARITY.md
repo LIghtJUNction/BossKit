@@ -1,6 +1,6 @@
-# Upstream parity ledger
+# BossKit capability ledger
 
-BossKit is an in-progress Rust reimplementation of `boss-agent-cli`, not a claim of full command parity. This ledger compares capability categories rather than treating a green build as proof that all upstream workflows exist.
+BossKit is an independently developed Rust 2024 product with its own command protocol, data model, safety boundary, and release lifecycle. It is not a branch, compatibility layer, or parity promise for another project. This ledger records BossKit's own shipped boundaries; a green build alone is not evidence that a live platform workflow works.
 
 ## Implemented now
 
@@ -22,6 +22,8 @@ BossKit is an in-progress Rust reimplementation of `boss-agent-cli`, not a claim
 | Presets | `boss preset add/ls/show/rm`, matching MCP tools | Complete validated local search specifications with override-aware search |
 | Watches | `boss watch add/ls/show/rm/run`, matching MCP tools | Explicit foreground read-only searches with an exact deduplicated union of every seen stable ID; no scheduler |
 | Local resumes | `boss resume ...`, matching structured MCP tools | Strict typed documents in one local file; no platform resume synchronization |
+| Resume screening | `boss campaign screen`, MCP `campaign_screen` | Deterministic local-only title and skill matching over cached job title, skills, and description; policy and blacklist gates run first; creates only deduplicated `manual_review` / `dry_run` plans |
+| Campaign review plans | `boss campaign plan ...`, matching MCP tools | Local policy, blacklist, bounded ephemeral greeting previews, and human-recorded state transitions; never applies or chats |
 | Statistics | `boss stats`, MCP `stats` | Exact local counts, time-window history outcomes, and known-file sizes |
 | Recoverable cleanup | `boss clean`, MCP `clean_preview` | Preview by default; Linux confirmation atomically archives only six known mutable JSON files and returns verified recovery paths, using a private root-level rescue transaction if rollback is blocked; no unlink; non-Linux and MCP are preview-only |
 | MCP transport | `boss mcp` | MCP 2025-03-26 stdio, strict arguments, batch requests |
@@ -30,7 +32,7 @@ BossKit is an in-progress Rust reimplementation of `boss-agent-cli`, not a claim
 
 | Category | Current boundary |
 | --- | --- |
-| Authentication | Status only detects the three Cookie environment variables; no login/session acquisition or validity probe |
+| Authentication | CLI stores sessions from explicit local sources. BOSS 直聘 additionally refreshes and verifies its session through browserless HTTPS plus local V8 challenge computation; MCP has no login surface |
 | Cities | 10 common logical mappings, not the broader upstream city catalog |
 | Search filters | Richer company/salary/experience/education/job-type/welfare filters exist, but operate only on fields present in provider list responses |
 | Detail compatibility | Implemented for all three adapters, but live endpoints/pages remain subject to login and risk controls |
@@ -38,8 +40,8 @@ BossKit is an in-progress Rust reimplementation of `boss-agent-cli`, not a claim
 
 ## Pending
 
-Remote platform browsing history, platform resume synchronization, background scheduling, AI analysis, crawling, and other upstream operator categories are not implemented in this slice.
+Remote platform browsing history, platform resume synchronization, background scheduling, crawling, batch greeting orchestration, reply polling, automatic conversations, and platform application workflows are not implemented.
 
 ## Policy-blocked / intentionally unimplemented
 
-Remote write or sensitive-person workflows remain absent: greeting, applying, chat, resume mutation, recruiter workflows, and recruiter personal-data collection. The current Rust service performs remote reads and clearly identified local JSON writes only.
+Automatic BOSS application submission and autonomous chat are not implemented. Recruiter personal-data collection, platform resume mutation, and bypasses for CAPTCHA, SMS, or risk controls also remain absent. Campaign screening remains strictly local and must not be interpreted as submission capability.

@@ -144,13 +144,6 @@ impl AuthStore {
         self.session_cookie(platform).is_some()
     }
 
-    /// Prepares the private root used for an isolated interactive browser profile.
-    #[must_use]
-    pub(crate) fn browser_profile_root(&self) -> Option<PathBuf> {
-        ensure_private_directory(&self.directory).ok()?;
-        Some(self.directory.clone())
-    }
-
     /// Stores one validated session.
     pub fn store_session(&mut self, platform: Platform, cookie: String) -> Result<(), BossError> {
         validate_cookie(&cookie)?;
@@ -386,16 +379,6 @@ fn private_file_metadata(metadata: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn private_file_metadata(_metadata: &fs::Metadata) -> bool {
     false
-}
-
-pub(crate) fn domain_matches(platform: Platform, domain: &str) -> bool {
-    let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
-    let expected = match platform {
-        Platform::Zhipin => "zhipin.com",
-        Platform::Zhilian => "zhaopin.com",
-        Platform::Qiancheng => "51job.com",
-    };
-    domain == expected || domain.ends_with(&format!(".{expected}"))
 }
 
 pub(crate) fn validate_cookie(cookie: &str) -> Result<(), BossError> {

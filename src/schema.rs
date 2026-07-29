@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use crate::BossError;
 use crate::ai::MAX_AI_BASE_URL_CHARS;
 use crate::campaign::{
-    MAX_CAMPAIGN_NAME_CHARS, MAX_PLANS_PER_BUILD, MAX_RULE_VALUE_CHARS, MAX_STATE_NOTE_CHARS,
-    MAX_TEMPLATE_CHARS,
+    DEFAULT_MINIMUM_RESUME_SCORE, MAX_CAMPAIGN_NAME_CHARS, MAX_PLANS_PER_BUILD,
+    MAX_RULE_VALUE_CHARS, MAX_STATE_NOTE_CHARS, MAX_TEMPLATE_CHARS,
 };
 use crate::notify::MAX_NOTIFICATION_EVENT_CHARS;
 use crate::reply::{MAX_KEYWORD_CHARS, MAX_MESSAGE_CHARS, MAX_REPLY_CHARS};
@@ -393,6 +393,17 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             },"additionalProperties":false}),
         ),
         tool(
+            "campaign_screen",
+            "Score cached jobs against explicit local resume title and skills, then create local manual-review dry-run plans only",
+            json!({"type":"object","required":["resume","policy"],"properties":{
+                "resume":{"type":"string","minLength":1,"maxLength":64},
+                "policy":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "template":{"type":"string","minLength":1,"maxLength":MAX_CAMPAIGN_NAME_CHARS},
+                "limit":{"type":"integer","minimum":1,"maximum":MAX_PLANS_PER_BUILD,"default":20},
+                "minimum_resume_score":{"type":"integer","minimum":0,"maximum":100,"default":DEFAULT_MINIMUM_RESUME_SCORE}
+            },"additionalProperties":false}),
+        ),
+        tool(
             "campaign_plan_list",
             "List local-only campaign plans and their human workflow state",
             empty(),
@@ -520,11 +531,14 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                "authentication":"login and logout are CLI-only private credential operations. Automatic sources are local; if none resolve on an interactive terminal, BossKit can use an isolated browser login flow. Authentication remains unavailable through MCP, and BossKit does not send a separate provider verification request."
+                    "chat_messages":"Direct Zhipin greeting and text-message commands are being integrated and are not exposed through MCP.",
+                    "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
+                "authentication":"login and logout are CLI-only private credential operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use environment, stored, or hidden manual Cookie input. Authentication remains unavailable through MCP."
                 },
                 "risk":{
                     "remote_writes":true,
                     "confirmed_remote_notifications":["notify send"],
+                    "confirmed_platform_messages":[],
                     "confirmed_model_calls":["ai draft","ai score"],
                     "all_remote_operations_read_only":false,
                     "local_writes":local_writes
@@ -636,6 +650,7 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("campaign template rm", &["greeting_templates"]),
         ("campaign template render", &[]),
         ("campaign plan create", &["application_plans"]),
+        ("campaign screen", &["application_plans"]),
         ("campaign plan ls", &[]),
         ("campaign plan transition", &["application_plans"]),
         ("campaign stats", &[]),
@@ -751,6 +766,24 @@ mod tests {
             tool_registry()
                 .iter()
                 .all(|tool| !matches!(tool.name, "login" | "logout"))
+        );
+    }
+
+    #[test]
+    fn direct_chat_is_not_advertised_before_transport_integration() {
+        let native = render(SchemaFormat::Native).expect("native");
+        let commands = native["commands"].as_array().expect("commands");
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command["name"].as_str(),
+                Some("chat greet" | "chat send")
+            ))
+        );
+        assert_eq!(native["risk"]["confirmed_platform_messages"], json!([]));
+        assert!(
+            tool_registry()
+                .iter()
+                .all(|tool| !matches!(tool.name, "chat_greet" | "chat_send"))
         );
     }
 

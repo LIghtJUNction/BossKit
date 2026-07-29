@@ -20,8 +20,10 @@ pub const MAX_RULE_VALUE_CHARS: usize = 256;
 pub const MAX_RULES: usize = 32;
 pub const MAX_WELFARE_REQUIREMENTS: usize = 16;
 pub const MAX_TEMPLATE_CHARS: usize = 2_000;
+pub const MAX_GREETING_PREVIEW_CHARS: usize = 4_000;
 pub const MAX_PLANS_PER_BUILD: usize = 100;
 pub const MAX_STATE_NOTE_CHARS: usize = 1_000;
+pub const DEFAULT_MINIMUM_RESUME_SCORE: u8 = 40;
 
 /// Normalized cached-job field available to a local campaign rule.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,6 +232,19 @@ pub struct ApplicationPlan {
     /// Bound local resume's update timestamp at plan creation.
     #[serde(default)]
     pub resume_updated_at: Option<u64>,
+    /// Policy-only score before any resume weighting.
+    #[serde(default)]
+    pub policy_score: Option<u8>,
+    /// Deterministic score from explicit resume title and skills only.
+    #[serde(default)]
+    pub resume_score: Option<u8>,
+    /// Whether the explicit resume title matched cached job text.
+    #[serde(default)]
+    pub title_match: bool,
+    /// Explicit resume skills found in cached job text, in resume order.
+    #[serde(default)]
+    pub matched_skills: Vec<String>,
+    /// Policy score for plan creation, or the weighted score for resume screening.
     pub score: u8,
     #[serde(default)]
     pub state: ApplicationPlanState,
@@ -248,6 +263,8 @@ pub struct ApplicationPlan {
 pub struct PlanGreetingPreview {
     /// Stable local job identifier for this rendering.
     pub job_id: String,
+    /// Always false: a preview is never sent to a platform.
+    pub sent: bool,
     /// Locally rendered candidate-context text; never persisted with the plan.
     pub text: String,
 }
@@ -262,6 +279,7 @@ pub struct PlanBuildResult {
     pub planned: usize,
     pub skipped_existing: usize,
     pub skipped_blacklist: usize,
+    pub skipped_resume_score: usize,
     pub plans: Vec<ApplicationPlan>,
     /// Ephemeral local renderings for this create response only.
     pub greeting_previews: Vec<PlanGreetingPreview>,
@@ -303,6 +321,59 @@ pub struct CampaignStore {
     blacklist_path: PathBuf,
     templates_path: PathBuf,
     plans_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PlanCandidate<'a> {
+    job: &'a Job,
+    score: u8,
+    policy_score: u8,
+    resume_score: Option<u8>,
+    title_match: bool,
+    matched_skills: Vec<String>,
+}
+
+#[derive(Debug)]
+struct GatedCandidates<'a> {
+    considered: usize,
+    skipped_blacklist: usize,
+    candidates: Vec<PlanCandidate<'a>>,
+}
+
+struct PlanPersistence<'a> {
+    policy: &'a CampaignPolicy,
+    template: Option<&'a GreetingTemplate>,
+    resume: Option<&'a ResumeDocument>,
+    limit: usize,
+    now: u64,
+    mode: &'static str,
+    eligible: usize,
+    skipped_resume_score: usize,
+    always_preview: bool,
+}
+
+pub(crate) struct ScreenPlanOptions<'a> {
+    pub(crate) template: Option<&'a GreetingTemplate>,
+    pub(crate) limit: usize,
+    pub(crate) minimum_resume_score: u8,
+    pub(crate) now: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResumeEvaluation {
+    score: u8,
+    title_match: bool,
+    matched_skills: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ResumeRenderContext<'a> {
+    Unbound,
+    Full(&'a ResumeDocument),
+    Screening {
+        title: &'a str,
+        matched_skills: &'a [String],
+    },
 }
 
 impl CampaignStore {
@@ -460,7 +531,7 @@ impl CampaignStore {
 
     pub fn render_template(&self, name: &str, job: &Job) -> Result<String, BossError> {
         let template = self.show_template(name)?;
-        render_body(&template.body, job, None)
+        render_body(&template.body, job, ResumeRenderContext::Unbound)
     }
 
     pub fn build_plans(
@@ -472,78 +543,81 @@ impl CampaignStore {
         limit: usize,
         now: u64,
     ) -> Result<PlanBuildResult, BossError> {
-        if limit == 0 || limit > MAX_PLANS_PER_BUILD {
-            return Err(BossError::InvalidArgument(format!(
-                "plan limit must be 1..={MAX_PLANS_PER_BUILD}"
-            )));
+        validate_plan_limit(limit)?;
+        let gated = self.gate_candidates(jobs, policy)?;
+        let eligible = gated.candidates.len();
+        self.persist_candidates(
+            gated,
+            PlanPersistence {
+                policy,
+                template,
+                resume,
+                limit,
+                now,
+                mode: "manual_review",
+                eligible,
+                skipped_resume_score: 0,
+                always_preview: false,
+            },
+        )
+    }
+
+    /// Screens cached jobs against one explicit local resume and persists only review plans.
+    pub(crate) fn screen_plans(
+        &self,
+        jobs: &[Job],
+        policy: &CampaignPolicy,
+        resume: &ResumeDocument,
+        options: ScreenPlanOptions<'_>,
+    ) -> Result<PlanBuildResult, BossError> {
+        validate_plan_limit(options.limit)?;
+        if options.minimum_resume_score > 100 {
+            return Err(BossError::InvalidArgument(
+                "minimum resume score must be in 0..=100".to_owned(),
+            ));
         }
-        let blacklist = self.read_blacklist()?;
-        let mut stored = self.read_plans()?;
-        let mut planned_or_existing: HashSet<String> =
-            stored.iter().map(|plan| plan.job_id.clone()).collect();
-        let mut plans = Vec::new();
-        let mut greeting_previews = Vec::new();
-        let mut eligible = 0;
-        let mut skipped_existing = 0;
-        let mut skipped_blacklist = 0;
-        for job in jobs {
-            if blacklist.iter().any(|rule| blacklist_matches(rule, job)) {
-                skipped_blacklist += 1;
-                continue;
-            }
-            let evaluation = policy.evaluate(job);
-            if !evaluation.eligible {
-                continue;
-            }
-            eligible += 1;
-            if planned_or_existing.contains(&job.id) {
-                skipped_existing += 1;
-                continue;
-            }
-            if plans.len() == limit {
-                continue;
-            }
-            planned_or_existing.insert(job.id.clone());
-            let greeting_preview = template
-                .map(|selected| render_body(&selected.body, job, resume))
-                .transpose()?;
-            if let Some(text) = greeting_preview {
-                greeting_previews.push(PlanGreetingPreview {
-                    job_id: job.id.clone(),
-                    text,
-                });
-            }
-            plans.push(ApplicationPlan {
-                job_id: job.id.clone(),
-                job_title: job.title.clone(),
-                company: job.company.clone(),
-                policy_name: policy.name.clone(),
-                template_name: template.map(|selected| selected.name.clone()),
-                resume_name: resume.map(|document| document.name.clone()),
-                resume_updated_at: resume.map(|document| document.updated_at),
-                score: evaluation.score,
-                state: ApplicationPlanState::ManualReview,
-                state_changed_at: now,
-                state_note: None,
-                dry_run: true,
-                created_at: now,
-            });
+        validate_screen_resume(resume)?;
+        if let Some(template) = options.template {
+            validate_screening_template(&template.body)?;
         }
-        if !plans.is_empty() {
-            stored.extend(plans.iter().cloned());
-            self.save_plans(&stored)?;
-        }
-        Ok(PlanBuildResult {
-            mode: "manual_review".to_owned(),
-            dry_run: true,
-            considered: jobs.len(),
-            eligible,
-            planned: plans.len(),
-            skipped_existing,
-            skipped_blacklist,
-            plans,
-            greeting_previews,
-        })
+
+        let mut gated = self.gate_candidates(jobs, policy)?;
+        let policy_eligible = gated.candidates.len();
+        gated.candidates = gated
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                let evaluation = evaluate_resume(resume, candidate.job);
+                (evaluation.score >= options.minimum_resume_score).then(|| PlanCandidate {
+                    score: combined_score(evaluation.score, candidate.policy_score),
+                    resume_score: Some(evaluation.score),
+                    title_match: evaluation.title_match,
+                    matched_skills: evaluation.matched_skills,
+                    ..candidate
+                })
+            })
+            .collect();
+        gated.candidates.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.job.id.cmp(&right.job.id))
+        });
+        let eligible = gated.candidates.len();
+        self.persist_candidates(
+            gated,
+            PlanPersistence {
+                policy,
+                template: options.template,
+                resume: Some(resume),
+                limit: options.limit,
+                now: options.now,
+                mode: "resume_screening_manual_review",
+                eligible,
+                skipped_resume_score: policy_eligible.saturating_sub(eligible),
+                always_preview: true,
+            },
+        )
     }
 
     pub fn list_plans(&self) -> Result<Vec<ApplicationPlan>, BossError> {
@@ -716,6 +790,135 @@ impl CampaignStore {
     fn save_plans(&self, values: &[ApplicationPlan]) -> Result<(), BossError> {
         save_json(&self.plans_path, values, "application plans")
     }
+
+    fn gate_candidates<'a>(
+        &self,
+        jobs: &'a [Job],
+        policy: &CampaignPolicy,
+    ) -> Result<GatedCandidates<'a>, BossError> {
+        let blacklist = self.read_blacklist()?;
+        let mut skipped_blacklist = 0;
+        let candidates = jobs
+            .iter()
+            .filter_map(|job| {
+                if blacklist.iter().any(|rule| blacklist_matches(rule, job)) {
+                    skipped_blacklist += 1;
+                    return None;
+                }
+                let evaluation = policy.evaluate(job);
+                evaluation.eligible.then_some(PlanCandidate {
+                    job,
+                    score: evaluation.score,
+                    policy_score: evaluation.score,
+                    resume_score: None,
+                    title_match: false,
+                    matched_skills: Vec::new(),
+                })
+            })
+            .collect();
+        Ok(GatedCandidates {
+            considered: jobs.len(),
+            skipped_blacklist,
+            candidates,
+        })
+    }
+
+    fn persist_candidates(
+        &self,
+        gated: GatedCandidates<'_>,
+        request: PlanPersistence<'_>,
+    ) -> Result<PlanBuildResult, BossError> {
+        let mut stored = self.read_plans()?;
+        let mut planned_or_existing: HashSet<String> =
+            stored.iter().map(|plan| plan.job_id.clone()).collect();
+        let mut plans = Vec::new();
+        let mut greeting_previews = Vec::new();
+        let mut skipped_existing = 0;
+        for candidate in gated.candidates {
+            if planned_or_existing.contains(&candidate.job.id) {
+                skipped_existing += 1;
+                continue;
+            }
+            if plans.len() == request.limit {
+                continue;
+            }
+            planned_or_existing.insert(candidate.job.id.clone());
+            let preview = match request.template {
+                Some(selected) => {
+                    let resume_context = if request.always_preview {
+                        ResumeRenderContext::Screening {
+                            title: &request
+                                .resume
+                                .ok_or_else(|| {
+                                    BossError::InvalidArgument(
+                                        "resume screening preview requires a bound resume"
+                                            .to_owned(),
+                                    )
+                                })?
+                                .title,
+                            matched_skills: &candidate.matched_skills,
+                        }
+                    } else {
+                        request
+                            .resume
+                            .map_or(ResumeRenderContext::Unbound, ResumeRenderContext::Full)
+                    };
+                    Some(render_body(&selected.body, candidate.job, resume_context)?)
+                }
+                None if request.always_preview => Some(render_screen_greeting_preview(
+                    &candidate,
+                    request.resume.ok_or_else(|| {
+                        BossError::InvalidArgument(
+                            "resume screening preview requires a bound resume".to_owned(),
+                        )
+                    })?,
+                )?),
+                None => None,
+            };
+            if let Some(text) = preview {
+                greeting_previews.push(PlanGreetingPreview {
+                    job_id: candidate.job.id.clone(),
+                    sent: false,
+                    text,
+                });
+            }
+            plans.push(ApplicationPlan {
+                job_id: candidate.job.id.clone(),
+                job_title: candidate.job.title.clone(),
+                company: candidate.job.company.clone(),
+                policy_name: request.policy.name.clone(),
+                template_name: request.template.map(|selected| selected.name.clone()),
+                resume_name: request.resume.map(|document| document.name.clone()),
+                resume_updated_at: request.resume.map(|document| document.updated_at),
+                policy_score: Some(candidate.policy_score),
+                resume_score: candidate.resume_score,
+                title_match: candidate.title_match,
+                matched_skills: candidate.matched_skills,
+                score: candidate.score,
+                state: ApplicationPlanState::ManualReview,
+                state_changed_at: request.now,
+                state_note: None,
+                dry_run: true,
+                created_at: request.now,
+            });
+        }
+        if !plans.is_empty() {
+            stored.extend(plans.iter().cloned());
+            self.save_plans(&stored)?;
+        }
+        Ok(PlanBuildResult {
+            mode: request.mode.to_owned(),
+            dry_run: true,
+            considered: gated.considered,
+            eligible: request.eligible,
+            planned: plans.len(),
+            skipped_existing,
+            skipped_blacklist: gated.skipped_blacklist,
+            skipped_resume_score: request.skipped_resume_score,
+            plans,
+            greeting_previews,
+        })
+    }
 }
 
 impl CampaignPolicy {
@@ -879,8 +1082,127 @@ fn normalize_bounded(value: &str, field: &str, maximum: usize) -> Result<String,
     Ok(value.to_owned())
 }
 
+fn validate_plan_limit(limit: usize) -> Result<(), BossError> {
+    if limit == 0 || limit > MAX_PLANS_PER_BUILD {
+        return Err(BossError::InvalidArgument(format!(
+            "plan limit must be 1..={MAX_PLANS_PER_BUILD}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_screen_resume(resume: &ResumeDocument) -> Result<(), BossError> {
+    if resume.title.trim().is_empty() && resume.skills.iter().all(|skill| skill.trim().is_empty()) {
+        return Err(BossError::InvalidArgument(
+            "resume screening requires a non-empty title or at least one skill".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_screening_template(body: &str) -> Result<(), BossError> {
+    validate_template(body)?;
+    if body.contains("{{resume_summary}}") {
+        return Err(BossError::InvalidArgument(
+            "campaign screening templates cannot use {{resume_summary}}".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn contains_normalized(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn evaluate_resume(resume: &ResumeDocument, job: &Job) -> ResumeEvaluation {
+    let searchable = normalize_match_text(&format!(
+        "{} {} {}",
+        job.title,
+        job.skills.join(" "),
+        job.description
+    ));
+    let normalized_title = normalize_match_text(&resume.title);
+    let title_match =
+        !normalized_title.is_empty() && explicit_text_match(&searchable, &normalized_title);
+    let matched_skills: Vec<String> = resume
+        .skills
+        .iter()
+        .filter(|skill| {
+            let normalized = normalize_match_text(skill);
+            !normalized.is_empty() && explicit_text_match(&searchable, &normalized)
+        })
+        .cloned()
+        .collect();
+    let skill_score = if resume.skills.is_empty() {
+        0
+    } else {
+        ((matched_skills.len() * 50) / resume.skills.len()) as u8
+    };
+    ResumeEvaluation {
+        score: u8::from(title_match) * 50 + skill_score,
+        title_match,
+        matched_skills,
+    }
+}
+
+fn normalize_match_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = true;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() || is_significant_match_punctuation(character) {
+            normalized.push(character);
+            separator = false;
+        } else if !separator {
+            normalized.push(' ');
+            separator = true;
+        }
+    }
+    if separator {
+        normalized.pop();
+    }
+    normalized
+}
+
+const fn is_significant_match_punctuation(character: char) -> bool {
+    // These characters carry identity inside common technical tokens such as
+    // C++, C#, .NET, snake_case, kebab-case, and path-like names.
+    matches!(character, '+' | '#' | '.' | '_' | '-' | '/')
+}
+
+fn explicit_text_match(searchable: &str, needle: &str) -> bool {
+    if needle.is_ascii() {
+        format!(" {searchable} ").contains(&format!(" {needle} "))
+    } else {
+        searchable.contains(needle)
+    }
+}
+
+fn combined_score(resume_score: u8, policy_score: u8) -> u8 {
+    ((u16::from(resume_score) * 70 + u16::from(policy_score) * 30) / 100) as u8
+}
+
+fn render_screen_greeting_preview(
+    candidate: &PlanCandidate<'_>,
+    resume: &ResumeDocument,
+) -> Result<String, BossError> {
+    let mut preview = if candidate.job.company.trim().is_empty() {
+        format!("您好，我关注到 {} 职位。", candidate.job.title)
+    } else {
+        format!(
+            "您好，我关注到 {} 的 {} 职位。",
+            candidate.job.company, candidate.job.title
+        )
+    };
+    if candidate.title_match {
+        preview.push_str(&format!("我的求职方向是 {}。", resume.title.trim()));
+    }
+    if !candidate.matched_skills.is_empty() {
+        preview.push_str(&format!(
+            "与岗位匹配的技能包括 {}。",
+            candidate.matched_skills.join("、")
+        ));
+    }
+    validate_greeting_preview_length(preview)
 }
 
 fn salary_in_range(job: &Job, minimum: Option<u32>, maximum: Option<u32>) -> bool {
@@ -1011,12 +1333,16 @@ fn allowed_placeholder(value: &str) -> bool {
 fn render_body(
     body: &str,
     job: &Job,
-    resume: Option<&ResumeDocument>,
+    resume: ResumeRenderContext<'_>,
 ) -> Result<String, BossError> {
     validate_template(body)?;
     let mut rendered = String::with_capacity(body.len());
     let welfare = job.welfare.join("、");
-    let resume_skills = resume.map(|document| document.skills.join("、"));
+    let resume_skills = match resume {
+        ResumeRenderContext::Full(document) => Some(document.skills.join("、")),
+        ResumeRenderContext::Screening { matched_skills, .. } => Some(matched_skills.join("、")),
+        ResumeRenderContext::Unbound => None,
+    };
     let mut remainder = body;
     while let Some(start) = remainder.find("{{") {
         rendered.push_str(&remainder[..start]);
@@ -1030,9 +1356,9 @@ fn render_body(
             "city" => &job.city,
             "salary" => &job.salary,
             "welfare" => &welfare,
-            "resume_title" => &required_resume(resume)?.title,
-            "resume_summary" => &required_resume(resume)?.summary,
-            "resume_skills" => required_resume_skills(resume_skills.as_deref())?,
+            "resume_title" => resume_title(resume)?,
+            "resume_summary" => resume_summary(resume)?,
+            "resume_skills" => required_resume_value(resume_skills.as_deref())?,
             _ => {
                 return Err(BossError::InvalidArgument(
                     "template contains an unsupported placeholder".to_owned(),
@@ -1042,23 +1368,44 @@ fn render_body(
         remainder = &after_start[end + 2..];
     }
     rendered.push_str(remainder);
+    validate_greeting_preview_length(rendered)
+}
+
+fn validate_greeting_preview_length(rendered: String) -> Result<String, BossError> {
+    if rendered.chars().count() > MAX_GREETING_PREVIEW_CHARS {
+        return Err(BossError::InvalidArgument(format!(
+            "rendered greeting preview must contain at most {MAX_GREETING_PREVIEW_CHARS} characters"
+        )));
+    }
     Ok(rendered)
 }
 
-fn required_resume(resume: Option<&ResumeDocument>) -> Result<&ResumeDocument, BossError> {
-    resume.ok_or_else(|| {
-        BossError::InvalidArgument(
-            "template uses a resume placeholder but no resume is bound to this plan".to_owned(),
-        )
-    })
+fn resume_title(resume: ResumeRenderContext<'_>) -> Result<&str, BossError> {
+    match resume {
+        ResumeRenderContext::Full(document) => Ok(&document.title),
+        ResumeRenderContext::Screening { title, .. } => Ok(title),
+        ResumeRenderContext::Unbound => Err(unbound_resume_placeholder()),
+    }
 }
 
-fn required_resume_skills(skills: Option<&str>) -> Result<&str, BossError> {
-    skills.ok_or_else(|| {
-        BossError::InvalidArgument(
-            "template uses a resume placeholder but no resume is bound to this plan".to_owned(),
-        )
-    })
+fn resume_summary(resume: ResumeRenderContext<'_>) -> Result<&str, BossError> {
+    match resume {
+        ResumeRenderContext::Full(document) => Ok(&document.summary),
+        ResumeRenderContext::Screening { .. } => Err(BossError::InvalidArgument(
+            "campaign screening templates cannot use {{resume_summary}}".to_owned(),
+        )),
+        ResumeRenderContext::Unbound => Err(unbound_resume_placeholder()),
+    }
+}
+
+fn required_resume_value(value: Option<&str>) -> Result<&str, BossError> {
+    value.ok_or_else(unbound_resume_placeholder)
+}
+
+fn unbound_resume_placeholder() -> BossError {
+    BossError::InvalidArgument(
+        "template uses a resume placeholder but no resume is bound to this plan".to_owned(),
+    )
 }
 
 fn ensure_unique_names<'a>(
@@ -1322,6 +1669,7 @@ mod tests {
             planned.greeting_previews,
             vec![PlanGreetingPreview {
                 job_id: "job-1".to_owned(),
+                sent: false,
                 text: "Private Resume Headline: Private resume summary (PrivateSkill、PrivateTool)"
                     .to_owned(),
             }]
@@ -1462,5 +1810,392 @@ mod tests {
             (3, 3, 1, 0, 0)
         );
         assert_eq!(store.list_plans().expect("plans").len(), 1);
+    }
+
+    #[test]
+    fn resume_screening_ranks_explicit_matches_and_persists_review_metadata_only() {
+        let (directory, store) = store();
+        let policy = store
+            .add_policy(CampaignPolicy {
+                name: "rust".to_owned(),
+                include: vec![CampaignRule {
+                    field: CampaignField::Title,
+                    value: "Rust".to_owned(),
+                }],
+                exclude: Vec::new(),
+                required_welfare: Vec::new(),
+                monthly_salary_min: None,
+                monthly_salary_max: None,
+                minimum_score: Some(100),
+            })
+            .expect("policy");
+        store
+            .add_blacklist(BlacklistKind::Company, "Blocked", 1)
+            .expect("blacklist");
+        let document = ResumeDocument {
+            title: "Rust Engineer".to_owned(),
+            skills: vec!["Rust".to_owned(), "Tokio".to_owned()],
+            ..resume()
+        };
+        let mut tied_b = job();
+        tied_b.id = "job-b".to_owned();
+        tied_b.skills = vec!["Rust".to_owned()];
+        tied_b.description = "Tokio services".to_owned();
+        let mut tied_a = tied_b.clone();
+        tied_a.id = "job-a".to_owned();
+        let mut below_floor = tied_b.clone();
+        below_floor.id = "job-low".to_owned();
+        below_floor.title = "Rust Product".to_owned();
+        below_floor.description.clear();
+        let mut blacklisted = tied_b.clone();
+        blacklisted.id = "job-blocked".to_owned();
+        blacklisted.company = "Blocked Company".to_owned();
+
+        let result = store
+            .screen_plans(
+                &[tied_b, below_floor, blacklisted, tied_a],
+                &policy,
+                &document,
+                ScreenPlanOptions {
+                    template: None,
+                    limit: 10,
+                    minimum_resume_score: DEFAULT_MINIMUM_RESUME_SCORE,
+                    now: 10,
+                },
+            )
+            .expect("screen");
+        assert_eq!(
+            (
+                result.considered,
+                result.eligible,
+                result.skipped_blacklist,
+                result.skipped_resume_score,
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(
+            result
+                .plans
+                .iter()
+                .map(|plan| plan.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-a", "job-b"]
+        );
+        assert_eq!(
+            result.greeting_previews,
+            vec![
+                PlanGreetingPreview {
+                    job_id: "job-a".to_owned(),
+                    sent: false,
+                    text: "您好，我关注到 Example Labs 的 Rust Engineer 职位。我的求职方向是 Rust Engineer。与岗位匹配的技能包括 Rust、Tokio。"
+                        .to_owned(),
+                },
+                PlanGreetingPreview {
+                    job_id: "job-b".to_owned(),
+                    sent: false,
+                    text: "您好，我关注到 Example Labs 的 Rust Engineer 职位。我的求职方向是 Rust Engineer。与岗位匹配的技能包括 Rust、Tokio。"
+                        .to_owned(),
+                },
+            ]
+        );
+        let plan = &result.plans[0];
+        assert_eq!(
+            (
+                plan.score,
+                plan.policy_score,
+                plan.resume_score,
+                plan.title_match,
+                plan.matched_skills.clone(),
+                plan.state,
+                plan.dry_run,
+            ),
+            (
+                100,
+                Some(100),
+                Some(100),
+                true,
+                vec!["Rust".to_owned(), "Tokio".to_owned()],
+                ApplicationPlanState::ManualReview,
+                true,
+            )
+        );
+        let persisted = std::fs::read_to_string(directory.path().join("application_plans.json"))
+            .expect("plans");
+        assert!(
+            persisted.contains("\"matched_skills\"")
+                && !persisted.contains("Private resume summary")
+                && !persisted.contains("\"greeting_previews\"")
+        );
+    }
+
+    #[test]
+    fn screening_templates_expose_only_title_and_matched_skills() {
+        let (directory, store) = store();
+        let policy = CampaignPolicy {
+            name: "all".to_owned(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            required_welfare: Vec::new(),
+            monthly_salary_min: None,
+            monthly_salary_max: None,
+            minimum_score: None,
+        };
+        let document = ResumeDocument {
+            title: "Rust Engineer".to_owned(),
+            summary: "Private screening summary".to_owned(),
+            skills: vec!["Rust".to_owned(), "UnmatchedSkill".to_owned()],
+            ..resume()
+        };
+        let summary_template = store
+            .add_template("summary", "{{resume_summary}}", 1)
+            .expect("summary template");
+        let error = store
+            .screen_plans(
+                &[job()],
+                &policy,
+                &document,
+                ScreenPlanOptions {
+                    template: Some(&summary_template),
+                    limit: 1,
+                    minimum_resume_score: 1,
+                    now: 10,
+                },
+            )
+            .expect_err("screening summary placeholder");
+        assert!(error.to_string().contains("cannot use {{resume_summary}}"));
+        assert!(!directory.path().join("application_plans.json").exists());
+
+        let matched_template = store
+            .add_template(
+                "matched",
+                "{{resume_title}} / {{resume_skills}} / {{title}}",
+                2,
+            )
+            .expect("matched template");
+        let result = store
+            .screen_plans(
+                &[job()],
+                &policy,
+                &document,
+                ScreenPlanOptions {
+                    template: Some(&matched_template),
+                    limit: 1,
+                    minimum_resume_score: 1,
+                    now: 11,
+                },
+            )
+            .expect("screening preview");
+        assert_eq!(
+            result.greeting_previews,
+            vec![PlanGreetingPreview {
+                job_id: "job-1".to_owned(),
+                sent: false,
+                text: "Rust Engineer / Rust / Rust Engineer".to_owned(),
+            }]
+        );
+        assert!(
+            !result.greeting_previews[0].text.contains("UnmatchedSkill")
+                && !result.greeting_previews[0]
+                    .text
+                    .contains("Private screening summary")
+        );
+    }
+
+    #[test]
+    fn resume_screening_keeps_punctuation_significant_technical_skills_distinct() {
+        let (_directory, store) = store();
+        let policy = CampaignPolicy {
+            name: "all".to_owned(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            required_welfare: Vec::new(),
+            monthly_salary_min: None,
+            monthly_salary_max: None,
+            minimum_score: None,
+        };
+        let mut c_resume = resume();
+        c_resume.title.clear();
+        c_resume.skills = vec!["C".to_owned()];
+        let technical_job = |id: &str, title: &str| {
+            let mut value = job();
+            value.id = id.to_owned();
+            value.title = title.to_owned();
+            value.description.clear();
+            value.skills.clear();
+            value
+        };
+        let c_result = store
+            .screen_plans(
+                &[
+                    technical_job("job-cpp", "C++ Engineer"),
+                    technical_job("job-c", "C Engineer"),
+                    technical_job("job-csharp", "C# Engineer"),
+                ],
+                &policy,
+                &c_resume,
+                ScreenPlanOptions {
+                    template: None,
+                    limit: 10,
+                    minimum_resume_score: 1,
+                    now: 10,
+                },
+            )
+            .expect("C screening");
+        assert_eq!(
+            (
+                c_result.eligible,
+                c_result.skipped_resume_score,
+                c_result
+                    .plans
+                    .iter()
+                    .map(|plan| plan.job_id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            (1, 2, vec!["job-c"])
+        );
+
+        let mut dotnet_resume = c_resume;
+        dotnet_resume.name = "dotnet".to_owned();
+        dotnet_resume.skills = vec![".NET".to_owned()];
+        let dotnet_result = store
+            .screen_plans(
+                &[
+                    technical_job("job-net", "NET Engineer"),
+                    technical_job("job-aspnet", "ASP.NET Engineer"),
+                    technical_job("job-dotnet", ".NET Engineer"),
+                ],
+                &policy,
+                &dotnet_resume,
+                ScreenPlanOptions {
+                    template: None,
+                    limit: 10,
+                    minimum_resume_score: 1,
+                    now: 11,
+                },
+            )
+            .expect(".NET screening");
+        assert_eq!(
+            (
+                dotnet_result.eligible,
+                dotnet_result.skipped_resume_score,
+                dotnet_result
+                    .plans
+                    .iter()
+                    .map(|plan| plan.job_id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            (1, 2, vec!["job-dotnet"])
+        );
+    }
+
+    #[test]
+    fn resume_screening_rejects_empty_explicit_match_data_without_persisting() {
+        let (_directory, store) = store();
+        let policy = CampaignPolicy {
+            name: "all".to_owned(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            required_welfare: Vec::new(),
+            monthly_salary_min: None,
+            monthly_salary_max: None,
+            minimum_score: None,
+        };
+        let mut document = resume();
+        document.title = " \t".to_owned();
+        document.skills.clear();
+        document.summary = "Rust engineer".to_owned();
+
+        let error = store
+            .screen_plans(
+                &[job()],
+                &policy,
+                &document,
+                ScreenPlanOptions {
+                    template: None,
+                    limit: 1,
+                    minimum_resume_score: 0,
+                    now: 10,
+                },
+            )
+            .expect_err("empty explicit match data");
+        assert!(
+            error
+                .to_string()
+                .contains("non-empty title or at least one skill")
+        );
+        assert!(store.list_plans().expect("plans").is_empty());
+    }
+
+    #[test]
+    fn resume_score_is_bounded_and_ignores_non_matching_resume_sections() {
+        let mut explicit = resume();
+        explicit.title = "Rust Engineer".to_owned();
+        explicit.skills = vec!["Rust".to_owned(), "Tokio".to_owned()];
+        let mut matching_job = job();
+        matching_job.description = "Tokio services".to_owned();
+        matching_job.skills = vec!["Rust".to_owned()];
+        assert_eq!(evaluate_resume(&explicit, &matching_job).score, 100);
+
+        explicit.title.clear();
+        explicit.skills.clear();
+        explicit.summary = "Rust Engineer with Tokio".to_owned();
+        explicit.experience.push(crate::resume::ResumeExperience {
+            company: "Example".to_owned(),
+            role: "Rust Engineer".to_owned(),
+            start_date: "2020".to_owned(),
+            end_date: "2024".to_owned(),
+            summary: "Built Tokio services".to_owned(),
+        });
+        assert_eq!(evaluate_resume(&explicit, &matching_job).score, 0);
+    }
+
+    #[test]
+    fn legacy_application_plans_default_resume_screening_metadata() {
+        let plan: ApplicationPlan = serde_json::from_value(serde_json::json!({
+            "job_id":"legacy",
+            "job_title":"Engineer",
+            "company":"Example",
+            "policy_name":"all",
+            "template_name":null,
+            "score":100,
+            "dry_run":true,
+            "created_at":1
+        }))
+        .expect("legacy plan");
+        assert_eq!(
+            (
+                plan.policy_score,
+                plan.resume_score,
+                plan.title_match,
+                plan.matched_skills,
+            ),
+            (None, None, false, Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn oversized_greeting_preview_is_rejected_before_any_plan_is_persisted() {
+        let (_directory, store) = store();
+        let policy = store
+            .add_policy(CampaignPolicy {
+                name: "all".to_owned(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+                required_welfare: Vec::new(),
+                monthly_salary_min: None,
+                monthly_salary_max: None,
+                minimum_score: None,
+            })
+            .expect("policy");
+        let template = store
+            .add_template("summary", "{{resume_summary}}", 1)
+            .expect("template");
+        let mut document = resume();
+        document.summary = "x".repeat(MAX_GREETING_PREVIEW_CHARS + 1);
+        let error = store
+            .build_plans(&[job()], &policy, Some(&template), Some(&document), 1, 2)
+            .expect_err("oversized preview");
+        assert!(error.to_string().contains("at most"));
+        assert!(store.list_plans().expect("plans").is_empty());
     }
 }

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Read};
+use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
@@ -19,7 +19,7 @@ use crate::ai::{AiProfile, AiProfileStore, AiScore};
 use crate::auth::{AuthStore, read_manual_cookie};
 use crate::campaign::{
     ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
-    CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult,
+    CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult, ScreenPlanOptions,
 };
 use crate::config::{AppConfig, ConfigChange, ConfigEntry, ConfigStore};
 use crate::export::{ExportOptions, ExportResult, ExportSource, structured_jobs, write_export};
@@ -263,7 +263,7 @@ impl BossService {
         diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
     }
 
-    /// Resolves a local Cookie source, then tries browser and manual fallbacks.
+    /// Resolves a local Cookie source and verifies Zhipin directly.
     pub async fn login(
         &mut self,
         platform: Option<Platform>,
@@ -273,13 +273,13 @@ impl BossService {
         for selected in selected_platforms(platform) {
             results.push(self.login_platform(selected, manual).await?);
         }
-        let interactive_browser_used = results.iter().any(|result| {
-            result.get("source").and_then(Value::as_str) == Some("interactive_browser")
-        });
+        let direct_verified = results
+            .iter()
+            .any(|result| result.get("state").and_then(Value::as_str) == Some("direct_verified"));
         Ok(json!({
-            "network_checked":false,
-            "verification":if interactive_browser_used {
-                "browser_interactive_provider_unverified"
+            "network_checked":direct_verified,
+            "verification":if direct_verified {
+                "zhipin_authenticated_api_code_0"
             } else {
                 "local_unverified"
             },
@@ -315,67 +315,39 @@ impl BossService {
             return self.manual_login_result(platform);
         }
         if let Some(cookie) = AuthStore::environment_cookie(platform) {
-            self.auth.store_session(platform, cookie)?;
-            return Ok(login_outcome(platform, "stored_unverified", "environment"));
+            return self.store_login_cookie(platform, cookie, "environment");
         }
-        if self.auth.has_session(platform) {
-            return Ok(login_outcome(
-                platform,
-                "stored_unverified",
-                "stored_session",
-            ));
+        if let Some(cookie) = self.auth.runtime_cookie(platform) {
+            return self.store_login_cookie(platform, cookie, "stored_session");
         }
-        self.browser_or_manual_result(
-            platform,
-            Self::browser_login_result,
-            Self::manual_login_result,
-        )
+        self.manual_login_result(platform)
     }
 
     fn manual_login_result(&mut self, platform: Platform) -> Result<Value, BossError> {
         match read_manual_cookie(platform)? {
-            Some(cookie) => {
-                self.auth.store_session(platform, cookie)?;
-                Ok(login_outcome(platform, "stored_unverified", "manual"))
-            }
+            Some(cookie) => self.store_login_cookie(platform, cookie, "manual"),
             None => Ok(login_outcome(platform, "manual_login_required", "none")),
         }
     }
 
-    fn browser_or_manual_result<B, M>(
+    fn store_login_cookie(
         &mut self,
         platform: Platform,
-        browser_attempt: B,
-        manual_fallback: M,
-    ) -> Result<Value, BossError>
-    where
-        B: FnOnce(&mut Self, Platform) -> Result<Option<Value>, BossError>,
-        M: FnOnce(&mut Self, Platform) -> Result<Value, BossError>,
-    {
-        match browser_attempt(self, platform)? {
-            Some(result) => Ok(result),
-            None => manual_fallback(self, platform),
+        cookie: String,
+        source: &'static str,
+    ) -> Result<Value, BossError> {
+        if platform == Platform::Zhipin {
+            let refreshed = crate::zhipin_direct::refresh_session(&cookie)?;
+            self.auth.store_session(platform, refreshed.cookie)?;
+            return Ok(json!({
+                "platform":platform,
+                "state":"direct_verified",
+                "source":source,
+                "verification":refreshed.verification
+            }));
         }
-    }
-
-    fn browser_login_result(&mut self, platform: Platform) -> Result<Option<Value>, BossError> {
-        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-            return Ok(None);
-        }
-        let Some(auth_root) = self.auth.browser_profile_root() else {
-            return Ok(None);
-        };
-        match crate::browser_login::interactive_login(platform, &auth_root) {
-            Some(cookie) => {
-                self.auth.store_session(platform, cookie)?;
-                Ok(Some(login_outcome(
-                    platform,
-                    "stored_unverified",
-                    "interactive_browser",
-                )))
-            }
-            None => Ok(None),
-        }
+        self.auth.store_session(platform, cookie)?;
+        Ok(login_outcome(platform, "stored_unverified", source))
     }
 
     /// Renders the shared capability registry.
@@ -817,6 +789,33 @@ impl BossService {
             resume.as_ref(),
             limit,
             now_seconds()?,
+        )
+    }
+
+    /// Screens cached jobs with explicit resume fields and creates local review plans only.
+    pub fn campaign_screen(
+        &self,
+        resume_name: &str,
+        policy_name: &str,
+        template_name: Option<&str>,
+        limit: usize,
+        minimum_resume_score: u8,
+    ) -> Result<PlanBuildResult, BossError> {
+        let resume = self.resumes.show(resume_name)?;
+        let policy = self.campaigns.show_policy(policy_name)?;
+        let template = template_name
+            .map(|name| self.campaigns.show_template(name))
+            .transpose()?;
+        self.campaigns.screen_plans(
+            &self.cache.all()?,
+            &policy,
+            &resume,
+            ScreenPlanOptions {
+                template: template.as_ref(),
+                limit,
+                minimum_resume_score,
+                now: now_seconds()?,
+            },
         )
     }
 
@@ -2225,7 +2224,6 @@ fn cleanup_created_directories(directories: &[PathBuf]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
 
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -2276,27 +2274,6 @@ mod tests {
                 Err(BossError::Parse("detail unavailable".to_owned()))
             }
         }
-    }
-
-    #[test]
-    fn failed_browser_attempt_selects_the_manual_fallback() {
-        let directory = tempdir().expect("temporary directory");
-        let mut service =
-            BossService::from_paths(DataPaths::new(directory.path())).expect("service");
-        let manual_selected = Cell::new(false);
-        let result = service
-            .browser_or_manual_result(
-                Platform::Zhipin,
-                |_, _| Ok(None),
-                |_, platform| {
-                    manual_selected.set(true);
-                    Ok(login_outcome(platform, "manual_login_required", "none"))
-                },
-            )
-            .expect("manual fallback result");
-        assert!(manual_selected.get());
-        assert_eq!(result["state"], "manual_login_required");
-        assert_eq!(result["source"], "none");
     }
 
     #[tokio::test]

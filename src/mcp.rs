@@ -4,7 +4,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::campaign::{ApplicationPlanState, BlacklistKind, CampaignPolicy, MAX_PLANS_PER_BUILD};
+use crate::campaign::{
+    ApplicationPlanState, BlacklistKind, CampaignPolicy, DEFAULT_MINIMUM_RESUME_SCORE,
+    MAX_PLANS_PER_BUILD,
+};
 use crate::export::{ExportFormat, ExportOptions, ExportSource};
 use crate::notify::normalize_event;
 use crate::schema::{SchemaFormat, tool_registry};
@@ -946,6 +949,44 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 false,
             ))
         }
+        "campaign_screen" => {
+            validate_allowed(
+                &arguments,
+                &[
+                    "resume",
+                    "policy",
+                    "template",
+                    "limit",
+                    "minimum_resume_score",
+                ],
+            )?;
+            let limit = positive_usize(&arguments, "limit", 20)?;
+            if limit > MAX_PLANS_PER_BUILD {
+                return Err(ToolCallError::InvalidArguments(format!(
+                    "limit must be at most {MAX_PLANS_PER_BUILD}"
+                )));
+            }
+            let minimum_resume_score = bounded_u8(
+                &arguments,
+                "minimum_resume_score",
+                DEFAULT_MINIMUM_RESUME_SCORE,
+                100,
+            )?;
+            Ok((
+                success_value(
+                    service
+                        .campaign_screen(
+                            required_string(&arguments, "resume")?,
+                            required_string(&arguments, "policy")?,
+                            optional_nonblank_owned_string(&arguments, "template")?.as_deref(),
+                            limit,
+                            minimum_resume_score,
+                        )
+                        .map_err(ToolCallError::Execution)?,
+                ),
+                false,
+            ))
+        }
         "campaign_plan_list" => {
             validate_allowed(&arguments, &[])?;
             Ok((
@@ -1252,6 +1293,19 @@ fn positive_usize(value: &Value, field: &str, default: usize) -> Result<usize, T
         .ok()
         .filter(|number| *number > 0)
         .ok_or_else(|| ToolCallError::InvalidArguments(format!("{field} must be positive")))
+}
+
+fn bounded_u8(value: &Value, field: &str, default: u8, maximum: u8) -> Result<u8, ToolCallError> {
+    let number = match value.get(field) {
+        None => u64::from(default),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            ToolCallError::InvalidArguments(format!("{field} must be an integer"))
+        })?,
+    };
+    u8::try_from(number)
+        .ok()
+        .filter(|number| *number <= maximum)
+        .ok_or_else(|| ToolCallError::InvalidArguments(format!("{field} must be in 0..={maximum}")))
 }
 
 fn parse_platform(

@@ -2,7 +2,6 @@
 
 pub mod ai;
 pub mod auth;
-pub(crate) mod browser_login;
 pub mod cache;
 pub mod campaign;
 pub mod city;
@@ -22,12 +21,14 @@ pub mod schema;
 pub mod service;
 pub mod shortlist;
 pub mod watch;
+pub(crate) mod zhipin_direct;
 
 pub use ai::{AiProfile, AiProfileStore, AiScore};
 pub use cache::JobCache;
 pub use campaign::{
     ApplicationPlan, BlacklistKind, BlacklistRule, CampaignField, CampaignPolicy, CampaignRule,
-    CampaignStats, GreetingTemplate, PlanBuildResult,
+    CampaignStats, DEFAULT_MINIMUM_RESUME_SCORE, GreetingTemplate, PlanBuildResult,
+    PlanGreetingPreview,
 };
 pub use config::{AppConfig, ConfigEntry, ConfigStore};
 pub use data::DataPaths;

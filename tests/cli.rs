@@ -149,6 +149,23 @@ fn invalid_limit_is_a_json_error() {
 }
 
 #[test]
+fn unknown_command_keeps_the_unlocalized_json_parse_error() {
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("not-a-command")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    let message = value["error"]["message"].as_str().expect("message");
+    assert!(message.contains("Usage: boss <COMMAND>"), "{message}");
+    assert!(!message.contains("<命令>"), "{message}");
+}
+
+#[test]
 fn data_dir_selects_the_cache_used_by_ls() {
     let directory = tempdir().expect("temporary directory");
     let jobs = serde_json::json!([{
@@ -172,17 +189,253 @@ fn data_dir_selects_the_cache_used_by_ls() {
 }
 
 #[test]
-fn help_and_version_exit_successfully_on_stdout() {
-    for argument in ["--help", "--version"] {
+fn bare_invocation_and_help_print_the_same_complete_chinese_root_help() {
+    let outputs = [vec![], vec!["--help"], vec!["-h"], vec!["help"]].map(|args| {
+        Command::cargo_bin("boss")
+            .expect("binary")
+            .args(args)
+            .output()
+            .expect("run")
+    });
+
+    for output in &outputs {
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
+
+        let help = String::from_utf8(output.stdout.clone()).expect("utf8");
+        for expected in [
+            "BossKit — 多平台招聘求职辅助工具",
+            "用法: boss <命令>",
+            "命令:",
+            "选项:",
+            "保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话",
+            "显示当前命令或指定子命令的帮助",
+            "--help",
+            "显示帮助",
+            "--version",
+            "显示版本",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+        for command in [
+            "platforms",
+            "cities",
+            "search",
+            "preset",
+            "reply",
+            "campaign",
+            "watch",
+            "resume",
+            "ai",
+            "notify",
+            "stats",
+            "clean",
+            "ls",
+            "show",
+            "detail",
+            "history",
+            "export",
+            "config",
+            "login",
+            "logout",
+            "status",
+            "doctor",
+            "schema",
+            "shortlist",
+            "mcp",
+            "help",
+        ] {
+            assert!(
+                help.lines()
+                    .any(|line| line.split_whitespace().next() == Some(command)),
+                "missing top-level command {command:?} in:\n{help}"
+            );
+        }
+        for english in [
+            "Usage:",
+            "Commands:",
+            "Arguments:",
+            "Options:",
+            "[possible values:",
+            "Print help",
+            "Print version",
+            "Print this message",
+        ] {
+            assert!(
+                !help.contains(english),
+                "unexpected English built-in {english:?} in:\n{help}"
+            );
+        }
+    }
+
+    for output in &outputs[1..] {
+        assert_eq!(outputs[0].stdout, output.stdout);
+    }
+}
+
+#[test]
+fn nested_help_screens_localize_generated_and_authored_text() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["ai", "--help"],
+            &[
+                "用法: boss ai <命令>",
+                "命令:",
+                "profile  添加或更新无凭据的 HTTPS OpenAI 兼容配置",
+                "draft    使用一个缓存职位和一份本地类型化简历生成 AI 文稿",
+                "score    根据一份本地类型化简历评估一个缓存职位",
+                "help     显示当前命令或指定子命令的帮助",
+                "选项:",
+                "-h, --help  显示帮助",
+            ],
+        ),
+        (
+            &["ai", "profile", "--help"],
+            &[
+                "用法: boss ai profile <命令>",
+                "add   仅添加或更新配置元数据；不接受或存储密钥",
+                "ls    列出本地配置 [别名: list]",
+                "show  查看一个本地配置",
+                "rm    移除一个本地配置 [别名: remove]",
+            ],
+        ),
+        (
+            &["notify", "--help"],
+            &[
+                "用法: boss notify <命令>",
+                "preview  仅渲染受限的本地载荷；不会读取 Webhook 或访问网络",
+                "send     明确确认后，将受限载荷发送到仅运行时提供的 Webhook",
+            ],
+        ),
+        (
+            &["campaign", "plan", "create", "--help"],
+            &[
+                "用法: boss campaign plan create [OPTIONS] <POLICY>",
+                "参数:",
+                "选项:",
+                "--resume-name <RESUME_NAME>  绑定一份现有的本地类型化简历，不将其内容复制到计划中",
+                "[默认值: 20]",
+            ],
+        ),
+        (
+            &["campaign", "screen", "--help"],
+            &[
+                "用法: boss campaign screen [OPTIONS] --resume <RESUME> --policy <POLICY>",
+                "--resume <RESUME>",
+                "现有本地类型化简历名称",
+                "--policy <POLICY>",
+                "现有本地筛选策略名称",
+                "--minimum-resume-score <MINIMUM_RESUME_SCORE>",
+                "简历标题与技能的最低本地匹配分数",
+                "[默认值: 40]",
+            ],
+        ),
+        (
+            &["search", "--help"],
+            &[
+                "用法: boss search [OPTIONS] [QUERY]",
+                "参数:",
+                "选项:",
+                "[可选值: zhipin, zhilian, qiancheng, all]",
+            ],
+        ),
+    ];
+
+    for (args, expected_fragments) in cases {
         let output = Command::cargo_bin("boss")
             .expect("binary")
-            .arg(argument)
+            .args(*args)
             .output()
             .expect("run");
-        assert!(output.status.success());
-        assert!(!output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
+        assert!(output.status.success(), "args={args:?}");
+        assert!(output.stderr.is_empty(), "args={args:?}");
+        let help = String::from_utf8(output.stdout).expect("utf8");
+        for expected in *expected_fragments {
+            assert!(
+                help.contains(expected),
+                "args={args:?}: missing {expected:?} in:\n{help}"
+            );
+        }
+        for english in [
+            "Usage:",
+            "Commands:",
+            "Arguments:",
+            "Options:",
+            "[possible values:",
+            "[default:",
+            "[alias:",
+            "Print help",
+            "Print version",
+            "Print this message",
+            "Add or update",
+            "Generate an AI",
+            "Score one cached",
+            "Bind one existing",
+            "Render the bounded",
+            "Send the bounded",
+        ] {
+            assert!(
+                !help.contains(english),
+                "args={args:?}: unexpected English help text {english:?} in:\n{help}"
+            );
+        }
     }
+}
+
+#[test]
+fn unavailable_chat_command_is_a_message_free_json_error() {
+    let secret = "GREETING_SECRET_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .args(["chat", "unknown", "--message", secret])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+}
+
+#[test]
+fn direct_chat_is_not_advertised_before_transport_integration() {
+    let directory = tempdir().expect("temporary directory");
+    let responses = run_mcp(
+        directory.path(),
+        &[serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})],
+    );
+    assert!(
+        responses[0]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .all(|tool| !matches!(tool["name"].as_str(), Some("chat_greet" | "chat_send")))
+    );
+
+    let schema = run_json(directory.path(), &["schema", "--format", "native"]);
+    let commands = schema["data"]["commands"].as_array().expect("commands");
+    assert!(
+        commands
+            .iter()
+            .all(|command| !matches!(command["name"].as_str(), Some("chat greet" | "chat send")))
+    );
+    assert_eq!(
+        schema["data"]["risk"]["confirmed_platform_messages"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn version_exits_successfully_on_stdout() {
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--version")
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    assert!(!output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -351,7 +604,7 @@ fn status_and_doctor_are_structured_and_offline() {
 }
 
 #[test]
-fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted() {
+fn non_zhipin_login_environment_status_logout_and_fallback_are_local_and_redacted() {
     #[cfg(unix)]
     {
         let directory = tempdir().expect("temporary directory");
@@ -360,10 +613,10 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
         let output = Command::cargo_bin("boss")
             .expect("binary")
             .env("BOSS_DATA_DIR", directory.path())
-            .env("BOSS_ZHIPIN_COOKIE", fixture_cookie)
-            .env_remove("BOSS_ZHILIAN_COOKIE")
+            .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
+            .env_remove("BOSS_ZHIPIN_COOKIE")
             .env_remove("BOSS_QIANCHENG_COOKIE")
-            .args(["login", "--platform", "zhipin"])
+            .args(["login", "--platform", "zhilian"])
             .output()
             .expect("login");
         assert!(output.status.success());
@@ -376,7 +629,7 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
                 && !login_text.contains(fixture_cookie)
         );
 
-        let status = run_json(directory.path(), &["status", "--platform", "zhipin"]);
+        let status = run_json(directory.path(), &["status", "--platform", "zhilian"]);
         assert!(
             status["data"]["providers"][0]["stored_session_present"] == true
                 && status["data"]["providers"][0]["auth_state"] == "stored_session_present"
@@ -386,10 +639,10 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
         );
         let logout = run_json(
             directory.path(),
-            &["logout", "--platform", "zhipin", "--yes"],
+            &["logout", "--platform", "zhilian", "--yes"],
         );
         assert_eq!(logout["data"]["results"][0]["revoked"], true);
-        let after_logout = run_json(directory.path(), &["status", "--platform", "zhipin"]);
+        let after_logout = run_json(directory.path(), &["status", "--platform", "zhilian"]);
         assert!(
             after_logout["data"]["providers"][0]["stored_session_present"] == false
                 && after_logout["data"]["providers"][0]
@@ -397,7 +650,7 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
                     .is_none()
         );
 
-        let manual_required = run_json(directory.path(), &["login", "--platform", "zhilian"]);
+        let manual_required = run_json(directory.path(), &["login", "--platform", "qiancheng"]);
         assert_eq!(
             manual_required["data"]["results"][0]["state"],
             "manual_login_required"
@@ -405,23 +658,13 @@ fn login_environment_status_logout_and_non_tty_fallback_are_local_and_redacted()
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn non_tty_login_does_not_start_a_user_configured_browser() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn non_tty_login_without_cookie_reports_manual_login_required() {
     let directory = tempdir().expect("temporary directory");
-    let marker = directory.path().join("browser-launch-marker");
-    let probe = directory.path().join("browser-probe");
-    std::fs::write(&probe, format!("#!/bin/sh\ntouch {}\n", marker.display()))
-        .expect("write probe");
-    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
-        .expect("make probe executable");
 
     let output = Command::cargo_bin("boss")
         .expect("binary")
         .env("BOSS_DATA_DIR", directory.path())
-        .env("BOSS_BROWSER", &probe)
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
         .env_remove("BOSS_QIANCHENG_COOKIE")
@@ -434,7 +677,6 @@ fn non_tty_login_does_not_start_a_user_configured_browser() {
         login["data"]["results"][0]["state"],
         "manual_login_required"
     );
-    assert!(!marker.exists());
     assert!(!directory.path().join(".auth").exists());
 }
 
@@ -761,6 +1003,259 @@ fn campaign_cli_binds_local_resume_and_records_human_transition_lifecycle() {
             && !stored.contains("Local profile")
             && !stored.contains("Rust、Tokio")
     );
+}
+
+#[test]
+fn campaign_screen_is_local_ranked_deduplicated_and_resume_bound() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let jobs_before = std::fs::read(directory.path().join("jobs.json")).expect("jobs");
+    run_json(
+        directory.path(),
+        &["resume", "init", "candidate", "--title", "Rust"],
+    );
+    run_json(
+        directory.path(),
+        &[
+            "resume",
+            "skills",
+            "candidate",
+            "--add",
+            "Rust",
+            "--add",
+            "UnmatchedSkill",
+        ],
+    );
+    run_json(directory.path(), &["campaign", "policy", "add", "all"]);
+    run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "template",
+            "add",
+            "screened",
+            "{{resume_title}} / {{resume_skills}} / {{title}}",
+        ],
+    );
+
+    let first = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "screen",
+            "--resume",
+            "candidate",
+            "--policy",
+            "all",
+            "--template",
+            "screened",
+            "--limit",
+            "3",
+        ],
+    );
+    let second = run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "screen",
+            "--resume",
+            "candidate",
+            "--policy",
+            "all",
+        ],
+    );
+    let persisted =
+        std::fs::read_to_string(directory.path().join("application_plans.json")).expect("plans");
+    assert_eq!(
+        first["data"]["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .map(|plan| plan["job_id"].as_str().expect("job id"))
+            .collect::<Vec<_>>(),
+        vec!["zhilian-job", "zhilian-job-2", "zhipin-job"]
+    );
+    assert!(
+        first["data"]["mode"] == "resume_screening_manual_review"
+            && first["data"]["planned"] == 3
+            && first["data"]["plans"]
+                .as_array()
+                .is_some_and(
+                    |plans| plans.iter().all(|plan| plan["state"] == "manual_review"
+                        && plan["dry_run"] == true
+                        && plan["policy_score"] == 100
+                        && plan["resume_score"] == 75
+                        && plan["title_match"] == true
+                        && plan["matched_skills"] == serde_json::json!(["Rust"]))
+                )
+            && first["data"]["greeting_previews"]
+                .as_array()
+                .is_some_and(|previews| previews.iter().all(|preview| {
+                    preview["sent"] == false
+                        && preview["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Rust / Rust /"))
+                        && !preview["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("UnmatchedSkill"))
+                }))
+            && second["data"]["planned"] == 0
+            && second["data"]["skipped_existing"] == 3
+            && !persisted.contains("greeting_previews")
+            && !persisted.contains("Rust / Rust / Rust")
+            && std::fs::read(directory.path().join("jobs.json")).expect("jobs") == jobs_before
+    );
+}
+
+#[test]
+fn campaign_screen_mcp_schema_and_arguments_match_the_local_cli_surface() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    run_json(
+        directory.path(),
+        &["resume", "init", "candidate", "--title", "Rust"],
+    );
+    run_json(
+        directory.path(),
+        &["resume", "skills", "candidate", "--add", "Rust"],
+    );
+    run_json(directory.path(), &["campaign", "policy", "add", "all"]);
+    let responses = run_mcp(
+        directory.path(),
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"campaign_screen","arguments":{
+                    "resume":"candidate","policy":"all","limit":1
+                }
+            }}),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"campaign_screen","arguments":{
+                    "resume":"candidate","policy":"all","minimum_resume_score":101
+                }
+            }}),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"campaign_screen","arguments":{
+                    "resume":"candidate","policy":"all","unexpected":true
+                }
+            }}),
+        ],
+    );
+    let schema = responses[0]["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "campaign_screen"))
+        .expect("campaign_screen schema");
+    assert!(
+        schema["inputSchema"]["required"] == serde_json::json!(["resume", "policy"])
+            && schema["inputSchema"]["properties"]["minimum_resume_score"]["default"] == 40
+            && responses[1]["result"]["isError"] == false
+            && responses[1]["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("resume_screening_manual_review"))
+            && responses[2]["error"]["code"] == -32602
+            && responses[3]["error"]["code"] == -32602
+    );
+}
+
+#[test]
+fn campaign_screen_rejects_empty_missing_resume_and_invalid_score() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    run_json(directory.path(), &["resume", "init", "empty"]);
+    run_json(directory.path(), &["campaign", "policy", "add", "all"]);
+
+    let run_failure = |args: &[&str]| {
+        Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .env_remove("BOSS_ZHIPIN_COOKIE")
+            .env_remove("BOSS_ZHILIAN_COOKIE")
+            .env_remove("BOSS_QIANCHENG_COOKIE")
+            .env_remove("BOSS_LLM_API_KEY")
+            .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
+            .args(args)
+            .output()
+            .expect("run")
+    };
+
+    let empty = run_failure(&["campaign", "screen", "--resume", "empty", "--policy", "all"]);
+    assert!(!empty.status.success());
+    let empty: Value = serde_json::from_slice(&empty.stdout).expect("empty resume error");
+    assert_eq!(empty["error"]["code"], "invalid_argument");
+    assert!(
+        empty["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty title or at least one skill"))
+    );
+
+    let missing = run_failure(&[
+        "campaign", "screen", "--resume", "missing", "--policy", "all",
+    ]);
+    assert!(!missing.status.success());
+    let missing: Value = serde_json::from_slice(&missing.stdout).expect("missing resume error");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not found: missing"))
+    );
+
+    let invalid_score = run_failure(&[
+        "campaign",
+        "screen",
+        "--resume",
+        "empty",
+        "--policy",
+        "all",
+        "--minimum-resume-score",
+        "101",
+    ]);
+    assert!(!invalid_score.status.success());
+    let invalid_score: Value =
+        serde_json::from_slice(&invalid_score.stdout).expect("invalid score error");
+    assert_eq!(invalid_score["error"]["code"], "invalid_argument");
+
+    run_json(
+        directory.path(),
+        &["resume", "init", "candidate", "--title", "Rust"],
+    );
+    run_json(
+        directory.path(),
+        &[
+            "resume",
+            "set",
+            "candidate",
+            "summary",
+            "Private screening summary",
+        ],
+    );
+    run_json(
+        directory.path(),
+        &[
+            "campaign",
+            "template",
+            "add",
+            "summary",
+            "{{resume_summary}}",
+        ],
+    );
+    let summary = run_failure(&[
+        "campaign",
+        "screen",
+        "--resume",
+        "candidate",
+        "--policy",
+        "all",
+        "--template",
+        "summary",
+    ]);
+    assert!(!summary.status.success());
+    let summary: Value = serde_json::from_slice(&summary.stdout).expect("summary error");
+    assert!(
+        summary["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot use {{resume_summary}}"))
+    );
+    assert!(!directory.path().join("application_plans.json").exists());
 }
 
 #[test]

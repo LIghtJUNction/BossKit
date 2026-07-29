@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use bosskit::campaign::{
     ApplicationPlanState, BlacklistKind, CampaignField, CampaignPolicy, CampaignRule,
+    DEFAULT_MINIMUM_RESUME_SCORE,
 };
 use bosskit::export::{ExportFormat, ExportOptions, ExportSource};
 use bosskit::model::ErrorBody;
@@ -15,8 +16,37 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 
+fn localize_generated_help(help: &str) -> String {
+    [
+        (
+            "Print this message or the help of the given subcommand(s)",
+            "显示当前命令或指定子命令的帮助",
+        ),
+        ("Usage:", "用法:"),
+        ("Commands:", "命令:"),
+        ("Arguments:", "参数:"),
+        ("Options:", "选项:"),
+        ("<COMMAND>", "<命令>"),
+        ("[possible values:", "[可选值:"),
+        ("[default:", "[默认值:"),
+        ("[aliases:", "[别名:"),
+        ("[alias:", "[别名:"),
+        ("Print help", "显示帮助"),
+        ("Print version", "显示版本"),
+    ]
+    .into_iter()
+    .fold(help.to_owned(), |localized, (english, chinese)| {
+        localized.replace(english, chinese)
+    })
+}
+
 #[derive(Parser)]
-#[command(name = "boss", version, about = "只读多平台招聘搜索 CLI")]
+#[command(
+    name = "boss",
+    version,
+    about = "BossKit — 多平台招聘求职辅助工具",
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -58,12 +88,12 @@ enum Command {
         #[command(subcommand)]
         command: ResumeCommand,
     },
-    /// Manage credential-free local AI profiles and explicitly confirmed model calls
+    /// 管理无凭据的本地 AI 配置与明确确认的模型调用
     Ai {
         #[command(subcommand)]
         command: AiCommand,
     },
-    /// Preview or explicitly send a minimal notification webhook summary
+    /// 预览或明确发送最小化通知 Webhook 摘要
     Notify {
         #[command(subcommand)]
         command: NotifyCommand,
@@ -124,7 +154,7 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 保存本地 Cookie；无可用来源时打开隔离浏览器
+    /// 保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话
     Login {
         #[arg(long, value_enum)]
         platform: Option<PlatformArg>,
@@ -246,6 +276,28 @@ enum CampaignCommand {
         #[command(subcommand)]
         command: CampaignPlanCommand,
     },
+    /// 按本地简历和策略筛选缓存职位，仅生成按分数排序的人工复核计划
+    Screen {
+        /// 现有本地类型化简历名称
+        #[arg(long)]
+        resume: String,
+        /// 现有本地筛选策略名称
+        #[arg(long)]
+        policy: String,
+        /// 可选的本地问候预览模板
+        #[arg(long)]
+        template: Option<String>,
+        /// 本次最多创建的去重计划数
+        #[arg(long, default_value = "20")]
+        limit: NonZeroUsize,
+        /// 简历标题与技能的最低本地匹配分数
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MINIMUM_RESUME_SCORE,
+            value_parser = clap::value_parser!(u8).range(0..=100)
+        )]
+        minimum_resume_score: u8,
+    },
     /// 汇总本地活动数据
     Stats,
 }
@@ -319,7 +371,7 @@ enum CampaignPlanCommand {
         policy: String,
         #[arg(long)]
         template: Option<String>,
-        /// Bind one existing local typed resume without copying its content into the plan.
+        /// 绑定一份现有的本地类型化简历，不将其内容复制到计划中
         #[arg(long)]
         resume_name: Option<String>,
         #[arg(long, default_value = "20")]
@@ -446,12 +498,12 @@ enum ResumeCommand {
 
 #[derive(Subcommand)]
 enum AiCommand {
-    /// Add or update a credential-free HTTPS OpenAI-compatible profile
+    /// 添加或更新无凭据的 HTTPS OpenAI 兼容配置
     Profile {
         #[command(subcommand)]
         command: AiProfileCommand,
     },
-    /// Generate an AI draft from one cached job and one typed local resume
+    /// 使用一个缓存职位和一份本地类型化简历生成 AI 文稿
     Draft {
         profile: String,
         job_id: String,
@@ -459,7 +511,7 @@ enum AiCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Score one cached job against one typed local resume
+    /// 根据一份本地类型化简历评估一个缓存职位
     Score {
         profile: String,
         job_id: String,
@@ -471,27 +523,27 @@ enum AiCommand {
 
 #[derive(Subcommand)]
 enum AiProfileCommand {
-    /// Add or update profile metadata only; no key is accepted or stored
+    /// 仅添加或更新配置元数据；不接受或存储密钥
     Add {
         name: String,
         base_url: String,
         model: String,
     },
-    /// List local profiles
+    /// 列出本地配置
     #[command(visible_alias = "list")]
     Ls,
-    /// Show one local profile
+    /// 查看一个本地配置
     Show { name: String },
-    /// Remove one local profile
+    /// 移除一个本地配置
     #[command(visible_alias = "remove")]
     Rm { name: String },
 }
 
 #[derive(Subcommand)]
 enum NotifyCommand {
-    /// Render the bounded local payload only; it never reads a webhook or uses network
+    /// 仅渲染受限的本地载荷；不会读取 Webhook 或访问网络
     Preview { event: String },
-    /// Send the bounded payload to the runtime-only webhook after explicit confirmation
+    /// 明确确认后，将受限载荷发送到仅运行时提供的 Webhook
     Send {
         event: String,
         #[arg(long)]
@@ -715,10 +767,12 @@ async fn main() -> ExitCode {
         Err(error)
             if matches!(
                 error.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             ) =>
         {
-            print!("{error}");
+            print!("{}", localize_generated_help(&error.to_string()));
             return ExitCode::SUCCESS;
         }
         Err(error) => {
@@ -899,6 +953,21 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                     )?));
                 }
             },
+            CampaignCommand::Screen {
+                resume,
+                policy,
+                template,
+                limit,
+                minimum_resume_score,
+            } => {
+                print_json(&Envelope::success(service.campaign_screen(
+                    &resume,
+                    &policy,
+                    template.as_deref(),
+                    limit.get(),
+                    minimum_resume_score,
+                )?));
+            }
             CampaignCommand::Stats => {
                 print_json(&Envelope::success(service.campaign_stats()?));
             }
