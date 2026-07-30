@@ -16,7 +16,7 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde_json::{Value, json};
 
 use crate::ai::{AiProfile, AiProfileStore, AiScore};
-use crate::auth::{AuthStore, read_manual_cookie};
+use crate::auth::{AuthStore, read_cookie_stdin, read_manual_cookie, validate_cookie};
 use crate::campaign::{
     ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
     CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult, ScreenPlanOptions,
@@ -218,6 +218,11 @@ impl BossService {
         json!({"count":cities.len(),"cities":cities})
     }
 
+    /// Reads one validated Cookie from stdin only for an explicit CLI request.
+    pub fn read_login_cookie_stdin() -> Result<String, BossError> {
+        read_cookie_stdin()
+    }
+
     /// Lists safe local account metadata without exposing credentials or paths.
     #[must_use]
     pub fn account_list(&self) -> Value {
@@ -331,10 +336,25 @@ impl BossService {
         &mut self,
         platform: Option<Platform>,
         manual: bool,
+        cookie: Option<String>,
     ) -> Result<Value, BossError> {
+        if manual && cookie.is_some() {
+            return Err(BossError::InvalidArgument(
+                "login --manual conflicts with --cookie-stdin".to_owned(),
+            ));
+        }
+        if cookie.is_some() && platform.is_none() {
+            return Err(BossError::InvalidArgument(
+                "login --cookie-stdin requires one explicit platform".to_owned(),
+            ));
+        }
+        if let Some(cookie) = cookie.as_deref() {
+            validate_cookie(cookie)?;
+        }
+        let mut cookie = cookie;
         let mut results = Vec::new();
         for selected in selected_platforms(platform) {
-            results.push(self.login_platform(selected, manual).await?);
+            results.push(self.login_platform(selected, manual, cookie.take()).await?);
         }
         let direct_verified = results
             .iter()
@@ -378,7 +398,11 @@ impl BossService {
         &mut self,
         platform: Platform,
         manual: bool,
+        cookie: Option<String>,
     ) -> Result<Value, BossError> {
+        if let Some(cookie) = cookie {
+            return self.store_login_cookie(platform, cookie, "stdin");
+        }
         if manual {
             return self.manual_login_result(platform);
         }

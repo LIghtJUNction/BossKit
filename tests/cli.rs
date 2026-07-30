@@ -2,6 +2,15 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
 fn run_json(data_dir: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -353,6 +362,15 @@ fn nested_help_screens_localize_generated_and_authored_text() {
                 "不启动浏览器、不修改或投递",
                 "选项:",
                 "-h, --help",
+            ],
+        ),
+        (
+            &["login", "--help"],
+            &[
+                "用法: boss login [OPTIONS]",
+                "-c, --cookie-stdin",
+                "从标准输入读取一个 Cookie",
+                "--manual",
             ],
         ),
         (
@@ -968,6 +986,187 @@ fn non_tty_login_without_cookie_reports_manual_login_required() {
         "manual_login_required"
     );
     assert!(!directory.path().join(".auth").exists());
+}
+
+#[test]
+fn cookie_stdin_login_stores_one_redacted_cookie_in_the_selected_account() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "session=STDIN_COOKIE_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .env_remove("BOSS_ZHILIAN_COOKIE")
+        .env_remove("BOSS_QIANCHENG_COOKIE")
+        .args(["login", "--account", "work", "--platform", "zhilian", "-c"])
+        .write_stdin(format!("{secret}\n"))
+        .output()
+        .expect("stdin login");
+    assert!(output.status.success());
+    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
+    let status = run_json(
+        directory.path(),
+        &["--account", "work", "status", "--platform", "zhilian"],
+    );
+    assert!(
+        login["data"]["account"] == "work"
+            && login["data"]["results"][0]["state"] == "stored_unverified"
+            && login["data"]["results"][0]["source"] == "stdin"
+            && status["data"]["providers"][0]["stored_session_present"] == true
+            && !String::from_utf8_lossy(&output.stdout).contains(secret)
+    );
+}
+
+#[test]
+fn cookie_stdin_rejects_empty_multiline_and_manual_conflict_without_secret_output() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "session=STDIN_ERROR_SECRET";
+    let multiline = format!("{secret}\nsession=SECOND_SECRET\n");
+    for input in ["", multiline.as_str()] {
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .args(["login", "--platform", "zhilian", "--cookie-stdin"])
+            .write_stdin(input)
+            .output()
+            .expect("invalid stdin login");
+        assert!(!output.status.success());
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+        assert!(
+            error["error"]["code"] == "authentication_error"
+                && error["data"].is_null()
+                && error["error"].get("source").is_none()
+                && !rendered.contains("STDIN_ERROR_SECRET")
+                && !rendered.contains("SECOND_SECRET")
+                && !rendered.contains(".auth")
+        );
+    }
+
+    let conflict = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "login",
+            "--platform",
+            "zhilian",
+            "--manual",
+            "--cookie-stdin",
+        ])
+        .write_stdin(secret)
+        .output()
+        .expect("conflicting login modes");
+    assert!(!conflict.status.success());
+    let rendered = String::from_utf8_lossy(&conflict.stdout);
+    let error: Value = serde_json::from_slice(&conflict.stdout).expect("error json");
+    assert!(
+        error["error"]["code"] == "invalid_argument"
+            && error["error"].get("source").is_none()
+            && !rendered.contains("STDIN_ERROR_SECRET")
+            && !rendered.contains(".auth")
+    );
+}
+
+#[test]
+fn cookie_stdin_requires_one_platform_before_reading_input() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "session=PLATFORM_VALIDATION_SECRET";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["login", "--cookie-stdin"])
+        .write_stdin(format!("{secret}\nsession=SECOND_SECRET\n"))
+        .output()
+        .expect("missing platform");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert!(
+        error["error"]["code"] == "invalid_argument"
+            && error["error"].get("source").is_none()
+            && !rendered.contains("PLATFORM_VALIDATION_SECRET")
+            && !rendered.contains("SECOND_SECRET")
+            && !rendered.contains(".auth")
+            && !directory.path().join(".auth").exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cookie_stdin_rejects_terminal_input_without_reading_it() {
+    let directory = tempdir().expect("temporary directory");
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    // SAFETY: all output pointers are valid for writes and the optional PTY
+    // configuration pointers are null, as permitted by `openpty`.
+    let result = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(result, 0, "open pseudo-terminal");
+    // SAFETY: a successful `openpty` call returns two newly owned file
+    // descriptors, each transferred into exactly one `File`.
+    let _master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+
+    let binary = Command::cargo_bin("boss").expect("binary");
+    let mut command = std::process::Command::new(binary.get_program());
+    command
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["login", "--platform", "zhilian", "--cookie-stdin"])
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("terminal stdin login");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll terminal stdin login") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop blocked terminal stdin login");
+            panic!("terminal stdin was read instead of rejected");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = child.wait_with_output().expect("terminal stdin output");
+    assert_eq!(output.status, status);
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert!(
+        error["error"]["code"] == "authentication_error"
+            && error["error"].get("source").is_none()
+            && rendered.contains("use login --manual")
+            && !rendered.contains(".auth")
+            && !directory.path().join(".auth").exists()
+    );
+}
+
+#[test]
+fn login_without_cookie_stdin_flag_does_not_read_piped_input() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "session=UNREQUESTED_STDIN_SECRET";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_ZHILIAN_COOKIE")
+        .args(["login", "--platform", "zhilian"])
+        .write_stdin(secret)
+        .output()
+        .expect("normal login");
+    assert!(output.status.success());
+    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
+    assert!(
+        login["data"]["results"][0]["state"] == "manual_login_required"
+            && !String::from_utf8_lossy(&output.stdout).contains(secret)
+            && !directory.path().join(".auth").exists()
+    );
 }
 
 #[test]

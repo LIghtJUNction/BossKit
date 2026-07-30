@@ -53,6 +53,7 @@ boss account use work --yes
 boss login
 boss login --platform zhipin
 boss login --account work --platform zhilian --manual
+wl-paste | boss login --account <alias> --platform zhipin -c
 boss --account work status --platform all
 boss status --platform all
 boss logout --platform zhipin --yes
@@ -61,6 +62,8 @@ boss logout --platform zhipin --yes
 `account list` 只返回别名、默认/活动状态和各平台是否存在已保存会话；不返回 Cookie、令牌或存储路径。`account use <别名> --yes` 创建或选择后续无覆盖命令使用的默认账户。全局 `--account <别名>` 只覆盖当前进程，不修改已保存的默认账户，并适用于搜索适配器、登录、状态、登出、在线简历和聊天等需要会话的 CLI 路径。别名只能包含 1–32 个 ASCII 字母、数字、`_` 或 `-`，并以字母或数字开头。旧版顶层 `zhipin` / `zhilian` / `qiancheng` 会话会原样迁移到 `default` 账户。
 
 `login` 先检查当前账户可用的 Cookie 来源和已保存会话。只有字面上的 `default` 账户可读取通用 `BOSS_*_COOKIE` 环境变量；其他账户不会静默复用这些变量，必须使用该账户自己的已保存会话或终端隐藏输入。对于 BOSS 直聘，命令会通过 HTTPS 验证会话；遇到平台代码 `37` 时，使用 `uv` 临时加载固定版本的 `iv8`、`requests` 与 `paho-mqtt`，在本地 V8 中计算本次挑战并再次验证。整个流程不启动浏览器、不读取浏览器资料，也不会输出 Cookie。首次执行需要已安装 `uv`，并可能下载 Python 运行依赖。其他平台的 `--manual` 只接受终端隐藏输入。
+
+显式提供 `-c` / `--cookie-stdin` 时，`login` 才会从管道或重定向的标准输入读取凭据；若标准输入是终端则会在读取前拒绝，并提示改用隐藏回显的 `--manual`。Cookie 不进入 argv、shell 历史或 JSON 输出。输入必须是一个有效 Cookie，可带一个末尾换行；空输入、多行输入和超长输入都会以不包含原文或路径的通用认证错误拒绝。`--manual` 与 `-c` 互斥，未提供 `-c` 时不会读取管道内容。为避免将一个 Cookie 写入多个平台，stdin 模式要求同时指定一个具体 `--platform`，该参数会在读取任何输入前完成校验。
 
 也可在运行时提供：
 

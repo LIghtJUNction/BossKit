@@ -168,6 +168,9 @@ enum Command {
         platform: Option<PlatformArg>,
         #[arg(long)]
         manual: bool,
+        /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
+        #[arg(short = 'c', long, conflicts_with = "manual")]
+        cookie_stdin: bool,
     },
     /// 对一个本地缓存 BOSS 职位发送平台默认招呼
     Chat {
@@ -1259,11 +1262,26 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.config_reset(key.as_deref())?));
             }
         },
-        Command::Login { platform, manual } => print_json(&Envelope::success(
-            service
-                .login(platform.and_then(PlatformArg::selected), manual)
-                .await?,
-        )),
+        Command::Login {
+            platform,
+            manual,
+            cookie_stdin,
+        } => {
+            let selected_platform = platform.and_then(PlatformArg::selected);
+            if cookie_stdin && selected_platform.is_none() {
+                return Err(BossError::InvalidArgument(
+                    "login --cookie-stdin requires one explicit platform".to_owned(),
+                ));
+            }
+            let cookie = if cookie_stdin {
+                Some(BossService::read_login_cookie_stdin()?)
+            } else {
+                None
+            };
+            print_json(&Envelope::success(
+                service.login(selected_platform, manual, cookie).await?,
+            ));
+        }
         Command::Chat { command } => match command {
             ChatCommand::Greet { job_id, yes } => {
                 print_json(&Envelope::success(service.chat_greet(&job_id, yes)?));

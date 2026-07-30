@@ -5,9 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 #[cfg(unix)]
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
+use std::io::{self, IsTerminal, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -343,6 +343,38 @@ impl AccountAuth {
             Platform::Qiancheng => &mut self.qiancheng,
         }
     }
+}
+
+/// Reads exactly one bounded Cookie from standard input without echoing it.
+pub(crate) fn read_cookie_stdin() -> Result<String, BossError> {
+    if io::stdin().is_terminal() {
+        return Err(auth_error(
+            "terminal credential input is not allowed; use login --manual",
+        ));
+    }
+    let mut input = Vec::with_capacity(MAX_COOKIE_BYTES.min(4096));
+    Read::by_ref(&mut io::stdin().lock())
+        .take(MAX_COOKIE_BYTES as u64 + 3)
+        .read_to_end(&mut input)
+        .map_err(|_| auth_error("unable to read credential input"))?;
+    parse_cookie_stdin(&input)
+}
+
+fn parse_cookie_stdin(input: &[u8]) -> Result<String, BossError> {
+    if input.len() > MAX_COOKIE_BYTES + 2 {
+        return Err(auth_error("credential input is invalid"));
+    }
+    let input =
+        std::str::from_utf8(input).map_err(|_| auth_error("credential input is invalid"))?;
+    let cookie = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\n'))
+        .unwrap_or(input);
+    if cookie.contains(['\r', '\n']) {
+        return Err(auth_error("credential input is invalid"));
+    }
+    validate_cookie(cookie)?;
+    Ok(cookie.to_owned())
 }
 
 /// Reads one manual Cookie with terminal echo disabled, if stdin is a TTY.
@@ -710,6 +742,37 @@ mod tests {
             "a23456789012345678901234567890123",
         ] {
             assert!(validate_account_alias(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn cookie_stdin_accepts_one_cookie_with_optional_line_ending() {
+        for input in [
+            &b"session=fixture"[..],
+            &b"session=fixture\n"[..],
+            &b"session=fixture\r\n"[..],
+        ] {
+            assert_eq!(
+                parse_cookie_stdin(input).expect("valid stdin"),
+                "session=fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_stdin_rejects_empty_multiline_and_oversized_input() {
+        for input in [
+            Vec::new(),
+            b"\n".to_vec(),
+            b"session=first\nsession=second\n".to_vec(),
+            b"session=first\n\n".to_vec(),
+            vec![b'x'; MAX_COOKIE_BYTES + 3],
+        ] {
+            let error = parse_cookie_stdin(&input).expect_err("invalid stdin");
+            assert_eq!(
+                error.to_string(),
+                "authentication setup failed: credential input is invalid"
+            );
         }
     }
 
