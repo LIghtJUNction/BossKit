@@ -36,7 +36,10 @@ const MAX_RESUME_DESCRIPTION_CHARS: usize = 16 * 1024;
 const MAX_RESUME_ITEMS: usize = 20;
 const MAX_RECRUITER_INBOX_RECORDS: usize = 20;
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_FRIEND_SEARCH_PAGES: usize = 5;
+// Keep exact resume/reply UID lookup aligned with recruiter inbox pagination.
+// The inbox can expose up to 50 pages, so stopping at page five silently made
+// later candidates look nonexistent.
+const MAX_FRIEND_SEARCH_PAGES: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecruiterReplyRecord {
