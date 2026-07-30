@@ -44,7 +44,9 @@ boss logout --yes
 
 `login` 使用纯命令行 HTTPS 验证 BOSS 会话；遇到需要本地 V8 挑战计算的响应时，会在本机完成计算后再验证。整个过程不启动浏览器、不读取浏览器资料，也不输出 Cookie。
 
-每个本地账户保存安全元数据角色：旧账户默认 `geek`；可用 `boss login --role recruiter -c` 保存招聘者会话。招聘者只提供 CLI 的只读 `boss recruiter replies --limit 20 --page 1`：它仅访问招聘者好友列表，返回有界、无标识符和联系方式的候选回复状态。方向证据不精确时会明确返回 `unknown`，不会猜测为待处理。招聘者会话不能执行搜索、在线简历或聊天；这些能力保持 `geek` 专用。
+每个本地账户保存安全元数据角色：旧账户默认 `geek`；可用 `boss login --role recruiter -c` 保存招聘者会话。招聘者 CLI 提供有界的 `boss recruiter replies` 状态列表、`boss recruiter inbox --limit 20 --page 1` 会话预览，以及 `boss recruiter resume <UID>` 读取一个候选人的完整在线简历详情（只读、限量、脱敏、不落盘）。预览只保留最近一条文本并脱敏联系方式；返回的会话 UID 仅用于人工确认后的精确回复。发送必须显式执行 `boss recruiter reply <UID> --message '...' --yes`，每次只发一条并通过历史记录核验，不自动发 Offer、不批量群发。
+
+命令默认输出紧凑 Markdown；需要脚本解析时显式加全局 `--json`，例如 `boss --json recruiter resume <UID>`。
 
 ## 本地筛选与人工复核
 

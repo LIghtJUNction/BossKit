@@ -22,6 +22,7 @@ pub mod service;
 pub mod shortlist;
 pub mod watch;
 pub(crate) mod zhipin_direct;
+pub(crate) mod zhipin_http;
 
 pub use ai::{AiProfile, AiProfileStore, AiScore};
 pub use cache::JobCache;

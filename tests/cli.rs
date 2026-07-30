@@ -5,6 +5,7 @@ use tempfile::tempdir;
 fn run_json(data_dir: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", data_dir)
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
@@ -32,6 +33,7 @@ fn run_mcp(data_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
     input.push('\n');
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", data_dir)
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
@@ -51,6 +53,29 @@ fn run_mcp(data_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("jsonrpc"))
         .collect()
+}
+
+#[test]
+fn markdown_is_default_and_json_requires_explicit_flag() {
+    let directory = tempdir().expect("temporary directory");
+    let markdown = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .arg("cities")
+        .output()
+        .expect("markdown output");
+    assert!(markdown.status.success());
+    assert!(String::from_utf8_lossy(&markdown.stdout).starts_with("- **data**:"));
+
+    let json = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["--json", "cities"])
+        .output()
+        .expect("json output");
+    assert!(json.status.success());
+    let value: Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(value["ok"], true);
 }
 
 fn seed_jobs(directory: &std::path::Path) {
@@ -92,6 +117,7 @@ fn boss_only_cli_rejects_platform_flags_and_ignores_legacy_cached_jobs() {
     for command in [["show", "legacy-job"], ["detail", "legacy-job"]] {
         let output = Command::cargo_bin("boss")
             .expect("binary")
+            .arg("--json")
             .env("BOSS_DATA_DIR", directory.path())
             .args(command)
             .output()
@@ -103,6 +129,7 @@ fn boss_only_cli_rejects_platform_flags_and_ignores_legacy_cached_jobs() {
 
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["search", "rust", "--platform", "zhipin"])
         .output()
@@ -160,6 +187,7 @@ fn mcp_stdio_enforces_search_preset_and_watch_relationships() {
 fn invalid_limit_is_a_json_error() {
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .args(["search", "rust", "--limit", "0"])
         .output()
         .expect("run");
@@ -180,6 +208,7 @@ fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
     assert_eq!(accounts["data"]["accounts"][0]["role"], "recruiter");
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["search", "rust"])
         .output()
@@ -189,6 +218,7 @@ fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
     assert_eq!(error["error"]["code"], "invalid_argument");
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["recruiter", "replies", "--limit", "21"])
         .output()
@@ -200,6 +230,7 @@ fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
 fn unknown_command_keeps_the_unlocalized_json_parse_error() {
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .arg("not-a-command")
         .output()
         .expect("run");
@@ -231,6 +262,7 @@ fn data_dir_selects_the_cache_used_by_ls() {
     .expect("write cache");
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["ls", "--limit", "1"])
         .output()
@@ -244,6 +276,7 @@ fn account_resume_show_is_read_only_and_fails_without_a_session_before_network()
     let directory = tempdir().expect("temporary directory");
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .args(["account", "resume", "show"])
@@ -261,6 +294,7 @@ fn chat_rejects_custom_message_arguments_without_echoing_their_value() {
     let secret = "GREETING_SECRET_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .args(["chat", "greet", "zhipin-job", "--message", secret])
         .output()
         .expect("run");
@@ -279,6 +313,7 @@ fn chat_greet_requires_yes_before_using_runtime_credentials() {
     let secret = "wt2=GREETING_COOKIE_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env("BOSS_ZHIPIN_COOKIE", secret)
         .args(["chat", "greet", "zhipin-job"])
@@ -299,6 +334,7 @@ fn chat_send_requires_yes_before_service_discovery_and_never_echoes_text() {
     let secret = "MESSAGE_BODY_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env("BOSS_ZHIPIN_COOKIE", "wt2=COOKIE_MUST_NOT_APPEAR")
         .args(["chat", "send", "zhipin-job", "--message", secret])
@@ -318,6 +354,7 @@ fn chat_send_rejects_invalid_text_before_credentials_without_echoing_it() {
     let secret = "PRIVATE_LINE\nMUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .args(["chat", "send", "zhipin-job", "--message", secret, "--yes"])
@@ -388,6 +425,7 @@ fn chat_history_is_read_only_and_rejects_missing_jobs_before_credentials() {
     let secret = "wt2=HISTORY_COOKIE_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env("BOSS_ZHIPIN_COOKIE", secret)
         .args(["chat", "history", "missing-job"])
@@ -414,6 +452,7 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
     ] {
         let output = Command::cargo_bin("boss")
             .expect("binary")
+            .arg("--json")
             .env("BOSS_DATA_DIR", directory.path())
             .env("BOSS_ZHIPIN_COOKIE", secret)
             .args(args)
@@ -433,6 +472,7 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
     ] {
         let output = Command::cargo_bin("boss")
             .expect("binary")
+            .arg("--json")
             .env("BOSS_DATA_DIR", directory.path())
             .args(args)
             .output()
@@ -447,6 +487,7 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
 fn version_exits_successfully_on_stdout() {
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .arg("--version")
         .output()
         .expect("run");
@@ -479,6 +520,7 @@ fn notification_preview_is_local_and_send_requires_confirmation_or_runtime_confi
 
     let unconfirmed = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .args(["notify", "send", "campaign.ready"])
@@ -491,6 +533,7 @@ fn notification_preview_is_local_and_send_requires_confirmation_or_runtime_confi
 
     let unconfigured = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .args(["notify", "send", "campaign.ready", "--yes"])
@@ -646,6 +689,7 @@ fn search_filter_validation_happens_before_network() {
     let directory = tempdir().expect("temporary directory");
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["search", "rust", "--company", " "])
         .output()
@@ -823,6 +867,7 @@ fn campaign_cli_binds_local_resume_and_records_human_transition_lifecycle() {
     );
     let without_confirmation = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["campaign", "plan", "transition", "zhipin-job", "approved"])
         .output()
@@ -854,6 +899,7 @@ fn campaign_cli_binds_local_resume_and_records_human_transition_lifecycle() {
     );
     let terminal = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args([
             "campaign",
@@ -1047,6 +1093,7 @@ fn campaign_screen_rejects_empty_missing_resume_and_invalid_score() {
     let run_failure = |args: &[&str]| {
         Command::cargo_bin("boss")
             .expect("binary")
+            .arg("--json")
             .env("BOSS_DATA_DIR", directory.path())
             .env_remove("BOSS_ZHIPIN_COOKIE")
             .env_remove("BOSS_ZHILIAN_COOKIE")
@@ -1162,6 +1209,7 @@ fn resume_cli_is_typed_and_requires_deletion_confirmation() {
     assert_eq!(skills["data"]["skills"].as_array().map(Vec::len), Some(1));
     let output = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .args(["resume", "rm", "base"])
         .output()
@@ -1204,6 +1252,7 @@ fn ai_profile_lifecycle_and_confirmation_gate_never_need_a_network() {
 
     let unconfirmed = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_LLM_API_KEY")
         .args(["ai", "draft", "local", "zhipin-job", "candidate"])
@@ -1215,6 +1264,7 @@ fn ai_profile_lifecycle_and_confirmation_gate_never_need_a_network() {
 
     let missing_key = Command::cargo_bin("boss")
         .expect("binary")
+        .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
         .env_remove("BOSS_LLM_API_KEY")
         .args(["ai", "score", "local", "zhipin-job", "candidate", "--yes"])

@@ -1,5 +1,6 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::path::PathBuf;
 
@@ -16,6 +17,8 @@ use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
+
+static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 fn localize_generated_help(help: &str) -> String {
     [
@@ -52,6 +55,9 @@ struct Cli {
     /// 临时选择本次命令使用的本地账户，不更改默认账户
     #[arg(long, global = true, value_name = "ALIAS")]
     account: Option<String>,
+    /// 输出机器可读 JSON；默认输出紧凑 Markdown
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -166,7 +172,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "geek")]
         role: RoleArg,
     },
-    /// Read-only recruiter inbox states; this is intentionally CLI-only
+    /// Recruiter review, full online-resume read, and explicit one-at-a-time replies; CLI-only
     Recruiter {
         #[command(subcommand)]
         command: RecruiterCommand,
@@ -244,6 +250,29 @@ enum RecruiterCommand {
         limit: usize,
         #[arg(long, default_value_t = 1, value_parser = parse_recruiter_page)]
         page: usize,
+    },
+    /// Read exact recruiter conversations and the latest safe text
+    Inbox {
+        #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
+        limit: usize,
+        #[arg(long, default_value_t = 1, value_parser = parse_recruiter_page)]
+        page: usize,
+    },
+    /// Read one exact candidate's full recruiter-side online resume
+    Resume {
+        /// Numeric candidate uid from `boss recruiter inbox`
+        uid: String,
+    },
+    /// Send one explicitly confirmed recruiter follow-up to an exact candidate
+    Reply {
+        /// Numeric candidate uid from `boss recruiter inbox`
+        uid: String,
+        /// One printable single-line follow-up, at most 200 characters
+        #[arg(long)]
+        message: String,
+        /// Confirm this external write
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -848,6 +877,10 @@ impl From<SchemaArg> for SchemaFormat {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    JSON_OUTPUT.store(
+        std::env::args().any(|argument| argument == "--json"),
+        Ordering::Relaxed,
+    );
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
@@ -884,6 +917,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, BossError> {
+    JSON_OUTPUT.store(cli.json, Ordering::Relaxed);
     if matches!(&cli.command, Command::Doctor {}) {
         print_json(&Envelope::success(BossService::doctor_local()));
         return Ok(ExitCode::SUCCESS);
@@ -1281,6 +1315,17 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             RecruiterCommand::Replies { limit, page } => {
                 print_json(&Envelope::success(service.recruiter_replies(limit, page)?));
             }
+            RecruiterCommand::Inbox { limit, page } => {
+                print_json(&Envelope::success(service.recruiter_inbox(limit, page)?));
+            }
+            RecruiterCommand::Resume { uid } => {
+                print_json(&Envelope::success(service.recruiter_resume(&uid)?));
+            }
+            RecruiterCommand::Reply { uid, message, yes } => {
+                print_json(&Envelope::success(
+                    service.recruiter_reply(&uid, &message, yes)?,
+                ));
+            }
         },
         Command::Chat { command } => match command {
             ChatCommand::Greet { job_id, yes } => {
@@ -1431,12 +1476,59 @@ fn print_search_report(report: bosskit::SearchReport) -> bool {
 }
 
 fn print_json(value: &impl Serialize) {
-    match serde_json::to_string(value) {
-        Ok(output) => println!("{output}"),
+    match serde_json::to_value(value) {
+        Ok(value) if JSON_OUTPUT.load(Ordering::Relaxed) => match serde_json::to_string(&value) {
+            Ok(output) => println!("{output}"),
+            Err(error) => println!(
+                "{{\"ok\":false,\"data\":null,\"error\":{{\"code\":\"serialization_error\",\"message\":{},\"recoverable\":false}},\"hints\":[]}}",
+                serde_json::to_string(&error.to_string())
+                    .unwrap_or_else(|_| "\"serialization failed\"".to_owned())
+            ),
+        },
+        Ok(value) => println!("{}", render_markdown(&value)),
         Err(error) => println!(
-            "{{\"ok\":false,\"data\":null,\"error\":{{\"code\":\"serialization_error\",\"message\":{},\"recoverable\":false}},\"hints\":[]}}",
-            serde_json::to_string(&error.to_string())
-                .unwrap_or_else(|_| "\"serialization failed\"".to_owned())
+            "- **ok**: false\n- **error**: serialization_error\n- **message**: {}",
+            markdown_scalar(&serde_json::Value::String(error.to_string()))
         ),
+    }
+}
+
+fn render_markdown(value: &serde_json::Value) -> String {
+    render_markdown_value(value, 0)
+}
+
+fn render_markdown_value(value: &serde_json::Value, indent: usize) -> String {
+    let prefix = " ".repeat(indent);
+    match value {
+        serde_json::Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| match value {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => format!(
+                    "{prefix}- **{key}**:\n{}",
+                    render_markdown_value(value, indent + 2)
+                ),
+                _ => format!("{prefix}- **{key}**: {}", markdown_scalar(value)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Array(array) => array
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                    format!("{prefix}-\n{}", render_markdown_value(value, indent + 2))
+                }
+                _ => format!("{prefix}- {}", markdown_scalar(value)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("{prefix}{}", markdown_scalar(value)),
+    }
+}
+
+fn markdown_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.replace('\n', "<br>").replace('\r', ""),
+        serde_json::Value::Null => "-".to_owned(),
+        _ => value.to_string(),
     }
 }

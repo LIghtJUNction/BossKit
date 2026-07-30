@@ -11,7 +11,8 @@ BossKit is a BOSS 直聘-only Rust 2024 CLI and MCP product. It provides browser
 | Authentication | `boss login --role geek\|recruiter`, `status`, `logout` | Per-account safe role metadata; legacy accounts default to `geek`; no credential MCP tool |
 | Account resume | `boss account resume show` | Bounded, privacy-filtered read only; no edit or submission |
 | Explicit chat | `boss chat greet/send ... --yes` | One exact cached BOSS job, no resume, no batch or automated conversation |
-| Recruiter reply state | CLI-only `boss recruiter replies --limit 1..20 --page 1..50` | Recruiter-only fixed friend-list GET; bounded redacted records, no identifiers/contact URLs, unknown direction is never guessed |
+| Recruiter review/reply/resume | CLI-only `boss recruiter replies`, `boss recruiter inbox`, `boss recruiter resume <uid>`, `boss recruiter reply <uid> --message ... --yes` | Bounded recruiter friend-list/history/detail reads; resume detail is read-only, bounded, contact-redacted, and ephemeral; each write is confirmed and history-verified; no bulk Offer or batch send |
+| CLI output | Markdown by default; `--json` opt-in | Compact human-readable output by default; machine-readable JSON only when explicitly requested |
 | MCP | `boss mcp` | MCP 2025-03-26 stdio with strict schemas; no credentials or account controls |
 
 ## Migration

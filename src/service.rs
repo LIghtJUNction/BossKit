@@ -480,6 +480,91 @@ impl BossService {
         }))
     }
 
+    /// Reads exact recruiter conversations and latest redacted text for review.
+    pub fn recruiter_inbox(&mut self, limit: usize, page: usize) -> Result<Value, BossError> {
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter inbox requires a selected saved recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter inbox requires a selected saved recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page)?;
+        Ok(json!({
+            "action":"recruiter_inbox",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "page":page,
+            "limit":limit,
+            "count":records.len(),
+            "records":records,
+            "network_checked":true,
+            "remote_modified":false
+        }))
+    }
+
+    /// Reads one exact candidate's bounded full online resume detail without persisting it.
+    pub fn recruiter_resume(&mut self, uid: &str) -> Result<Value, BossError> {
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter resume requires a selected recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter resume requires a selected recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let resume = crate::zhipin_http::recruiter_resume(&cookie, uid)?;
+        Ok(json!({
+            "action":"recruiter_resume",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "resume":resume,
+            "network_checked":true,
+            "remote_modified":false,
+            "persisted":false
+        }))
+    }
+
+    /// Sends one explicitly confirmed recruiter follow-up and verifies it.
+    pub fn recruiter_reply(
+        &mut self,
+        uid: &str,
+        message: &str,
+        yes: bool,
+    ) -> Result<Value, BossError> {
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "recruiter reply requires --yes".to_owned(),
+            ));
+        }
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter reply requires a selected recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter reply requires a selected recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let sent = crate::zhipin_http::recruiter_send(&cookie, uid, message)?;
+        Ok(json!({
+            "action":"recruiter_reply",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "uid":uid,
+            "state":sent.state,
+            "verification":sent.verification,
+            "network_checked":true,
+            "remote_modified":sent.state == "message_verified"
+        }))
+    }
+
     /// Reads the current online BOSS Zhipin resume without modifying it.
     pub fn account_resume_show(&mut self) -> Result<Value, BossError> {
         self.require_geek("account resume show")?;
