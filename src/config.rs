@@ -7,35 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::data::atomic_write;
-use crate::{BossError, DataPaths, Platform};
-
-/// Configured default platform selection.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigPlatform {
-    /// Search all registered providers.
-    #[default]
-    All,
-    /// BOSS 直聘 only.
-    Zhipin,
-    /// 智联招聘 only.
-    Zhilian,
-    /// 前程无忧 / 51job only.
-    Qiancheng,
-}
-
-impl ConfigPlatform {
-    /// Converts to an optional provider selector.
-    #[must_use]
-    pub const fn selected(self) -> Option<Platform> {
-        match self {
-            Self::All => None,
-            Self::Zhipin => Some(Platform::Zhipin),
-            Self::Zhilian => Some(Platform::Zhilian),
-            Self::Qiancheng => Some(Platform::Qiancheng),
-        }
-    }
-}
+use crate::{BossError, DataPaths};
 
 /// Supported log verbosity.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -64,8 +36,6 @@ pub enum OperatingMode {
 /// Fully merged effective configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppConfig {
-    /// Default provider selection.
-    pub platform: ConfigPlatform,
     /// Provider request timeout.
     pub request_timeout_secs: u64,
     /// Default result count.
@@ -79,7 +49,6 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            platform: ConfigPlatform::All,
             request_timeout_secs: 15,
             page_size: 20,
             operating_mode: OperatingMode::Assisted,
@@ -91,11 +60,25 @@ impl Default for AppConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserOverrides {
-    platform: Option<ConfigPlatform>,
+    #[serde(
+        default,
+        rename = "platform",
+        deserialize_with = "discard_legacy_platform",
+        skip_serializing
+    )]
+    _legacy_platform: bool,
     request_timeout_secs: Option<u64>,
     page_size: Option<usize>,
     operating_mode: Option<OperatingMode>,
     log_level: Option<LogLevel>,
+}
+
+fn discard_legacy_platform<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 /// One effective configuration value and its source.
@@ -152,7 +135,6 @@ impl ConfigStore {
     pub fn effective(&self) -> AppConfig {
         let defaults = AppConfig::default();
         AppConfig {
-            platform: self.overrides.platform.unwrap_or(defaults.platform),
             request_timeout_secs: self
                 .overrides
                 .request_timeout_secs
@@ -169,7 +151,6 @@ impl ConfigStore {
     /// Lists every safe public key.
     pub fn list(&self) -> Result<Vec<ConfigEntry>, BossError> {
         [
-            "platform",
             "request_timeout_secs",
             "page_size",
             "operating_mode",
@@ -189,9 +170,6 @@ impl ConfigStore {
     pub fn set(&mut self, key: &str, raw: &str) -> Result<ConfigChange, BossError> {
         let previous = self.get(key)?.value;
         match key {
-            "platform" => {
-                self.overrides.platform = Some(parse_json_enum(raw, key)?);
-            }
             "request_timeout_secs" => {
                 self.overrides.request_timeout_secs = Some(parse_positive(raw, key)?);
             }
@@ -219,7 +197,6 @@ impl ConfigStore {
         if let Some(key) = key {
             let previous = self.get(key)?.value;
             match key {
-                "platform" => self.overrides.platform = None,
                 "request_timeout_secs" => self.overrides.request_timeout_secs = None,
                 "page_size" => self.overrides.page_size = None,
                 "operating_mode" => self.overrides.operating_mode = None,
@@ -249,7 +226,6 @@ impl ConfigStore {
     fn entry(&self, key: &str) -> Result<ConfigEntry, BossError> {
         let config = self.effective();
         let (value, user) = match key {
-            "platform" => (json!(config.platform), self.overrides.platform.is_some()),
             "request_timeout_secs" => (
                 json!(config.request_timeout_secs),
                 self.overrides.request_timeout_secs.is_some(),
@@ -264,7 +240,6 @@ impl ConfigStore {
         };
         Ok(ConfigEntry {
             key: match key {
-                "platform" => "platform",
                 "request_timeout_secs" => "request_timeout_secs",
                 "page_size" => "page_size",
                 "operating_mode" => "operating_mode",

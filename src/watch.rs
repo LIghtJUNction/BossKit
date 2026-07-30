@@ -147,12 +147,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{PlatformSelector, SearchFilters};
+    use crate::SearchFilters;
 
     fn spec() -> SearchSpec {
         SearchSpec {
             query: "rust".to_owned(),
-            platform: PlatformSelector::All,
             city: None,
             page: 1,
             limit: 20,

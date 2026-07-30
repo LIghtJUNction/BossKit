@@ -79,10 +79,20 @@ impl Default for AuthDocument {
 struct AccountAuth {
     #[serde(default)]
     zhipin: StoredAuth,
-    #[serde(default)]
-    zhilian: StoredAuth,
-    #[serde(default)]
-    qiancheng: StoredAuth,
+    #[serde(
+        default,
+        rename = "zhilian",
+        deserialize_with = "discard_legacy_entry",
+        skip_serializing
+    )]
+    _legacy_zhilian: (),
+    #[serde(
+        default,
+        rename = "qiancheng",
+        deserialize_with = "discard_legacy_entry",
+        skip_serializing
+    )]
+    _legacy_qiancheng: (),
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -90,10 +100,14 @@ struct AccountAuth {
 struct LegacyAuthDocument {
     #[serde(default)]
     zhipin: StoredAuth,
-    #[serde(default)]
-    zhilian: StoredAuth,
-    #[serde(default)]
-    qiancheng: StoredAuth,
+    #[serde(default, rename = "zhilian", deserialize_with = "discard_legacy_entry")]
+    _legacy_zhilian: (),
+    #[serde(
+        default,
+        rename = "qiancheng",
+        deserialize_with = "discard_legacy_entry"
+    )]
+    _legacy_qiancheng: (),
 }
 
 #[derive(Deserialize)]
@@ -101,6 +115,14 @@ struct LegacyAuthDocument {
 enum SerializedAuthDocument {
     Current(AuthDocument),
     Legacy(LegacyAuthDocument),
+}
+
+fn discard_legacy_entry<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -173,8 +195,7 @@ impl AuthStore {
     pub const fn cookie_env(platform: Platform) -> &'static str {
         match platform {
             Platform::Zhipin => "BOSS_ZHIPIN_COOKIE",
-            Platform::Zhilian => "BOSS_ZHILIAN_COOKIE",
-            Platform::Qiancheng => "BOSS_QIANCHENG_COOKIE",
+            Platform::Zhilian | Platform::Qiancheng => "BOSS_ZHIPIN_COOKIE",
         }
     }
 
@@ -305,11 +326,10 @@ impl AuthStore {
     }
 
     fn has_legacy_credential_file(&self) -> bool {
-        self.document.accounts.values().any(|account| {
-            [&account.zhipin, &account.zhilian, &account.qiancheng]
-                .into_iter()
-                .any(|entry| entry.legacy_credential_file)
-        })
+        self.document
+            .accounts
+            .values()
+            .any(|account| account.zhipin.legacy_credential_file)
     }
 
     fn persist(&mut self) -> Result<(), BossError> {
@@ -331,16 +351,14 @@ impl AccountAuth {
     fn entry(&self, platform: Platform) -> &StoredAuth {
         match platform {
             Platform::Zhipin => &self.zhipin,
-            Platform::Zhilian => &self.zhilian,
-            Platform::Qiancheng => &self.qiancheng,
+            Platform::Zhilian | Platform::Qiancheng => &self.zhipin,
         }
     }
 
     fn entry_mut(&mut self, platform: Platform) -> &mut StoredAuth {
         match platform {
             Platform::Zhipin => &mut self.zhipin,
-            Platform::Zhilian => &mut self.zhilian,
-            Platform::Qiancheng => &mut self.qiancheng,
+            Platform::Zhilian | Platform::Qiancheng => &mut self.zhipin,
         }
     }
 }
@@ -448,8 +466,7 @@ fn load_document(directory: &Path, path: &Path) -> Result<Option<(AuthDocument, 
         SerializedAuthDocument::Legacy(legacy) => {
             let account = AccountAuth {
                 zhipin: legacy.zhipin,
-                zhilian: legacy.zhilian,
-                qiancheng: legacy.qiancheng,
+                ..AccountAuth::default()
             };
             (
                 AuthDocument {
@@ -502,14 +519,11 @@ fn document_is_valid(document: &AuthDocument) -> bool {
         && valid_account_alias(&document.selected_account)
         && document.accounts.iter().all(|(alias, account)| {
             valid_account_alias(alias)
-                && [&account.zhipin, &account.zhilian, &account.qiancheng]
-                    .into_iter()
-                    .all(|entry| {
-                        entry
-                            .cookie
-                            .as_deref()
-                            .is_none_or(|cookie| validate_cookie(cookie).is_ok())
-                    })
+                && account
+                    .zhipin
+                    .cookie
+                    .as_deref()
+                    .is_none_or(|cookie| validate_cookie(cookie).is_ok())
         })
 }
 
@@ -698,13 +712,15 @@ mod tests {
             rewritten["accounts"][DEFAULT_ACCOUNT]["zhipin"]["cookie"],
             "session=zhipin-fixture"
         );
-        assert_eq!(
-            rewritten["accounts"][DEFAULT_ACCOUNT]["zhilian"]["cookie"],
-            "session=zhilian-fixture"
+        assert!(
+            rewritten["accounts"][DEFAULT_ACCOUNT]
+                .get("zhilian")
+                .is_none()
         );
-        assert_eq!(
-            rewritten["accounts"][DEFAULT_ACCOUNT]["qiancheng"]["cookie"],
-            "session=qiancheng-fixture"
+        assert!(
+            rewritten["accounts"][DEFAULT_ACCOUNT]
+                .get("qiancheng")
+                .is_none()
         );
         assert!(
             rewritten["accounts"][DEFAULT_ACCOUNT]["zhipin"]
@@ -783,14 +799,14 @@ mod tests {
         let paths = DataPaths::new(directory.path());
         let mut store = AuthStore::from_paths(&paths);
         store
-            .store_session(Platform::Zhilian, "session=default-fixture".to_owned())
+            .store_session(Platform::Zhipin, "session=default-fixture".to_owned())
             .expect("store default");
 
         store.use_account("work").expect("select work");
         assert!(!store.allows_environment_cookie());
-        assert!(!store.has_session(Platform::Zhilian));
+        assert!(!store.has_session(Platform::Zhipin));
         store
-            .store_session(Platform::Zhilian, "session=work-fixture".to_owned())
+            .store_session(Platform::Zhipin, "session=work-fixture".to_owned())
             .expect("store work");
 
         store
@@ -798,14 +814,14 @@ mod tests {
             .expect("select default");
         assert!(store.allows_environment_cookie());
         assert_eq!(
-            store.session_cookie(Platform::Zhilian).as_deref(),
+            store.session_cookie(Platform::Zhipin).as_deref(),
             Some("session=default-fixture")
         );
         store
             .select_runtime_account("work")
             .expect("select work override");
         assert_eq!(
-            store.session_cookie(Platform::Zhilian).as_deref(),
+            store.session_cookie(Platform::Zhipin).as_deref(),
             Some("session=work-fixture")
         );
         assert_eq!(store.default_account(), "work");
@@ -813,7 +829,7 @@ mod tests {
         let reloaded = AuthStore::from_paths(&paths);
         assert_eq!(reloaded.active_account(), "work");
         assert_eq!(
-            reloaded.session_cookie(Platform::Zhilian).as_deref(),
+            reloaded.session_cookie(Platform::Zhipin).as_deref(),
             Some("session=work-fixture")
         );
     }

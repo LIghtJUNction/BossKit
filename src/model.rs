@@ -4,54 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::BossError;
 
-/// Supported job platform selector.
+/// The fixed BOSS 直聘 source marker retained in local records.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     /// BOSS 直聘.
     Zhipin,
-    /// 智联招聘.
+    /// Legacy cached value; never registered or exposed by the BOSS-only product.
     Zhilian,
-    /// 前程无忧 / 51job.
+    /// Legacy cached value; never registered or exposed by the BOSS-only product.
     Qiancheng,
-}
-
-/// Owned platform selector used by saved local search specifications.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformSelector {
-    /// Search all registered providers.
-    All,
-    /// Search BOSS 直聘.
-    Zhipin,
-    /// Search 智联招聘.
-    Zhilian,
-    /// Search 前程无忧.
-    Qiancheng,
-}
-
-impl PlatformSelector {
-    /// Converts the owned selector to the service's optional platform.
-    #[must_use]
-    pub const fn selected(self) -> Option<Platform> {
-        match self {
-            Self::All => None,
-            Self::Zhipin => Some(Platform::Zhipin),
-            Self::Zhilian => Some(Platform::Zhilian),
-            Self::Qiancheng => Some(Platform::Qiancheng),
-        }
-    }
-}
-
-impl From<Option<Platform>> for PlatformSelector {
-    fn from(value: Option<Platform>) -> Self {
-        match value {
-            None => Self::All,
-            Some(Platform::Zhipin) => Self::Zhipin,
-            Some(Platform::Zhilian) => Self::Zhilian,
-            Some(Platform::Qiancheng) => Self::Qiancheng,
-        }
-    }
 }
 
 impl Platform {
@@ -70,8 +32,7 @@ impl Platform {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Zhipin => "BOSS 直聘",
-            Self::Zhilian => "智联招聘",
-            Self::Qiancheng => "前程无忧 / 51job",
+            Self::Zhilian | Self::Qiancheng => "legacy unsupported provider",
         }
     }
 }
@@ -176,8 +137,6 @@ pub struct SearchFilters {
 pub struct SearchSpec {
     /// Non-empty search query.
     pub query: String,
-    /// All providers or one selected provider.
-    pub platform: PlatformSelector,
     /// Optional shared or provider-native city.
     pub city: Option<String>,
     /// One-based result page.
@@ -193,8 +152,6 @@ pub struct SearchSpec {
 pub struct SearchSpecPatch {
     /// Explicit query.
     pub query: Option<String>,
-    /// Explicit platform selector.
-    pub platform: Option<PlatformSelector>,
     /// Explicit city.
     pub city: Option<String>,
     /// Explicit page.

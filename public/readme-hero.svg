@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="280" viewBox="0 0 960 280" role="img" aria-labelledby="title desc">
+  <title id="title">BossKit for BOSS 直聘</title>
+  <desc id="desc">A BOSS-only CLI and MCP tool for deterministic local screening and human review.</desc>
+  <rect width="960" height="280" rx="24" fill="#101827"/>
+  <path d="M676 0h284v280H579z" fill="#132a26"/>
+  <circle cx="110" cy="112" r="56" fill="#16a34a"/>
+  <path d="M80 112h60M110 82v60" fill="none" stroke="#fff" stroke-linecap="round" stroke-width="12"/>
+  <text x="196" y="91" fill="#fff" font-family="system-ui, sans-serif" font-size="46" font-weight="700">BossKit</text>
+  <text x="196" y="130" fill="#a7f3d0" font-family="system-ui, sans-serif" font-size="23">BOSS 直聘 · CLI + MCP</text>
+  <text x="196" y="169" fill="#cbd5e1" font-family="system-ui, sans-serif" font-size="18">确定性本地筛选，人工掌握每一步。</text>
+  <g font-family="system-ui, sans-serif" font-size="17" font-weight="650">
+    <rect x="55" y="212" width="144" height="40" rx="20" fill="#1f2937"/><text x="81" y="238" fill="#d1fae5">本地筛选</text>
+    <rect x="214" y="212" width="144" height="40" rx="20" fill="#1f2937"/><text x="240" y="238" fill="#d1fae5">人工复核</text>
+    <rect x="373" y="212" width="144" height="40" rx="20" fill="#166534"/><text x="402" y="238" fill="#fff">免费开源</text>
+  </g>
+  <g transform="translate(714 56)" font-family="system-ui, sans-serif">
+    <rect width="178" height="168" rx="18" fill="#0f211e" stroke="#2e5b50"/>
+    <circle cx="30" cy="31" r="8" fill="#34d399"/>
+    <text x="50" y="37" fill="#ecfdf5" font-size="16" font-weight="700">HUMAN REVIEW</text>
+    <path d="M28 72h122M28 102h94M28 132h112" stroke="#3b665b" stroke-linecap="round" stroke-width="9"/>
+    <path d="m133 128 10 10 21-25" fill="none" stroke="#6ee7b7" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+  </g>
+</svg>

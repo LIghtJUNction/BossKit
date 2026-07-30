@@ -119,12 +119,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{PlatformSelector, SearchFilters};
+    use crate::SearchFilters;
 
     fn spec(query: &str) -> SearchSpec {
         SearchSpec {
             query: query.to_owned(),
-            platform: PlatformSelector::All,
             city: None,
             page: 1,
             limit: 20,

@@ -10,7 +10,7 @@ use bosskit::campaign::{
 use bosskit::export::{ExportFormat, ExportOptions, ExportSource};
 use bosskit::model::ErrorBody;
 use bosskit::schema::SchemaFormat;
-use bosskit::{BossError, BossService, Envelope, Platform, PlatformSelector, SearchSpecPatch};
+use bosskit::{BossError, BossService, Envelope, SearchSpecPatch};
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -44,7 +44,7 @@ fn localize_generated_help(help: &str) -> String {
 #[command(
     name = "boss",
     version,
-    about = "BossKit — 多平台招聘求职辅助工具",
+    about = "BossKit — BOSS 直聘命令行求职辅助工具",
     arg_required_else_help = true
 )]
 struct Cli {
@@ -57,9 +57,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 列出已注册平台
-    Platforms,
-    /// 列出三个平台共同支持的逻辑城市
+    /// 列出 BOSS 直聘支持的逻辑城市
     Cities,
     /// 搜索公开职位
     Search {
@@ -120,8 +118,6 @@ enum Command {
     },
     /// 列出本地缓存职位
     Ls {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
         #[arg(long)]
         limit: Option<NonZeroUsize>,
     },
@@ -135,8 +131,6 @@ enum Command {
     },
     /// 列出 BossKit 本地搜索审计历史
     History {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
         #[arg(long, default_value = "20")]
         limit: NonZeroUsize,
     },
@@ -144,8 +138,6 @@ enum Command {
     Export {
         #[arg(long, value_enum, default_value = "jobs")]
         source: ExportSourceArg,
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
         #[arg(long, default_value = "20")]
         limit: NonZeroUsize,
         #[arg(long, value_enum, default_value = "json")]
@@ -164,8 +156,6 @@ enum Command {
     },
     /// 保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话
     Login {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
         #[arg(long)]
         manual: bool,
         /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
@@ -179,21 +169,13 @@ enum Command {
     },
     /// 撤销本地保存的登录会话
     Logout {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
         #[arg(long)]
         yes: bool,
     },
     /// 检查本地 Cookie 环境状态，不联网
-    Status {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
-    },
+    Status {},
     /// 运行严格本地诊断，不联网
-    Doctor {
-        #[arg(long, value_enum)]
-        platform: Option<PlatformArg>,
-    },
+    Doctor {},
     /// 输出共享能力 Schema
     Schema {
         #[arg(long, value_enum)]
@@ -276,8 +258,6 @@ struct SearchOptions {
     query: Option<String>,
     #[arg(long)]
     preset: Option<String>,
-    #[arg(long, value_enum)]
-    platform: Option<PlatformArg>,
     #[arg(long)]
     city: Option<String>,
     #[arg(long)]
@@ -472,8 +452,6 @@ enum CampaignPlanCommand {
 
 #[derive(Clone, Args)]
 struct SearchFlags {
-    #[arg(long, value_enum)]
-    platform: Option<PlatformArg>,
     #[arg(long)]
     page: Option<NonZeroU32>,
     #[arg(long)]
@@ -680,14 +658,6 @@ enum ShortlistCommand {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum PlatformArg {
-    Zhipin,
-    Zhilian,
-    Qiancheng,
-    All,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
 enum BlacklistKindArg {
     Company,
     Description,
@@ -700,26 +670,6 @@ impl From<BlacklistKindArg> for BlacklistKind {
             BlacklistKindArg::Company => Self::Company,
             BlacklistKindArg::Description => Self::Description,
             BlacklistKindArg::Job => Self::Job,
-        }
-    }
-}
-
-impl PlatformArg {
-    const fn selected(self) -> Option<Platform> {
-        match self {
-            Self::Zhipin => Some(Platform::Zhipin),
-            Self::Zhilian => Some(Platform::Zhilian),
-            Self::Qiancheng => Some(Platform::Qiancheng),
-            Self::All => None,
-        }
-    }
-
-    const fn selector(self) -> PlatformSelector {
-        match self {
-            Self::Zhipin => PlatformSelector::Zhipin,
-            Self::Zhilian => PlatformSelector::Zhilian,
-            Self::Qiancheng => PlatformSelector::Qiancheng,
-            Self::All => PlatformSelector::All,
         }
     }
 }
@@ -877,10 +827,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, BossError> {
-    if let Command::Doctor { platform } = &cli.command {
-        print_json(&Envelope::success(BossService::doctor_local(
-            platform.and_then(PlatformArg::selected),
-        )));
+    if matches!(&cli.command, Command::Doctor {}) {
+        print_json(&Envelope::success(BossService::doctor_local()));
         return Ok(ExitCode::SUCCESS);
     }
     if let Command::Chat { command } = &cli.command {
@@ -903,7 +851,6 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
     }
     let mut service = BossService::discover_for_account(cli.account.as_deref())?;
     match cli.command {
-        Command::Platforms => print_json(&Envelope::success(service.platforms())),
         Command::Cities => print_json(&Envelope::success(service.cities())),
         Command::Search { options } => {
             let preset = options.preset.clone();
@@ -1216,12 +1163,10 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         Command::Clean { target, yes } => {
             print_json(&Envelope::success(service.clean(target.as_str(), yes)?));
         }
-        Command::Ls { platform, limit } => {
+        Command::Ls { limit } => {
             let defaults = service.effective_config();
-            let platform =
-                platform.map_or_else(|| defaults.platform.selected(), PlatformArg::selected);
             let limit = limit.map_or(defaults.page_size, NonZeroUsize::get);
-            print_json(&Envelope::success(service.list(platform, limit)?));
+            print_json(&Envelope::success(service.list(None, limit)?));
         }
         Command::Show { id } => match service.show(&id)? {
             Some(job) => print_json(&Envelope::success(job)),
@@ -1230,12 +1175,11 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         Command::Detail { id, refresh } => {
             print_json(&Envelope::success(service.detail(&id, refresh).await?));
         }
-        Command::History { platform, limit } => print_json(&Envelope::success(
-            service.history(platform.and_then(PlatformArg::selected), limit.get())?,
-        )),
+        Command::History { limit } => {
+            print_json(&Envelope::success(service.history(None, limit.get())?))
+        }
         Command::Export {
             source,
-            platform,
             limit,
             format,
             output,
@@ -1243,7 +1187,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             force,
         } => print_json(&Envelope::success(service.export(ExportOptions {
             source: source.into(),
-            platform: platform.and_then(PlatformArg::selected),
+            platform: None,
             limit: limit.get(),
             format: format.into(),
             output,
@@ -1263,24 +1207,15 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             }
         },
         Command::Login {
-            platform,
             manual,
             cookie_stdin,
         } => {
-            let selected_platform = platform.and_then(PlatformArg::selected);
-            if cookie_stdin && selected_platform.is_none() {
-                return Err(BossError::InvalidArgument(
-                    "login --cookie-stdin requires one explicit platform".to_owned(),
-                ));
-            }
             let cookie = if cookie_stdin {
                 Some(BossService::read_login_cookie_stdin()?)
             } else {
                 None
             };
-            print_json(&Envelope::success(
-                service.login(selected_platform, manual, cookie).await?,
-            ));
+            print_json(&Envelope::success(service.login(manual, cookie).await?));
         }
         Command::Chat { command } => match command {
             ChatCommand::Greet { job_id, yes } => {
@@ -1304,15 +1239,9 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.chat_inbox(&job_ids)?));
             }
         },
-        Command::Logout { platform, yes } => print_json(&Envelope::success(
-            service.logout(platform.and_then(PlatformArg::selected), yes)?,
-        )),
-        Command::Status { platform } => print_json(&Envelope::success(
-            service.status(platform.and_then(PlatformArg::selected)),
-        )),
-        Command::Doctor { platform } => print_json(&Envelope::success(
-            service.doctor(platform.and_then(PlatformArg::selected)),
-        )),
+        Command::Logout { yes } => print_json(&Envelope::success(service.logout(yes)?)),
+        Command::Status {} => print_json(&Envelope::success(service.status())),
+        Command::Doctor {} => print_json(&Envelope::success(service.doctor())),
         Command::Schema { format } => {
             print_json(&Envelope::success(service.schema(format.into())?));
         }
@@ -1387,7 +1316,6 @@ fn parse_campaign_field(value: &str) -> Result<CampaignField, BossError> {
 fn patch_from_options(options: SearchOptions) -> SearchSpecPatch {
     SearchSpecPatch {
         query: options.query,
-        platform: options.platform.map(PlatformArg::selector),
         city: options.city,
         page: options.page.map(NonZeroU32::get),
         limit: options.limit.map(NonZeroU32::get),
@@ -1407,7 +1335,6 @@ fn patch_from_flags(
 ) -> SearchSpecPatch {
     SearchSpecPatch {
         query,
-        platform: flags.platform.map(PlatformArg::selector),
         city,
         page: flags.page.map(NonZeroU32::get),
         limit: flags.limit.map(NonZeroU32::get),

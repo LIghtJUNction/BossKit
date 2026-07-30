@@ -30,17 +30,15 @@ use crate::notify::{
     webhook_url_from_environment,
 };
 use crate::preset::{Preset, PresetStore};
-use crate::provider::{
-    JobProvider, QianchengProvider, SearchRequest, ZhilianProvider, ZhipinProvider, http_client,
-};
+use crate::provider::{JobProvider, SearchRequest, ZhipinProvider, http_client};
 use crate::reply::{ReplyMatch, ReplyRule, ReplyStore};
 use crate::resume::{ResumeDiff, ResumeDocument, ResumeStore, export_document};
 use crate::schema::{SchemaFormat, render};
 use crate::shortlist::{ShortlistComparison, ShortlistEntry, ShortlistStore};
 use crate::watch::{Watch, WatchStore};
 use crate::{
-    BossError, DataPaths, Job, JobCache, Platform, PlatformInfo, PlatformSelector, SearchFilters,
-    SearchReport, SearchSpec,
+    BossError, DataPaths, Job, JobCache, Platform, PlatformInfo, SearchFilters, SearchReport,
+    SearchSpec,
 };
 
 const MAX_RESUME_IMPORT_BYTES: usize = 2 * 1024 * 1024;
@@ -126,7 +124,7 @@ pub struct BossService {
 }
 
 impl BossService {
-    /// Constructs the service with all three real read-only adapters.
+    /// Constructs the service with the BOSS 直聘 read-only adapter.
     pub fn discover() -> Result<Self, BossError> {
         Self::from_paths(DataPaths::discover())
     }
@@ -148,8 +146,6 @@ impl BossService {
             auth.select_runtime_account(account)?;
         }
         let zhipin_cookie = auth.runtime_cookie(Platform::Zhipin);
-        let zhilian_cookie = auth.runtime_cookie(Platform::Zhilian);
-        let qiancheng_cookie = auth.runtime_cookie(Platform::Qiancheng);
         Ok(Self {
             cache: JobCache::from_paths(&paths),
             shortlist: ShortlistStore::from_paths(&paths),
@@ -163,11 +159,7 @@ impl BossService {
             paths,
             config,
             auth,
-            providers: vec![
-                Box::new(ZhipinProvider::new(client.clone(), zhipin_cookie)),
-                Box::new(ZhilianProvider::new(client.clone(), zhilian_cookie)),
-                Box::new(QianchengProvider::new(client, qiancheng_cookie)),
-            ],
+            providers: vec![Box::new(ZhipinProvider::new(client, zhipin_cookie))],
         })
     }
 
@@ -200,7 +192,7 @@ impl BossService {
     /// Returns all registered platforms.
     #[must_use]
     pub fn platforms(&self) -> Vec<PlatformInfo> {
-        [Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng]
+        [Platform::Zhipin]
             .into_iter()
             .map(|platform| PlatformInfo {
                 platform: platform.as_str(),
@@ -230,12 +222,11 @@ impl BossService {
         let accounts: Vec<Value> = aliases
             .iter()
             .map(|alias| {
-                let sessions: Vec<&str> =
-                    [Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng]
-                        .into_iter()
-                        .filter(|platform| self.auth.account_has_session(alias, *platform))
-                        .map(Platform::as_str)
-                        .collect();
+                let sessions: Vec<&str> = [Platform::Zhipin]
+                    .into_iter()
+                    .filter(|platform| self.auth.account_has_session(alias, *platform))
+                    .map(Platform::as_str)
+                    .collect();
                 json!({
                     "alias":alias,
                     "selected":*alias == self.auth.default_account(),
@@ -272,8 +263,8 @@ impl BossService {
 
     /// Reports configured authentication state without exposing values or paths.
     #[must_use]
-    pub fn status(&self, platform: Option<Platform>) -> Value {
-        let providers: Vec<Value> = selected_platforms(platform)
+    pub fn status(&self) -> Value {
+        let providers: Vec<Value> = [Platform::Zhipin]
             .into_iter()
             .map(|selected| {
                 let variable = AuthStore::cookie_env(selected);
@@ -300,7 +291,6 @@ impl BossService {
             "network_checked":false,
             "account":self.auth.active_account(),
             "selected_account":self.auth.default_account(),
-            "configured_default":self.config.effective().platform,
             "auth_store":self.auth.health().as_str(),
             "providers":providers
         })
@@ -308,7 +298,7 @@ impl BossService {
 
     /// Runs strictly local diagnostics and returns errors as structured checks.
     #[must_use]
-    pub fn doctor(&self, platform: Option<Platform>) -> Value {
+    pub fn doctor(&self) -> Value {
         diagnose_local(
             &self.paths,
             &self.cache,
@@ -316,25 +306,23 @@ impl BossService {
             &self.reply_rules,
             &self.auth,
             self.providers.len(),
-            platform,
         )
     }
 
     /// Runs local diagnostics even when the persisted configuration is invalid.
     #[must_use]
-    pub fn doctor_local(platform: Option<Platform>) -> Value {
+    pub fn doctor_local() -> Value {
         let paths = DataPaths::discover();
         let cache = JobCache::from_paths(&paths);
         let shortlist = ShortlistStore::from_paths(&paths);
         let reply_rules = ReplyStore::from_paths(&paths);
         let auth = AuthStore::from_paths(&paths);
-        diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 3, platform)
+        diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 1)
     }
 
     /// Resolves a local Cookie source and verifies Zhipin directly.
     pub async fn login(
         &mut self,
-        platform: Option<Platform>,
         manual: bool,
         cookie: Option<String>,
     ) -> Result<Value, BossError> {
@@ -343,19 +331,13 @@ impl BossService {
                 "login --manual conflicts with --cookie-stdin".to_owned(),
             ));
         }
-        if cookie.is_some() && platform.is_none() {
-            return Err(BossError::InvalidArgument(
-                "login --cookie-stdin requires one explicit platform".to_owned(),
-            ));
-        }
         if let Some(cookie) = cookie.as_deref() {
             validate_cookie(cookie)?;
         }
-        let mut cookie = cookie;
-        let mut results = Vec::new();
-        for selected in selected_platforms(platform) {
-            results.push(self.login_platform(selected, manual, cookie.take()).await?);
-        }
+        let results = vec![
+            self.login_platform(Platform::Zhipin, manual, cookie)
+                .await?,
+        ];
         let direct_verified = results
             .iter()
             .any(|result| result.get("state").and_then(Value::as_str) == Some("direct_verified"));
@@ -372,13 +354,13 @@ impl BossService {
     }
 
     /// Removes local saved sessions.
-    pub fn logout(&mut self, platform: Option<Platform>, yes: bool) -> Result<Value, BossError> {
+    pub fn logout(&mut self, yes: bool) -> Result<Value, BossError> {
         if !yes {
             return Err(BossError::InvalidArgument(
                 "logout requires --yes".to_owned(),
             ));
         }
-        let results = selected_platforms(platform)
+        let results = [Platform::Zhipin]
             .into_iter()
             .map(|selected| {
                 Ok(json!({
@@ -666,7 +648,6 @@ impl BossService {
             Some(name) => self.presets.show(name)?.spec,
             None => SearchSpec {
                 query: String::new(),
-                platform: PlatformSelector::from(defaults.platform.selected()),
                 city: None,
                 page: 1,
                 limit: u32::try_from(defaults.page_size).unwrap_or(u32::MAX),
@@ -675,9 +656,6 @@ impl BossService {
         };
         if let Some(value) = patch.query {
             spec.query = value;
-        }
-        if let Some(value) = patch.platform {
-            spec.platform = value;
         }
         if let Some(value) = patch.city {
             spec.city = Some(value);
@@ -717,7 +695,7 @@ impl BossService {
             .map(|city| city.trim().to_owned())
             .filter(|city| !city.is_empty());
         if let Some(city) = spec.city.as_deref() {
-            crate::city::validate_selection(spec.platform.selected(), city)?;
+            crate::city::validate_selection(city)?;
         }
         spec.filters = SearchFilters::new(
             spec.filters.company,
@@ -735,7 +713,6 @@ impl BossService {
         let spec = self.validate_search_spec(spec)?;
         self.search(
             &spec.query,
-            spec.platform.selected(),
             spec.city.as_deref(),
             spec.page,
             spec.limit,
@@ -748,14 +725,13 @@ impl BossService {
     pub async fn search(
         &self,
         query: &str,
-        platform: Option<Platform>,
         city: Option<&str>,
         page: u32,
         limit: u32,
         filters: SearchFilters,
     ) -> Result<SearchReport, BossError> {
         if let Some(city) = city {
-            crate::city::validate_selection(platform, city)?;
+            crate::city::validate_selection(city)?;
         }
         let request = SearchRequest {
             query,
@@ -766,9 +742,6 @@ impl BossService {
         let mut results = Vec::new();
         let mut successful_jobs = Vec::new();
         for provider in &self.providers {
-            if platform.is_some_and(|selected| selected != provider.platform()) {
-                continue;
-            }
             match provider.search(&request).await {
                 Ok(jobs) => {
                     let jobs: Vec<Job> = jobs
@@ -803,7 +776,7 @@ impl BossService {
         self.history.record(SearchHistoryEntry {
             timestamp,
             query: query.to_owned(),
-            platform: platform.map_or_else(|| "all".to_owned(), |value| value.as_str().to_owned()),
+            platform: Platform::Zhipin.as_str().to_owned(),
             city: city.map(ToOwned::to_owned),
             page,
             limit,
@@ -826,7 +799,13 @@ impl BossService {
 
     /// Lists cached jobs.
     pub fn list(&self, platform: Option<Platform>, limit: usize) -> Result<Vec<Job>, BossError> {
-        self.cache.list(platform, limit)
+        Ok(self
+            .cache
+            .list(platform, usize::MAX)?
+            .into_iter()
+            .filter(|job| job.platform == Platform::Zhipin)
+            .take(limit)
+            .collect())
     }
 
     /// Shows one cached job.
@@ -879,6 +858,7 @@ impl BossService {
                 .collect(),
         }
         .into_iter()
+        .filter(|job| job.platform == Platform::Zhipin)
         .filter(|job| {
             options
                 .platform
@@ -1487,13 +1467,14 @@ impl BossService {
             ));
         }
         let jobs = self.cache.all()?;
-        let mut by_platform = serde_json::Map::new();
-        for platform in [Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng] {
-            by_platform.insert(
-                platform.as_str().to_owned(),
-                json!(jobs.iter().filter(|job| job.platform == platform).count()),
-            );
-        }
+        let by_platform = serde_json::Map::from_iter([(
+            Platform::Zhipin.as_str().to_owned(),
+            json!(
+                jobs.iter()
+                    .filter(|job| job.platform == Platform::Zhipin)
+                    .count()
+            ),
+        )]);
         let cutoff = now_seconds()?.saturating_sub(days.saturating_mul(86_400));
         let history: Vec<SearchHistoryEntry> = self
             .history
@@ -2344,7 +2325,6 @@ fn diagnose_local(
     reply_rules: &ReplyStore,
     auth: &AuthStore,
     provider_count: usize,
-    platform: Option<Platform>,
 ) -> Value {
     let mut checks = Vec::new();
     let mut has_error = false;
@@ -2407,32 +2387,30 @@ fn diagnose_local(
         auth_store_warn.then(|| "private credential store was ignored".to_owned()),
     ));
 
-    let registered = provider_count == 3;
+    let registered = provider_count == 1;
     has_error |= !registered;
     checks.push(check(
         "provider_registration",
         if registered { "ok" } else { "error" },
-        (!registered).then(|| format!("expected 3 providers, found {provider_count}")),
+        (!registered).then(|| format!("expected 1 provider, found {provider_count}")),
     ));
 
-    for selected in selected_platforms(platform) {
-        let variable = AuthStore::cookie_env(selected);
-        let env_present = AuthStore::environment_cookie(selected).is_some();
-        let stored_present = auth.has_session(selected);
-        let present = env_present || stored_present;
-        has_warn |= !present;
-        checks.push(json!({
-            "name":format!("cookie_{}",selected.as_str()),
-            "status":if present {"ok"} else {"warn"},
-            "message":if env_present {
-                format!("{variable} is present")
-            } else if stored_present {
-                "private stored session is present".to_owned()
-            } else {
-                format!("{variable} and private stored session are missing")
-            }
-        }));
-    }
+    let variable = AuthStore::cookie_env(Platform::Zhipin);
+    let env_present = AuthStore::environment_cookie(Platform::Zhipin).is_some();
+    let stored_present = auth.has_session(Platform::Zhipin);
+    let present = env_present || stored_present;
+    has_warn |= !present;
+    checks.push(json!({
+        "name":"cookie_zhipin",
+        "status":if present {"ok"} else {"warn"},
+        "message":if env_present {
+            format!("{variable} is present")
+        } else if stored_present {
+            "private stored session is present".to_owned()
+        } else {
+            format!("{variable} and private stored session are missing")
+        }
+    }));
     json!({
         "network_checked":false,
         "status":if has_error {"error"} else if has_warn {"warn"} else {"ok"},
@@ -2442,13 +2420,6 @@ fn diagnose_local(
 
 fn login_outcome(platform: Platform, state: &'static str, source: &'static str) -> Value {
     json!({"platform":platform,"state":state,"source":source})
-}
-
-fn selected_platforms(platform: Option<Platform>) -> Vec<Platform> {
-    platform.map_or_else(
-        || vec![Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng],
-        |selected| vec![selected],
-    )
 }
 
 fn check(name: &str, status: &str, message: Option<String>) -> Value {
@@ -2577,50 +2548,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_preserves_partial_provider_outcomes() {
-        let directory = tempdir().expect("temporary directory");
-        let service = BossService {
-            paths: DataPaths::new(directory.path()),
-            cache: JobCache::new(directory.path()),
-            config: ConfigStore::from_paths(&DataPaths::new(directory.path())).expect("config"),
-            shortlist: ShortlistStore::from_paths(&DataPaths::new(directory.path())),
-            history: SearchHistoryStore::from_paths(&DataPaths::new(directory.path())),
-            presets: PresetStore::from_paths(&DataPaths::new(directory.path())),
-            reply_rules: ReplyStore::from_paths(&DataPaths::new(directory.path())),
-            watches: WatchStore::from_paths(&DataPaths::new(directory.path())),
-            resumes: ResumeStore::from_paths(&DataPaths::new(directory.path())),
-            campaigns: CampaignStore::from_paths(&DataPaths::new(directory.path())),
-            ai_profiles: AiProfileStore::from_paths(&DataPaths::new(directory.path())),
-            auth: AuthStore::from_paths(&DataPaths::new(directory.path())),
-            providers: vec![
-                Box::new(MockProvider {
-                    platform: Platform::Zhipin,
-                    succeeds: true,
-                }),
-                Box::new(MockProvider {
-                    platform: Platform::Zhilian,
-                    succeeds: false,
-                }),
-            ],
-        };
-        let report = service
-            .search("rust", None, Some("深圳"), 1, 20, SearchFilters::default())
-            .await
-            .expect("search");
-        assert!(report.providers[0].error.is_none());
-        assert_eq!(
-            report.providers[1].error.as_ref().expect("failure").code,
-            "authentication_or_risk_control"
-        );
-        assert_eq!(
-            service.history(None, 1).expect("history")[0]
-                .providers
-                .len(),
-            2
-        );
-    }
-
-    #[tokio::test]
     async fn cache_write_failure_is_a_top_level_error() {
         let directory = tempdir().expect("temporary directory");
         let blocked = directory.path().join("not-a-directory");
@@ -2644,7 +2571,7 @@ mod tests {
             })],
         };
         let result = service
-            .search("rust", None, None, 1, 20, SearchFilters::default())
+            .search("rust", None, 1, 20, SearchFilters::default())
             .await;
         assert!(matches!(result, Err(BossError::CacheIo(_))));
     }
@@ -2671,7 +2598,7 @@ mod tests {
             })],
         };
         let result = service
-            .search("rust", None, Some("火星"), 1, 20, SearchFilters::default())
+            .search("rust", Some("火星"), 1, 20, SearchFilters::default())
             .await;
         assert!(matches!(
             result,
@@ -2684,7 +2611,7 @@ mod tests {
         // SAFETY: The test restores this dedicated process variable immediately.
         unsafe { std::env::set_var("BOSS_ZHIPIN_COOKIE", "do-not-print-this") };
         let service = BossService::discover().expect("service");
-        let serialized = service.status(Some(Platform::Zhipin)).to_string();
+        let serialized = service.status().to_string();
         // SAFETY: Restore process state before returning.
         unsafe { std::env::remove_var("BOSS_ZHIPIN_COOKIE") };
         assert!(!serialized.contains("do-not-print-this"));
@@ -2693,7 +2620,7 @@ mod tests {
     #[test]
     fn doctor_missing_cookies_warns_without_error() {
         let service = BossService::discover().expect("service");
-        let report = service.doctor(None);
+        let report = service.doctor();
         assert_ne!(report["status"], "error");
     }
 
@@ -2818,7 +2745,7 @@ mod tests {
             })],
         };
         let report = service
-            .search("rust", None, None, 1, 20, SearchFilters::default())
+            .search("rust", None, 1, 20, SearchFilters::default())
             .await
             .expect("report");
         let history = service.history(None, 1).expect("history");
@@ -2853,7 +2780,7 @@ mod tests {
             })],
         };
         let result = service
-            .search("rust", None, None, 1, 20, SearchFilters::default())
+            .search("rust", None, 1, 20, SearchFilters::default())
             .await;
         assert!(matches!(result, Err(BossError::HistoryIo(_))));
     }
@@ -3317,7 +3244,6 @@ mod tests {
                 None,
                 SearchSpecPatch {
                     query: Some("rust".to_owned()),
-                    platform: Some(PlatformSelector::Zhipin),
                     ..SearchSpecPatch::default()
                 },
             )
@@ -3327,60 +3253,6 @@ mod tests {
         let outcome = service.watch_run("daily").await.expect("run");
         let after = service.watch_show("daily").expect("after");
         assert!(outcome["ok"] == false && before == after);
-    }
-
-    #[tokio::test]
-    async fn run_all_preserves_mixed_watch_outcomes() {
-        let directory = tempdir().expect("temporary directory");
-        let paths = DataPaths::new(directory.path());
-        let service = BossService {
-            paths: paths.clone(),
-            cache: JobCache::from_paths(&paths),
-            config: ConfigStore::from_paths(&paths).expect("config"),
-            shortlist: ShortlistStore::from_paths(&paths),
-            history: SearchHistoryStore::from_paths(&paths),
-            presets: PresetStore::from_paths(&paths),
-            reply_rules: ReplyStore::from_paths(&paths),
-            watches: WatchStore::from_paths(&paths),
-            resumes: ResumeStore::from_paths(&paths),
-            campaigns: CampaignStore::from_paths(&paths),
-            ai_profiles: AiProfileStore::from_paths(&paths),
-            auth: AuthStore::from_paths(&paths),
-            providers: vec![
-                Box::new(MockProvider {
-                    platform: Platform::Zhipin,
-                    succeeds: true,
-                }),
-                Box::new(MockProvider {
-                    platform: Platform::Zhilian,
-                    succeeds: false,
-                }),
-            ],
-        };
-        for (name, platform) in [
-            ("success", PlatformSelector::Zhipin),
-            ("failure", PlatformSelector::Zhilian),
-        ] {
-            let spec = service
-                .resolve_search_spec(
-                    None,
-                    SearchSpecPatch {
-                        query: Some("rust".to_owned()),
-                        platform: Some(platform),
-                        ..SearchSpecPatch::default()
-                    },
-                )
-                .expect("spec");
-            service.watch_add(name, spec).expect("watch");
-        }
-        let outcomes = service.watch_run_all().await.expect("run all");
-        assert_eq!(
-            outcomes
-                .iter()
-                .map(|outcome| outcome["ok"].as_bool())
-                .collect::<Vec<_>>(),
-            vec![Some(true), Some(false)]
-        );
     }
 
     #[test]

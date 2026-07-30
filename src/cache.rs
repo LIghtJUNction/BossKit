@@ -57,6 +57,9 @@ impl JobCache {
         let mut seen = HashSet::new();
         let mut jobs = Vec::with_capacity(incoming.len() + existing.len());
         for job in incoming {
+            if job.platform != Platform::Zhipin {
+                continue;
+            }
             if seen.insert(job.id.as_str()) {
                 jobs.push(
                     existing_by_id
@@ -87,7 +90,10 @@ impl JobCache {
 
     pub(crate) fn read_all(&self) -> Result<Vec<Job>, BossError> {
         match fs::read(&self.path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => Ok(serde_json::from_slice::<Vec<Job>>(&bytes)?
+                .into_iter()
+                .filter(|job| job.platform == Platform::Zhipin)
+                .collect()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(error.into()),
         }
@@ -163,6 +169,25 @@ mod tests {
             .expect("read")
             .expect("job");
         assert!(job.description.is_empty() && job.welfare.is_empty());
+    }
+
+    #[test]
+    fn legacy_non_boss_records_are_excluded_from_every_cache_read() {
+        let directory = tempdir().expect("temporary directory");
+        std::fs::write(
+            directory.path().join("jobs.json"),
+            r#"[
+                {"id":"boss","platform":"zhipin","remote_id":"1","title":"Rust","company":"Example","city":"深圳","salary":"20K","url":"https://example.test/boss"},
+                {"id":"legacy-zhilian","platform":"zhilian","remote_id":"2","title":"Rust","company":"Example","city":"深圳","salary":"20K","url":"https://example.test/legacy-zhilian"},
+                {"id":"legacy-qiancheng","platform":"qiancheng","remote_id":"3","title":"Rust","company":"Example","city":"深圳","salary":"20K","url":"https://example.test/legacy-qiancheng"}
+            ]"#,
+        )
+        .expect("fixture");
+
+        let cache = JobCache::new(directory.path());
+        assert_eq!(cache.all().expect("all").len(), 1);
+        assert!(cache.show("legacy-zhilian").expect("show").is_none());
+        assert!(cache.show("legacy-qiancheng").expect("show").is_none());
     }
 
     #[test]

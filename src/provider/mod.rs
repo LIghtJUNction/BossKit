@@ -1,7 +1,5 @@
 //! Read-only provider adapters.
 
-mod qiancheng;
-mod zhilian;
 mod zhipin;
 
 use async_trait::async_trait;
@@ -10,8 +8,6 @@ use sha2::{Digest, Sha256};
 
 use crate::{BossError, Job, Platform};
 
-pub use qiancheng::QianchengProvider;
-pub use zhilian::ZhilianProvider;
 pub use zhipin::ZhipinProvider;
 
 /// Search parameters shared by every provider.
@@ -99,27 +95,6 @@ fn json_content_type(value: Option<&reqwest::header::HeaderValue>) -> bool {
             })
         })
     })
-}
-
-pub(crate) async fn send_text(request: reqwest::RequestBuilder) -> Result<String, BossError> {
-    let response = request
-        .send()
-        .await
-        .map_err(|error| BossError::Network(error.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(BossError::Http {
-            status: status.as_u16(),
-            message: status
-                .canonical_reason()
-                .unwrap_or("request rejected")
-                .to_owned(),
-        });
-    }
-    response
-        .text()
-        .await
-        .map_err(|error| BossError::Parse(error.to_string()))
 }
 
 pub(crate) fn required_url(value: Option<&str>, field: &str) -> Result<String, BossError> {

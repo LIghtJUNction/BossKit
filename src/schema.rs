@@ -43,15 +43,13 @@ pub struct ToolDefinition {
 #[must_use]
 pub fn tool_registry() -> Vec<ToolDefinition> {
     let empty = || json!({"type":"object","properties":{},"additionalProperties":false});
-    let platform = json!({"type":"string","enum":["all","zhipin","zhilian","qiancheng"]});
     vec![
-        tool("platforms", "List supported job platforms", empty()),
         tool("cities", "List shared logical city mappings", empty()),
         tool(
             "search_jobs",
             "Search jobs and apply local-only list-field filters",
             json!({"type":"object","properties":{
-                "query":{"type":"string","minLength":1},"preset":{"type":"string","minLength":1},"platform":platform,
+                "query":{"type":"string","minLength":1},"preset":{"type":"string","minLength":1},
                 "city":{"type":"string"},"page":{"type":"integer","minimum":1},
                 "limit":{"type":"integer","minimum":1},
                 "company":{"type":"string","minLength":1},
@@ -67,7 +65,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "list_jobs",
             "List locally cached jobs",
             json!({"type":"object","properties":{
-                "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]},
                 "limit":{"type":"integer","minimum":1}
             },"additionalProperties":false}),
         ),
@@ -89,7 +86,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "search_history",
             "List BossKit local search-attempt history, not platform browsing history",
             json!({"type":"object","properties":{
-                "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]},
                 "limit":{"type":"integer","minimum":1}
             },"additionalProperties":false}),
         ),
@@ -98,19 +94,18 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "Return structured local jobs or shortlist snapshots without filesystem access",
             json!({"type":"object","properties":{
                 "source":{"type":"string","enum":["jobs","shortlist"]},
-                "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]},
                 "limit":{"type":"integer","minimum":1},"include_ids":{"type":"boolean"}
             },"additionalProperties":false}),
         ),
         tool(
             "status",
             "Inspect local cookie environment status without network access",
-            platform_schema(),
+            empty(),
         ),
         tool(
             "doctor",
             "Run local data and registration diagnostics without network access",
-            platform_schema(),
+            empty(),
         ),
         tool(
             "schema",
@@ -456,7 +451,6 @@ fn search_named_schema(include_preset: bool) -> Value {
     let mut properties = json!({
         "name":{"type":"string","minLength":1,"maxLength":64},
         "query":{"type":"string","minLength":1},
-        "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]},
         "city":{"type":"string","minLength":1},"page":{"type":"integer","minimum":1},
         "limit":{"type":"integer","minimum":1},"company":{"type":"string","minLength":1},
         "salary":{"type":"string","minLength":1},"experience":{"type":"string","minLength":1},
@@ -524,7 +518,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
             json!({
                 "name":"boss",
                 "read_only_remote":false,
-                "platforms":["zhipin","zhilian","qiancheng"],
+                "platforms":["zhipin"],
                 "commands":commands,
                 "mcp_tools":tools,
                 "notes":{
@@ -534,7 +528,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. greet and send are explicitly confirmed writes; history reads one bounded exact conversation; inbox reads only the latest safe text for 1 to 5 exact conversations without polling or replying. send verifies exact outgoing history, none submits a resume, and no chat command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
                     "accounts":"Named accounts are CLI-only local session profiles. --account selects one profile for the current CLI process; account use changes the saved default. Generic environment Cookies are eligible only for the literal default account.",
-                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only account operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use stored or hidden manual Cookie input, while generic environment Cookies are limited to the default account. Credential actions remain unavailable through MCP."
+                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only BOSS 直聘 account operations. Sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; generic environment Cookies are limited to the default account. Credential actions remain unavailable through MCP."
                 },
                 "risk":{
                     "remote_writes":true,
@@ -567,12 +561,6 @@ fn tool(name: &'static str, description: &'static str, input_schema: Value) -> T
         description,
         input_schema,
     }
-}
-
-fn platform_schema() -> Value {
-    json!({"type":"object","properties":{
-        "platform":{"type":"string","enum":["all","zhipin","zhilian","qiancheng"]}
-    },"additionalProperties":false})
 }
 
 fn ai_operation_schema() -> Value {
@@ -608,8 +596,7 @@ struct CommandDefinition {
 
 fn command_registry() -> Vec<CommandDefinition> {
     [
-        ("platforms", &[][..]),
-        ("cities", &[]),
+        ("cities", &[][..]),
         ("search", &["history", "jobs_cache"]),
         ("ls", &[]),
         ("show", &[]),

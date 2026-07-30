@@ -34,8 +34,7 @@ pub use config::{AppConfig, ConfigEntry, ConfigStore};
 pub use data::DataPaths;
 pub use error::BossError;
 pub use model::{
-    Envelope, Job, Platform, PlatformInfo, PlatformSelector, SearchFilters, SearchReport,
-    SearchSpec, SearchSpecPatch,
+    Envelope, Job, Platform, PlatformInfo, SearchFilters, SearchReport, SearchSpec, SearchSpecPatch,
 };
 pub use notify::{
     NotificationAudit, NotificationPayload, NotificationStatus, NotificationStore,

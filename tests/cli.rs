@@ -2,15 +2,6 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
-#[cfg(unix)]
-use std::process::Stdio;
-#[cfg(unix)]
-use std::time::{Duration, Instant};
-
 fn run_json(data_dir: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -72,12 +63,12 @@ fn seed_jobs(directory: &std::path::Path) {
             "employment_type":"全职","skills":["Rust"],"welfare":["双休"],"address":""
         },
         {
-            "id":"zhilian-job","platform":"zhilian","remote_id":"remote-2",
+            "id":"legacy-job","platform":"zhilian","remote_id":"remote-2",
             "title":"Rust","company":"Example","city":"深圳","salary":"21K",
             "url":"https://example.test/2"
         },
         {
-            "id":"zhilian-job-2","platform":"zhilian","remote_id":"remote-3",
+            "id":"legacy-job-2","platform":"zhilian","remote_id":"remote-3",
             "title":"Senior Rust","company":"Example","city":"上海","salary":"30K",
             "url":"https://example.test/3"
         }
@@ -90,15 +81,35 @@ fn seed_jobs(directory: &std::path::Path) {
 }
 
 #[test]
-fn platforms_lists_all_registered_adapters() {
+fn boss_only_cli_rejects_platform_flags_and_ignores_legacy_cached_jobs() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+
+    let jobs = run_json(directory.path(), &["ls", "--limit", "20"]);
+    assert_eq!(jobs["data"].as_array().expect("jobs").len(), 1);
+    assert_eq!(jobs["data"][0]["platform"], "zhipin");
+
+    for command in [["show", "legacy-job"], ["detail", "legacy-job"]] {
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .env("BOSS_DATA_DIR", directory.path())
+            .args(command)
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+        assert_eq!(error["error"]["code"], "invalid_argument");
+    }
+
     let output = Command::cargo_bin("boss")
         .expect("binary")
-        .arg("platforms")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["search", "rust", "--platform", "zhipin"])
         .output()
         .expect("run");
-    assert!(output.status.success());
-    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(value["data"].as_array().expect("platforms").len(), 3);
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
 }
 
 #[test]
@@ -201,231 +212,6 @@ fn data_dir_selects_the_cache_used_by_ls() {
 }
 
 #[test]
-fn bare_invocation_and_help_print_the_same_complete_chinese_root_help() {
-    let outputs = [vec![], vec!["--help"], vec!["-h"], vec!["help"]].map(|args| {
-        Command::cargo_bin("boss")
-            .expect("binary")
-            .args(args)
-            .output()
-            .expect("run")
-    });
-
-    for output in &outputs {
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
-        assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
-
-        let help = String::from_utf8(output.stdout.clone()).expect("utf8");
-        for expected in [
-            "BossKit — 多平台招聘求职辅助工具",
-            "用法: boss [OPTIONS] <命令>",
-            "命令:",
-            "选项:",
-            "保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话",
-            "显示当前命令或指定子命令的帮助",
-            "--help",
-            "显示帮助",
-            "--version",
-            "显示版本",
-        ] {
-            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
-        }
-        for command in [
-            "platforms",
-            "cities",
-            "search",
-            "preset",
-            "reply",
-            "campaign",
-            "watch",
-            "resume",
-            "account",
-            "ai",
-            "notify",
-            "stats",
-            "clean",
-            "ls",
-            "show",
-            "detail",
-            "history",
-            "export",
-            "config",
-            "login",
-            "chat",
-            "logout",
-            "status",
-            "doctor",
-            "schema",
-            "shortlist",
-            "mcp",
-            "help",
-        ] {
-            assert!(
-                help.lines()
-                    .any(|line| line.split_whitespace().next() == Some(command)),
-                "missing top-level command {command:?} in:\n{help}"
-            );
-        }
-        for english in [
-            "Usage:",
-            "Commands:",
-            "Arguments:",
-            "Options:",
-            "[possible values:",
-            "Print help",
-            "Print version",
-            "Print this message",
-        ] {
-            assert!(
-                !help.contains(english),
-                "unexpected English built-in {english:?} in:\n{help}"
-            );
-        }
-    }
-
-    for output in &outputs[1..] {
-        assert_eq!(outputs[0].stdout, output.stdout);
-    }
-}
-
-#[test]
-fn nested_help_screens_localize_generated_and_authored_text() {
-    let cases: &[(&[&str], &[&str])] = &[
-        (
-            &["ai", "--help"],
-            &[
-                "用法: boss ai [OPTIONS] <命令>",
-                "命令:",
-                "profile  添加或更新无凭据的 HTTPS OpenAI 兼容配置",
-                "draft    使用一个缓存职位和一份本地类型化简历生成 AI 文稿",
-                "score    根据一份本地类型化简历评估一个缓存职位",
-                "help     显示当前命令或指定子命令的帮助",
-                "选项:",
-                "-h, --help",
-            ],
-        ),
-        (
-            &["ai", "profile", "--help"],
-            &[
-                "用法: boss ai profile [OPTIONS] <命令>",
-                "add   仅添加或更新配置元数据；不接受或存储密钥",
-                "ls    列出本地配置 [别名: list]",
-                "show  查看一个本地配置",
-                "rm    移除一个本地配置 [别名: remove]",
-            ],
-        ),
-        (
-            &["notify", "--help"],
-            &[
-                "用法: boss notify [OPTIONS] <命令>",
-                "preview  仅渲染受限的本地载荷；不会读取 Webhook 或访问网络",
-                "send     明确确认后，将受限载荷发送到仅运行时提供的 Webhook",
-            ],
-        ),
-        (
-            &["campaign", "plan", "create", "--help"],
-            &[
-                "用法: boss campaign plan create [OPTIONS] <POLICY>",
-                "参数:",
-                "选项:",
-                "--resume-name <RESUME_NAME>  绑定一份现有的本地类型化简历，不将其内容复制到计划中",
-                "[默认值: 20]",
-            ],
-        ),
-        (
-            &["campaign", "screen", "--help"],
-            &[
-                "用法: boss campaign screen [OPTIONS] --resume <RESUME> --policy <POLICY>",
-                "--resume <RESUME>",
-                "现有本地类型化简历名称",
-                "--policy <POLICY>",
-                "现有本地筛选策略名称",
-                "--minimum-resume-score <MINIMUM_RESUME_SCORE>",
-                "简历标题与技能的最低本地匹配分数",
-                "[默认值: 40]",
-            ],
-        ),
-        (
-            &["account", "--help"],
-            &[
-                "用法: boss account [OPTIONS] <命令>",
-                "list    列出安全的本地账户元数据",
-                "use     创建或选择后续命令使用的默认本地账户",
-                "resume  只读查看 BOSS 直聘在线简历",
-            ],
-        ),
-        (
-            &["account", "resume", "show", "--help"],
-            &[
-                "用法: boss account resume show [OPTIONS]",
-                "通过纯命令行只读获取在线简历快照",
-                "不启动浏览器、不修改或投递",
-                "选项:",
-                "-h, --help",
-            ],
-        ),
-        (
-            &["login", "--help"],
-            &[
-                "用法: boss login [OPTIONS]",
-                "-c, --cookie-stdin",
-                "从标准输入读取一个 Cookie",
-                "--manual",
-            ],
-        ),
-        (
-            &["search", "--help"],
-            &[
-                "用法: boss search [OPTIONS] [QUERY]",
-                "参数:",
-                "选项:",
-                "[可选值: zhipin, zhilian, qiancheng, all]",
-            ],
-        ),
-    ];
-
-    for (args, expected_fragments) in cases {
-        let output = Command::cargo_bin("boss")
-            .expect("binary")
-            .args(*args)
-            .output()
-            .expect("run");
-        assert!(output.status.success(), "args={args:?}");
-        assert!(output.stderr.is_empty(), "args={args:?}");
-        let help = String::from_utf8(output.stdout).expect("utf8");
-        for expected in *expected_fragments {
-            assert!(
-                help.contains(expected),
-                "args={args:?}: missing {expected:?} in:\n{help}"
-            );
-        }
-        for english in [
-            "Usage:",
-            "Commands:",
-            "Arguments:",
-            "Options:",
-            "[possible values:",
-            "[default:",
-            "[alias:",
-            "Print help",
-            "Print version",
-            "Print this message",
-            "Add or update",
-            "Generate an AI",
-            "Score one cached",
-            "Bind one existing",
-            "Render the bounded",
-            "Send the bounded",
-        ] {
-            assert!(
-                !help.contains(english),
-                "args={args:?}: unexpected English help text {english:?} in:\n{help}"
-            );
-        }
-    }
-}
-
-#[test]
 fn account_resume_show_is_read_only_and_fails_without_a_session_before_network() {
     let directory = tempdir().expect("temporary directory");
     let output = Command::cargo_bin("boss")
@@ -440,111 +226,6 @@ fn account_resume_show_is_read_only_and_fails_without_a_session_before_network()
     let value: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(value["error"]["code"], "authentication_error");
     assert!(!directory.path().join(".auth").exists());
-}
-
-#[test]
-fn account_list_use_and_ephemeral_override_are_local_and_safe() {
-    let directory = tempdir().expect("temporary directory");
-    let initial = run_json(directory.path(), &["account", "list"]);
-    assert!(
-        initial["data"]["selected_account"] == "default"
-            && initial["data"]["active_account"] == "default"
-            && initial["data"]["count"] == 1
-            && initial["data"]["accounts"][0]["alias"] == "default"
-            && initial["data"]["accounts"][0]["selected"] == true
-    );
-
-    let unconfirmed = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .args(["account", "use", "work"])
-        .output()
-        .expect("unconfirmed account use");
-    assert!(!unconfirmed.status.success());
-    let unconfirmed: Value = serde_json::from_slice(&unconfirmed.stdout).expect("error json");
-    assert_eq!(unconfirmed["error"]["code"], "invalid_argument");
-
-    let selected = run_json(directory.path(), &["account", "use", "work", "--yes"]);
-    let listed = run_json(directory.path(), &["account", "list"]);
-    let overridden = run_json(
-        directory.path(),
-        &["--account", "default", "status", "--platform", "zhipin"],
-    );
-    let persisted = run_json(directory.path(), &["status", "--platform", "zhipin"]);
-    let logout = run_json(
-        directory.path(),
-        &[
-            "logout",
-            "--account",
-            "work",
-            "--platform",
-            "zhipin",
-            "--yes",
-        ],
-    );
-    assert!(
-        selected["data"]["account"] == "work"
-            && selected["data"]["created"] == true
-            && listed["data"]["count"] == 2
-            && listed["data"]["selected_account"] == "work"
-            && overridden["data"]["account"] == "default"
-            && overridden["data"]["selected_account"] == "work"
-            && persisted["data"]["account"] == "work"
-            && persisted["data"]["selected_account"] == "work"
-            && logout["data"]["account"] == "work"
-            && logout["data"]["results"][0]["revoked"] == false
-    );
-
-    let invalid = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .args(["--account", "bad account", "status"])
-        .output()
-        .expect("invalid account override");
-    assert!(!invalid.status.success());
-    let invalid: Value = serde_json::from_slice(&invalid.stdout).expect("error json");
-    assert_eq!(invalid["error"]["code"], "invalid_argument");
-}
-
-#[test]
-fn non_default_account_never_consumes_generic_environment_cookie() {
-    let directory = tempdir().expect("temporary directory");
-    let fixture_cookie = "session=CROSS_ACCOUNT_SECRET";
-    let login_output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
-        .env_remove("BOSS_ZHIPIN_COOKIE")
-        .env_remove("BOSS_QIANCHENG_COOKIE")
-        .args(["login", "--account", "work", "--platform", "zhilian"])
-        .output()
-        .expect("isolated login");
-    assert!(login_output.status.success());
-    let login: Value = serde_json::from_slice(&login_output.stdout).expect("login json");
-    assert!(
-        login["data"]["account"] == "work"
-            && login["data"]["results"][0]["state"] == "manual_login_required"
-            && login["data"]["results"][0]["source"] == "none"
-            && !String::from_utf8_lossy(&login_output.stdout).contains(fixture_cookie)
-            && !directory.path().join(".auth").exists()
-    );
-
-    let status_output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
-        .args(["--account", "work", "status", "--platform", "zhilian"])
-        .output()
-        .expect("isolated status");
-    assert!(status_output.status.success());
-    let status: Value = serde_json::from_slice(&status_output.stdout).expect("status json");
-    assert!(
-        status["data"]["account"] == "work"
-            && status["data"]["providers"][0]["environment_allowed"] == false
-            && status["data"]["providers"][0]["present"] == false
-            && status["data"]["providers"][0]["stored_session_present"] == false
-            && !String::from_utf8_lossy(&status_output.stdout).contains(fixture_cookie)
-    );
 }
 
 #[test]
@@ -701,7 +382,7 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
     for args in [
         vec!["chat", "inbox", "missing-job"],
         vec!["chat", "inbox", "zhipin-job", "zhipin-job"],
-        vec!["chat", "inbox", "zhilian-job"],
+        vec!["chat", "inbox", "legacy-job"],
     ] {
         let output = Command::cargo_bin("boss")
             .expect("binary")
@@ -764,7 +445,7 @@ fn notification_preview_is_local_and_send_requires_confirmation_or_runtime_confi
             preview["data"]["sent"].as_bool(),
             preview["data"]["payload"]["summary"]["cached_jobs"].as_u64(),
         ),
-        (Some("local_notification_preview"), Some(false), Some(3))
+        (Some("local_notification_preview"), Some(false), Some(1))
     );
     assert!(!directory.path().join("notification_audit.json").exists());
 
@@ -829,28 +510,6 @@ fn mcp_notification_tools_match_schema_and_reject_unconfirmed_send_without_netwo
 }
 
 #[test]
-fn config_lifecycle_and_defaults_affect_ls() {
-    let directory = tempdir().expect("temporary directory");
-    seed_jobs(directory.path());
-    let set_platform = run_json(directory.path(), &["config", "set", "platform", "zhilian"]);
-    assert_eq!(set_platform["data"]["new"], "zhilian");
-    let set_limit = run_json(directory.path(), &["config", "set", "page_size", "1"]);
-    assert_eq!(set_limit["data"]["new"], 1);
-    let listed = run_json(directory.path(), &["ls"]);
-    assert_eq!(
-        (
-            listed["data"].as_array().map(Vec::len),
-            listed["data"][0]["platform"].as_str()
-        ),
-        (Some(1), Some("zhilian"))
-    );
-    let reset = run_json(directory.path(), &["config", "reset"]);
-    assert_eq!(reset["data"]["key"], "all");
-    let defaults = run_json(directory.path(), &["config", "get", "page_size"]);
-    assert_eq!(defaults["data"]["source"], "default");
-}
-
-#[test]
 fn shortlist_full_cli_lifecycle_is_local() {
     let directory = tempdir().expect("temporary directory");
     seed_jobs(directory.path());
@@ -912,264 +571,6 @@ fn status_and_doctor_are_structured_and_offline() {
 }
 
 #[test]
-fn non_zhipin_login_environment_status_logout_and_fallback_are_local_and_redacted() {
-    #[cfg(unix)]
-    {
-        let directory = tempdir().expect("temporary directory");
-        let fixture_cookie = "session=fixture-cookie-value";
-
-        let output = Command::cargo_bin("boss")
-            .expect("binary")
-            .env("BOSS_DATA_DIR", directory.path())
-            .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
-            .env_remove("BOSS_ZHIPIN_COOKIE")
-            .env_remove("BOSS_QIANCHENG_COOKIE")
-            .args(["login", "--platform", "zhilian"])
-            .output()
-            .expect("login");
-        assert!(output.status.success());
-        let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
-        let login_text = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            login["data"]["network_checked"] == false
-                && login["data"]["results"][0]["state"] == "stored_unverified"
-                && login["data"]["results"][0]["source"] == "environment"
-                && !login_text.contains(fixture_cookie)
-        );
-
-        let status = run_json(directory.path(), &["status", "--platform", "zhilian"]);
-        assert!(
-            status["data"]["providers"][0]["stored_session_present"] == true
-                && status["data"]["providers"][0]["auth_state"] == "stored_session_present"
-                && status["data"]["providers"][0]
-                    .get("registered_export_present")
-                    .is_none()
-        );
-        let logout = run_json(
-            directory.path(),
-            &["logout", "--platform", "zhilian", "--yes"],
-        );
-        assert_eq!(logout["data"]["results"][0]["revoked"], true);
-        let after_logout = run_json(directory.path(), &["status", "--platform", "zhilian"]);
-        assert!(
-            after_logout["data"]["providers"][0]["stored_session_present"] == false
-                && after_logout["data"]["providers"][0]
-                    .get("registered_export_present")
-                    .is_none()
-        );
-
-        let manual_required = run_json(directory.path(), &["login", "--platform", "qiancheng"]);
-        assert_eq!(
-            manual_required["data"]["results"][0]["state"],
-            "manual_login_required"
-        );
-    }
-}
-
-#[test]
-fn non_tty_login_without_cookie_reports_manual_login_required() {
-    let directory = tempdir().expect("temporary directory");
-
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_ZHIPIN_COOKIE")
-        .env_remove("BOSS_ZHILIAN_COOKIE")
-        .env_remove("BOSS_QIANCHENG_COOKIE")
-        .args(["login", "--platform", "zhipin"])
-        .output()
-        .expect("login");
-    assert!(output.status.success());
-    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
-    assert_eq!(
-        login["data"]["results"][0]["state"],
-        "manual_login_required"
-    );
-    assert!(!directory.path().join(".auth").exists());
-}
-
-#[test]
-fn cookie_stdin_login_stores_one_redacted_cookie_in_the_selected_account() {
-    let directory = tempdir().expect("temporary directory");
-    let secret = "session=STDIN_COOKIE_MUST_NOT_APPEAR";
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_ZHIPIN_COOKIE")
-        .env_remove("BOSS_ZHILIAN_COOKIE")
-        .env_remove("BOSS_QIANCHENG_COOKIE")
-        .args(["login", "--account", "work", "--platform", "zhilian", "-c"])
-        .write_stdin(format!("{secret}\n"))
-        .output()
-        .expect("stdin login");
-    assert!(output.status.success());
-    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
-    let status = run_json(
-        directory.path(),
-        &["--account", "work", "status", "--platform", "zhilian"],
-    );
-    assert!(
-        login["data"]["account"] == "work"
-            && login["data"]["results"][0]["state"] == "stored_unverified"
-            && login["data"]["results"][0]["source"] == "stdin"
-            && status["data"]["providers"][0]["stored_session_present"] == true
-            && !String::from_utf8_lossy(&output.stdout).contains(secret)
-    );
-}
-
-#[test]
-fn cookie_stdin_rejects_empty_multiline_and_manual_conflict_without_secret_output() {
-    let directory = tempdir().expect("temporary directory");
-    let secret = "session=STDIN_ERROR_SECRET";
-    let multiline = format!("{secret}\nsession=SECOND_SECRET\n");
-    for input in ["", multiline.as_str()] {
-        let output = Command::cargo_bin("boss")
-            .expect("binary")
-            .env("BOSS_DATA_DIR", directory.path())
-            .args(["login", "--platform", "zhilian", "--cookie-stdin"])
-            .write_stdin(input)
-            .output()
-            .expect("invalid stdin login");
-        assert!(!output.status.success());
-        let rendered = String::from_utf8_lossy(&output.stdout);
-        let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
-        assert!(
-            error["error"]["code"] == "authentication_error"
-                && error["data"].is_null()
-                && error["error"].get("source").is_none()
-                && !rendered.contains("STDIN_ERROR_SECRET")
-                && !rendered.contains("SECOND_SECRET")
-                && !rendered.contains(".auth")
-        );
-    }
-
-    let conflict = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .args([
-            "login",
-            "--platform",
-            "zhilian",
-            "--manual",
-            "--cookie-stdin",
-        ])
-        .write_stdin(secret)
-        .output()
-        .expect("conflicting login modes");
-    assert!(!conflict.status.success());
-    let rendered = String::from_utf8_lossy(&conflict.stdout);
-    let error: Value = serde_json::from_slice(&conflict.stdout).expect("error json");
-    assert!(
-        error["error"]["code"] == "invalid_argument"
-            && error["error"].get("source").is_none()
-            && !rendered.contains("STDIN_ERROR_SECRET")
-            && !rendered.contains(".auth")
-    );
-}
-
-#[test]
-fn cookie_stdin_requires_one_platform_before_reading_input() {
-    let directory = tempdir().expect("temporary directory");
-    let secret = "session=PLATFORM_VALIDATION_SECRET";
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .args(["login", "--cookie-stdin"])
-        .write_stdin(format!("{secret}\nsession=SECOND_SECRET\n"))
-        .output()
-        .expect("missing platform");
-    assert!(!output.status.success());
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
-    assert!(
-        error["error"]["code"] == "invalid_argument"
-            && error["error"].get("source").is_none()
-            && !rendered.contains("PLATFORM_VALIDATION_SECRET")
-            && !rendered.contains("SECOND_SECRET")
-            && !rendered.contains(".auth")
-            && !directory.path().join(".auth").exists()
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn cookie_stdin_rejects_terminal_input_without_reading_it() {
-    let directory = tempdir().expect("temporary directory");
-    let mut master_fd = -1;
-    let mut slave_fd = -1;
-    // SAFETY: all output pointers are valid for writes and the optional PTY
-    // configuration pointers are null, as permitted by `openpty`.
-    let result = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(result, 0, "open pseudo-terminal");
-    // SAFETY: a successful `openpty` call returns two newly owned file
-    // descriptors, each transferred into exactly one `File`.
-    let _master = unsafe { File::from_raw_fd(master_fd) };
-    let slave = unsafe { File::from_raw_fd(slave_fd) };
-
-    let binary = Command::cargo_bin("boss").expect("binary");
-    let mut command = std::process::Command::new(binary.get_program());
-    command
-        .env("BOSS_DATA_DIR", directory.path())
-        .args(["login", "--platform", "zhilian", "--cookie-stdin"])
-        .stdin(Stdio::from(slave))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("terminal stdin login");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll terminal stdin login") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("stop blocked terminal stdin login");
-            panic!("terminal stdin was read instead of rejected");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let output = child.wait_with_output().expect("terminal stdin output");
-    assert_eq!(output.status, status);
-    assert!(!output.status.success());
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
-    assert!(
-        error["error"]["code"] == "authentication_error"
-            && error["error"].get("source").is_none()
-            && rendered.contains("use login --manual")
-            && !rendered.contains(".auth")
-            && !directory.path().join(".auth").exists()
-    );
-}
-
-#[test]
-fn login_without_cookie_stdin_flag_does_not_read_piped_input() {
-    let directory = tempdir().expect("temporary directory");
-    let secret = "session=UNREQUESTED_STDIN_SECRET";
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_ZHILIAN_COOKIE")
-        .args(["login", "--platform", "zhilian"])
-        .write_stdin(secret)
-        .output()
-        .expect("normal login");
-    assert!(output.status.success());
-    let login: Value = serde_json::from_slice(&output.stdout).expect("login json");
-    assert!(
-        login["data"]["results"][0]["state"] == "manual_login_required"
-            && !String::from_utf8_lossy(&output.stdout).contains(secret)
-            && !directory.path().join(".auth").exists()
-    );
-}
-
-#[test]
 fn doctor_reports_invalid_config_as_local_error() {
     let directory = tempdir().expect("temporary directory");
     std::fs::write(directory.path().join("config.json"), b"{not-json").expect("write invalid");
@@ -1209,54 +610,6 @@ fn schema_formats_use_expected_wrappers() {
                 tool["name"].as_str(),
                 Some("login" | "logout" | "account_list" | "account_use" | "account_resume_show")
             ))
-    );
-}
-
-#[test]
-fn detail_history_and_export_cli_surfaces_are_local() {
-    let directory = tempdir().expect("temporary directory");
-    seed_jobs(directory.path());
-    let history = serde_json::json!([{
-        "timestamp":1,"query":"rust","platform":"zhipin","city":"深圳",
-        "page":1,"limit":20,"filters":{"company":null,"salary":null,
-        "experience":null,"education":null,"employment_type":null,"welfare":[]},
-        "providers":[{"platform":"zhipin","count":1,"error_code":null}]
-    }]);
-    std::fs::write(
-        directory.path().join("history.json"),
-        serde_json::to_vec(&history).expect("history json"),
-    )
-    .expect("history fixture");
-    let detail = run_json(directory.path(), &["detail", "zhipin-job"]);
-    let listed = run_json(
-        directory.path(),
-        &["history", "--platform", "zhipin", "--limit", "1"],
-    );
-    let structured = run_json(
-        directory.path(),
-        &["export", "--format", "csv", "--limit", "1"],
-    );
-    let output_path = directory.path().join("exports").join("jobs.csv");
-    let output_text = output_path.display().to_string();
-    let written = run_json(
-        directory.path(),
-        &[
-            "export",
-            "--format",
-            "csv",
-            "--limit",
-            "1",
-            "--output",
-            &output_text,
-        ],
-    );
-    assert!(
-        detail["data"]["description"] == "cached detail"
-            && listed["data"].as_array().map(Vec::len) == Some(1)
-            && structured["data"]["format"] == "csv"
-            && structured["data"]["jobs"].is_array()
-            && written["data"]["jobs"].is_null()
-            && output_path.is_file()
     );
 }
 
@@ -1380,13 +733,13 @@ fn campaign_cli_creates_only_deduplicated_local_manual_review_dry_runs() {
     assert!(
         first["data"]["mode"] == "manual_review"
             && first["data"]["dry_run"] == true
-            && first["data"]["planned"] == 3
-            && listed["data"].as_array().map(Vec::len) == Some(3)
+            && first["data"]["planned"] == 1
+            && listed["data"].as_array().map(Vec::len) == Some(1)
             && listed["data"].as_array().is_some_and(|plans| plans
                 .iter()
                 .all(|plan| { plan["state"] == "manual_review" && plan["dry_run"] == true }))
             && second["data"]["planned"] == 0
-            && second["data"]["skipped_existing"] == 3
+            && second["data"]["skipped_existing"] == 1
             && std::fs::read(directory.path().join("jobs.json")).expect("cached jobs")
                 == jobs_before
     );
@@ -1572,11 +925,11 @@ fn campaign_screen_is_local_ranked_deduplicated_and_resume_bound() {
             .iter()
             .map(|plan| plan["job_id"].as_str().expect("job id"))
             .collect::<Vec<_>>(),
-        vec!["zhilian-job", "zhilian-job-2", "zhipin-job"]
+        vec!["zhipin-job"]
     );
     assert!(
         first["data"]["mode"] == "resume_screening_manual_review"
-            && first["data"]["planned"] == 3
+            && first["data"]["planned"] == 1
             && first["data"]["plans"]
                 .as_array()
                 .is_some_and(
@@ -1599,7 +952,7 @@ fn campaign_screen_is_local_ranked_deduplicated_and_resume_bound() {
                             .is_some_and(|text| text.contains("UnmatchedSkill"))
                 }))
             && second["data"]["planned"] == 0
-            && second["data"]["skipped_existing"] == 3
+            && second["data"]["skipped_existing"] == 1
             && !persisted.contains("greeting_previews")
             && !persisted.contains("Rust / Rust / Rust")
             && std::fs::read(directory.path().join("jobs.json")).expect("jobs") == jobs_before

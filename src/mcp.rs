@@ -11,12 +11,11 @@ use crate::campaign::{
 use crate::export::{ExportFormat, ExportOptions, ExportSource};
 use crate::notify::normalize_event;
 use crate::schema::{SchemaFormat, tool_registry};
-use crate::{BossError, BossService, Platform, PlatformSelector, SearchSpecPatch};
+use crate::{BossError, BossService, SearchSpecPatch};
 
 const SEARCH_FIELDS: &[&str] = &[
     "query",
     "preset",
-    "platform",
     "city",
     "page",
     "limit",
@@ -30,7 +29,6 @@ const SEARCH_FIELDS: &[&str] = &[
 const PRESET_ADD_FIELDS: &[&str] = &[
     "name",
     "query",
-    "platform",
     "city",
     "page",
     "limit",
@@ -45,7 +43,6 @@ const WATCH_ADD_FIELDS: &[&str] = &[
     "name",
     "query",
     "preset",
-    "platform",
     "city",
     "page",
     "limit",
@@ -215,13 +212,6 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
         ));
     }
     match name {
-        "platforms" => {
-            validate_allowed(&arguments, &[])?;
-            Ok((
-                json!({"ok":true,"data":service.platforms(),"error":null,"hints":[]}),
-                false,
-            ))
-        }
         "cities" => {
             validate_allowed(&arguments, &[])?;
             Ok((
@@ -263,12 +253,11 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
             ))
         }
         "list_jobs" => {
-            validate_allowed(&arguments, &["platform", "limit"])?;
+            validate_allowed(&arguments, &["limit"])?;
             let defaults = service.effective_config();
-            let platform = parse_platform(&arguments, defaults.platform.selected())?;
             let limit = positive_usize(&arguments, "limit", defaults.page_size)?;
             let jobs = service
-                .list(platform, limit)
+                .list(None, limit)
                 .map_err(ToolCallError::Execution)?;
             Ok((
                 json!({"ok":true,"data":jobs,"error":null,"hints":[]}),
@@ -299,11 +288,10 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
             Ok((json!({"ok":true,"data":job,"error":null,"hints":[]}), false))
         }
         "search_history" => {
-            validate_allowed(&arguments, &["platform", "limit"])?;
-            let platform = parse_platform(&arguments, None)?;
+            validate_allowed(&arguments, &["limit"])?;
             let limit = positive_usize(&arguments, "limit", 20)?;
             let history = service
-                .history(platform, limit)
+                .history(None, limit)
                 .map_err(ToolCallError::Execution)?;
             Ok((
                 json!({"ok":true,"data":history,"error":null,"hints":[]}),
@@ -311,7 +299,7 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
             ))
         }
         "export_jobs" => {
-            validate_allowed(&arguments, &["source", "platform", "limit", "include_ids"])?;
+            validate_allowed(&arguments, &["source", "limit", "include_ids"])?;
             let source = match optional_string(&arguments, "source")?.unwrap_or("jobs") {
                 "jobs" => ExportSource::Jobs,
                 "shortlist" => ExportSource::Shortlist,
@@ -321,13 +309,12 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                     )));
                 }
             };
-            let platform = parse_platform(&arguments, None)?;
             let limit = positive_usize(&arguments, "limit", 20)?;
             let include_ids = optional_bool(&arguments, "include_ids", false)?;
             let export = service
                 .export(ExportOptions {
                     source,
-                    platform,
+                    platform: None,
                     limit,
                     format: ExportFormat::Json,
                     output: None,
@@ -341,18 +328,16 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
             ))
         }
         "status" => {
-            validate_allowed(&arguments, &["platform"])?;
-            let platform = parse_platform(&arguments, None)?;
+            validate_allowed(&arguments, &[])?;
             Ok((
-                json!({"ok":true,"data":service.status(platform),"error":null,"hints":[]}),
+                json!({"ok":true,"data":service.status(),"error":null,"hints":[]}),
                 false,
             ))
         }
         "doctor" => {
-            validate_allowed(&arguments, &["platform"])?;
-            let platform = parse_platform(&arguments, None)?;
+            validate_allowed(&arguments, &[])?;
             Ok((
-                json!({"ok":true,"data":service.doctor(platform),"error":null,"hints":[]}),
+                json!({"ok":true,"data":service.doctor(),"error":null,"hints":[]}),
                 false,
             ))
         }
@@ -1116,7 +1101,6 @@ fn success_value(value: impl Serialize) -> Value {
 fn search_patch(arguments: &Value) -> Result<SearchSpecPatch, ToolCallError> {
     Ok(SearchSpecPatch {
         query: optional_nonblank_owned_string(arguments, "query")?,
-        platform: optional_platform_selector(arguments)?,
         city: optional_nonblank_owned_string(arguments, "city")?,
         page: optional_positive_u32(arguments, "page")?,
         limit: optional_positive_u32(arguments, "limit")?,
@@ -1130,23 +1114,6 @@ fn search_patch(arguments: &Value) -> Result<SearchSpecPatch, ToolCallError> {
             .map(|_| nonblank_string_array(arguments, "welfare"))
             .transpose()?,
     })
-}
-
-fn optional_platform_selector(
-    arguments: &Value,
-) -> Result<Option<PlatformSelector>, ToolCallError> {
-    let Some(value) = optional_string(arguments, "platform")? else {
-        return Ok(None);
-    };
-    match value {
-        "all" => Ok(Some(PlatformSelector::All)),
-        "zhipin" => Ok(Some(PlatformSelector::Zhipin)),
-        "zhilian" => Ok(Some(PlatformSelector::Zhilian)),
-        "qiancheng" => Ok(Some(PlatformSelector::Qiancheng)),
-        other => Err(ToolCallError::InvalidArguments(format!(
-            "unknown platform: {other}"
-        ))),
-    }
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, ToolCallError> {
@@ -1308,24 +1275,6 @@ fn bounded_u8(value: &Value, field: &str, default: u8, maximum: u8) -> Result<u8
         .ok_or_else(|| ToolCallError::InvalidArguments(format!("{field} must be in 0..={maximum}")))
 }
 
-fn parse_platform(
-    arguments: &Value,
-    default: Option<Platform>,
-) -> Result<Option<Platform>, ToolCallError> {
-    let Some(value) = optional_string(arguments, "platform")? else {
-        return Ok(default);
-    };
-    match value {
-        "all" => Ok(None),
-        "zhipin" => Ok(Some(Platform::Zhipin)),
-        "zhilian" => Ok(Some(Platform::Zhilian)),
-        "qiancheng" => Ok(Some(Platform::Qiancheng)),
-        other => Err(ToolCallError::InvalidArguments(format!(
-            "unknown platform: {other}"
-        ))),
-    }
-}
-
 async fn write_response(stdout: &mut tokio::io::Stdout, response: &Value) -> Result<(), BossError> {
     let mut bytes = serde_json::to_vec(response)?;
     bytes.push(b'\n');
@@ -1346,6 +1295,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::Platform;
 
     fn service() -> BossService {
         BossService::discover().expect("service")
