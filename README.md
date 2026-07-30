@@ -2,7 +2,7 @@
 
 BossKit 是独立维护的 Rust 2024 招聘求职 CLI。可执行文件名为 `boss`，库名为 `bosskit`。
 
-当前可用的 `campaign screen` 只做本地简历筛选并生成 `manual_review` / `dry_run` 计划。BOSS 直聘登录会话可通过纯命令行 HTTPS 与本地 V8 挑战计算刷新并验证，全程不启动或依赖浏览器。`chat greet` 仅对一个本地缓存职位发送平台默认招呼；`chat send` 仅向同一职位的既有精确会话发送一条明确确认的文本；`chat history` 读取一个精确会话最近的文本；`chat inbox` 一次查看至多五个精确会话的最新安全文本。批量写操作、自动回复和投递仍未开放。
+当前可用的 `campaign screen` 只做本地简历筛选并生成 `manual_review` / `dry_run` 计划。BOSS 直聘登录会话可通过纯命令行 HTTPS 与本地 V8 挑战计算刷新并验证，全程不启动或依赖浏览器。`account resume show` 可只读查看经过裁剪和隐私过滤的 BOSS 在线简历快照；它不会修改或投递简历。`chat greet` 仅对一个本地缓存职位发送平台默认招呼；`chat send` 仅向同一职位的既有精确会话发送一条明确确认的文本；`chat history` 读取一个精确会话最近的文本；`chat inbox` 一次查看至多五个精确会话的最新安全文本。批量写操作、自动回复和投递仍未开放。
 
 ## 安装
 
@@ -66,6 +66,14 @@ export BOSS_QIANCHENG_COOKIE='...'
 ```
 
 BossKit 不输出 Cookie，不读取既有浏览器配置、桌面客户端、SQLite 或系统钥匙串。MCP 不暴露登录、登出、浏览器或凭据入口。
+
+## BOSS 直聘在线账户只读快照
+
+```bash
+boss account resume show
+```
+
+该命令仅支持 BOSS 直聘，通过已保存或环境提供的会话，以纯命令行 HTTPS 获取一次在线简历预览。输出是固定形状、长度受限的快照，包含基本信息、求职期望、个人总结及工作、项目、教育、证书和志愿经历的可读章节；不会返回 Cookie、令牌、远端标识、手机号、邮箱或附件链接。命令不启动浏览器、不修改或润色在线简历，也不会提交简历。
 
 ## 本地简历
 

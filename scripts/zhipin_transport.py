@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import ssl
 import sys
@@ -26,7 +27,11 @@ API_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 USER_INFO_URL = "https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json"
 WT_URL = "https://www.zhipin.com/wapi/zppassport/get/wt"
 HISTORY_URL = "https://www.zhipin.com/wapi/zpchat/geek/historyMsg"
+RESUME_PREVIEW_URL = (
+    "https://www.zhipin.com/wapi/zpgeek/resume/geek/preview/data.json"
+)
 BASE_URL = "https://www.zhipin.com"
+RESUME_REFERER = f"{BASE_URL}/web/geek/resume"
 MAX_LOOKUP_PAGES = 3
 LOOKUP_PAGE_SIZE = 30
 HISTORY_PAGE_SIZE = 20
@@ -38,6 +43,13 @@ MAX_INBOX_CONVERSATIONS = 5
 MAX_INBOX_TEXT_CHARS = 512
 MAX_INBOX_RESPONSE_BYTES = 60 * 1024
 MAX_REMOTE_ID_CHARS = 2048
+MAX_RESUME_SCALAR_CHARS = 128
+MAX_RESUME_SUMMARY_CHARS = 2000
+MAX_RESUME_EXPECTATIONS = 10
+MAX_RESUME_SECTION_ITEMS = 8
+MAX_RESUME_ENTRY_CHARS = 384
+MAX_RESUME_CONTENT_CHARS = 32 * 1024
+MAX_RESUME_RESPONSE_BYTES = 60 * 1024
 MAX_OPAQUE_VALUE_CHARS = 4096
 SEND_DEADLINE_SECONDS = 50.0
 USER_AGENT = (
@@ -94,6 +106,17 @@ def replace_cookie(
 
 def cookie_header(pairs: list[tuple[str, str]]) -> str:
     return "; ".join(f"{name}={value}" for name, value in pairs)
+
+
+def required_cookie_value(
+    pairs: list[tuple[str, str]],
+    name: str,
+    field: str,
+) -> str:
+    matches = [value for key, value in pairs if key == name]
+    if len(matches) != 1:
+        raise SafeFailure(f"Zhipin {field} is invalid")
+    return bounded_string(matches[0], field)
 
 
 def request_json(response: requests.Response, action: str) -> dict:
@@ -803,6 +826,467 @@ def readable_inbox(cookie: str, remote_ids: list[str]) -> dict:
     return bounded_inbox_response(cookie_header(pairs), conversations)
 
 
+def first_resume_value(mapping: dict, keys: tuple[str, ...]) -> object:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def resume_text(value: object, field: str, maximum: int) -> tuple[str, bool]:
+    if value is None:
+        return "", False
+    if type(value) is int:
+        value = str(value)
+    if not isinstance(value, str):
+        raise SafeFailure(f"Zhipin resume {field} is invalid")
+    if any(
+        unsafe_history_character(character) and character not in "\n\r\t"
+        for character in value
+    ):
+        raise SafeFailure(f"Zhipin resume {field} contains unsafe characters")
+    redacted = re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        "[redacted-email]",
+        value,
+    )
+    redacted = re.sub(
+        r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:[^\s]+",
+        "[redacted-url]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        (
+            r"(?<![A-Za-z0-9@-])"
+            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?\.)+"
+            r"[A-Za-z]{2,}(?:/[^\s]*)?"
+            r"(?![A-Za-z0-9@-])"
+        ),
+        "[redacted-url]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        r"(?<![A-Za-z0-9_+])\+?(?:\d[\s().-]*){6,14}\d(?![A-Za-z0-9_])",
+        "[redacted-phone]",
+        redacted,
+    )
+    redacted = redacted.replace("@", "[redacted-at]")
+    normalized = " ".join(redacted.strip().split())
+    if len(normalized) <= maximum:
+        return normalized, False
+    return normalized[:maximum], True
+
+
+def resume_list(mapping: dict, keys: tuple[str, ...], field: str) -> list[dict]:
+    value = first_resume_value(mapping, keys)
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, dict) for item in value
+    ):
+        raise SafeFailure(f"Zhipin resume {field} is invalid")
+    return value
+
+
+def render_resume_entries(
+    mapping: dict,
+    source_keys: tuple[str, ...],
+    field: str,
+    fields: tuple[tuple[str, tuple[str, ...], int], ...],
+) -> tuple[list[str], bool]:
+    raw_items = resume_list(mapping, source_keys, field)
+    truncated = len(raw_items) > MAX_RESUME_SECTION_ITEMS
+    rendered: list[str] = []
+    for item in raw_items[:MAX_RESUME_SECTION_ITEMS]:
+        parts: list[str] = []
+        for label, keys, maximum in fields:
+            text, shortened = resume_text(
+                first_resume_value(item, keys),
+                f"{field} {label}",
+                maximum,
+            )
+            truncated = truncated or shortened
+            if text:
+                parts.append(f"{label}: {text}")
+        if not parts:
+            continue
+        entry = " | ".join(parts)
+        if len(entry) > MAX_RESUME_ENTRY_CHARS:
+            entry = entry[:MAX_RESUME_ENTRY_CHARS]
+            truncated = True
+        rendered.append(entry)
+    return rendered, truncated
+
+
+def resume_snapshot(data: dict) -> dict:
+    nested = first_resume_value(data, ("resumeInfo", "resume", "geekResume"))
+    if isinstance(nested, dict) and not any(
+        key in data
+        for key in ("geekBaseInfo", "baseInfo", "geekInfo", "resumeBaseInfo")
+    ):
+        data = nested
+    base_value = first_resume_value(
+        data,
+        ("geekBaseInfo", "baseInfo", "geekInfo", "resumeBaseInfo"),
+    )
+    if base_value is None:
+        base = data
+    elif isinstance(base_value, dict):
+        base = base_value
+    else:
+        raise SafeFailure("Zhipin resume basic info is invalid")
+
+    truncated = False
+
+    def scalar(
+        mapping: dict,
+        keys: tuple[str, ...],
+        field: str,
+        maximum: int = MAX_RESUME_SCALAR_CHARS,
+    ) -> str:
+        nonlocal truncated
+        text, shortened = resume_text(
+            first_resume_value(mapping, keys),
+            field,
+            maximum,
+        )
+        truncated = truncated or shortened
+        return text
+
+    display_name = scalar(
+        base,
+        ("nickName", "displayName", "showName", "geekName", "name"),
+        "display name",
+    )
+    if not display_name:
+        raise SafeFailure("Zhipin resume display name is missing")
+    work_years = scalar(
+        base,
+        (
+            "workYears",
+            "workYear",
+            "workYearsName",
+            "workYearDesc",
+            "experience",
+        ),
+        "work years",
+    )
+    education = scalar(
+        base,
+        (
+            "degreeCategory",
+            "education",
+            "degreeName",
+            "degree",
+            "highestDegree",
+        ),
+        "education",
+    )
+    job_status = scalar(
+        data,
+        (
+            "jobStatus",
+            "jobStatusName",
+            "jobStatusDesc",
+            "applyStatusName",
+            "applyStatusDesc",
+            "statusDesc",
+        ),
+        "job status",
+    )
+
+    expectation_items = resume_list(
+        data,
+        (
+            "geekExpectInfoList",
+            "geekExpectPositionList",
+            "geekExpectList",
+            "expectInfoList",
+            "expectList",
+        ),
+        "expectations",
+    )
+    truncated = truncated or len(expectation_items) > MAX_RESUME_EXPECTATIONS
+    expected_roles: list[dict] = []
+    for item in expectation_items[:MAX_RESUME_EXPECTATIONS]:
+        position = scalar(
+            item,
+            ("position", "positionName", "expectPositionName"),
+            "expected position",
+        )
+        city = scalar(
+            item,
+            ("city", "cityName", "locationName", "expectLocationName"),
+            "expected city",
+        )
+        salary = scalar(
+            item,
+            ("salary", "salaryName", "salaryDesc", "expectSalary"),
+            "expected salary",
+        )
+        if position:
+            expected_roles.append(
+                {"position": position, "city": city, "salary": salary}
+            )
+
+    summary_value = first_resume_value(
+        data,
+        (
+            "personalSummary",
+            "userDesc",
+            "selfIntroduction",
+            "geekAdvantage",
+            "geekDesc",
+            "advantage",
+            "selfDescription",
+        ),
+    )
+    if isinstance(summary_value, dict):
+        summary_value = first_resume_value(
+            summary_value,
+            ("content", "description", "text"),
+        )
+    personal_summary = scalar(
+        {"value": summary_value},
+        ("value",),
+        "personal summary",
+        MAX_RESUME_SUMMARY_CHARS,
+    )
+
+    work, shortened = render_resume_entries(
+        data,
+        ("geekWorkExpList", "workExperienceList", "workExpList"),
+        "work experience",
+        (
+            ("Company", ("companyName", "company"), MAX_RESUME_SCALAR_CHARS),
+            ("Role", ("positionName", "position", "title"), MAX_RESUME_SCALAR_CHARS),
+            ("Start", ("startDate", "startYear"), MAX_RESUME_SCALAR_CHARS),
+            ("End", ("endDate", "endYear"), MAX_RESUME_SCALAR_CHARS),
+            (
+                "Summary",
+                (
+                    "responsibility",
+                    "workContent",
+                    "workEmphasis",
+                    "description",
+                ),
+                MAX_RESUME_SUMMARY_CHARS,
+            ),
+            (
+                "Performance",
+                ("workPerformance",),
+                MAX_RESUME_SUMMARY_CHARS,
+            ),
+        ),
+    )
+    truncated = truncated or shortened
+    projects, shortened = render_resume_entries(
+        data,
+        (
+            "projectExpList",
+            "geekProjectExpList",
+            "geekProjExpList",
+            "projectExperienceList",
+        ),
+        "project experience",
+        (
+            ("Project", ("projectName", "name"), MAX_RESUME_SCALAR_CHARS),
+            (
+                "Role",
+                ("roleName", "projectRole", "role"),
+                MAX_RESUME_SCALAR_CHARS,
+            ),
+            ("Start", ("startDate", "startYear"), MAX_RESUME_SCALAR_CHARS),
+            ("End", ("endDate", "endYear"), MAX_RESUME_SCALAR_CHARS),
+            (
+                "Summary",
+                ("projectDesc", "projectDescription", "description"),
+                MAX_RESUME_SUMMARY_CHARS,
+            ),
+            (
+                "Performance",
+                ("performance", "achievement"),
+                MAX_RESUME_SUMMARY_CHARS,
+            ),
+        ),
+    )
+    truncated = truncated or shortened
+    educations, shortened = render_resume_entries(
+        data,
+        (
+            "educationExpList",
+            "geekEduExpList",
+            "educationExperienceList",
+            "eduExpList",
+        ),
+        "education experience",
+        (
+            ("School", ("schoolName", "school"), MAX_RESUME_SCALAR_CHARS),
+            ("Major", ("majorName", "major"), MAX_RESUME_SCALAR_CHARS),
+            ("Degree", ("degreeName", "degree"), MAX_RESUME_SCALAR_CHARS),
+            ("Start", ("startYear", "startDate"), MAX_RESUME_SCALAR_CHARS),
+            ("End", ("endYear", "endDate"), MAX_RESUME_SCALAR_CHARS),
+        ),
+    )
+    truncated = truncated or shortened
+    certifications, shortened = render_resume_entries(
+        data,
+        ("geekCertInfoList", "geekCertList", "certificationList", "certList"),
+        "certification",
+        (
+            ("Certificate", ("certName", "certificateName", "name"), MAX_RESUME_SCALAR_CHARS),
+            ("Date", ("getDate", "date", "time"), MAX_RESUME_SCALAR_CHARS),
+        ),
+    )
+    truncated = truncated or shortened
+    volunteers, shortened = render_resume_entries(
+        data,
+        (
+            "geekVolunteerExpList",
+            "geekVolunteerList",
+            "volunteerExperienceList",
+            "volunteerExpList",
+        ),
+        "volunteer experience",
+        (
+            (
+                "Name",
+                ("name", "organizationName", "organization"),
+                MAX_RESUME_SCALAR_CHARS,
+            ),
+            (
+                "Service length",
+                ("serviceLength",),
+                MAX_RESUME_SCALAR_CHARS,
+            ),
+            (
+                "Summary",
+                (
+                    "volunteerDesc",
+                    "volunteerDescription",
+                    "serviceContent",
+                    "description",
+                    "content",
+                ),
+                MAX_RESUME_SUMMARY_CHARS,
+            ),
+        ),
+    )
+    truncated = truncated or shortened
+
+    basic = [
+        f"Display name: {display_name}",
+        *([f"Work years: {work_years}"] if work_years else []),
+        *([f"Education: {education}"] if education else []),
+        *([f"Job status: {job_status}"] if job_status else []),
+    ]
+    expectations = [
+        " | ".join(
+            item
+            for item in (
+                f"Position: {role['position']}",
+                f"City: {role['city']}" if role["city"] else "",
+                f"Salary: {role['salary']}" if role["salary"] else "",
+            )
+            if item
+        )
+        for role in expected_roles
+    ]
+    sections = (
+        ("Basic info", basic),
+        ("Expectations", expectations),
+        ("Personal summary", [personal_summary] if personal_summary else []),
+        ("Work experience", work),
+        ("Project experience", projects),
+        ("Education experience", educations),
+        ("Certifications", certifications),
+        ("Volunteer experience", volunteers),
+    )
+    content = "\n\n".join(
+        f"[{title}]\n"
+        + ("\n".join(f"- {item}" for item in items) if items else "(none)")
+        for title, items in sections
+    )
+    if len(content) > MAX_RESUME_CONTENT_CHARS:
+        raise SafeFailure("Zhipin resume snapshot exceeded the safe content budget")
+
+    return {
+        "display_name": display_name,
+        "work_years": work_years,
+        "education": education,
+        "job_status": job_status,
+        "expected_roles": expected_roles,
+        "personal_summary": personal_summary,
+        "content": content,
+        "section_counts": {
+            "basic_info": len(basic),
+            "expectations": len(expected_roles),
+            "personal_summary": 1 if personal_summary else 0,
+            "work_experience": len(work),
+            "project_experience": len(projects),
+            "education_experience": len(educations),
+            "certifications": len(certifications),
+            "volunteer_experience": len(volunteers),
+        },
+        "truncated": truncated,
+    }
+
+
+def resume_show(cookie: str) -> dict:
+    deadline = time.monotonic() + SEND_DEADLINE_SECONDS
+    session, pairs, _ = prepare_session(cookie, deadline)
+    resume_token = required_cookie_value(pairs, "bst", "resume token")
+    timestamp = positive_int(int(time.time() * 1000), "resume timestamp")
+    headers = dict(HEADERS)
+    headers["Referer"] = RESUME_REFERER
+    headers["Zp_token"] = resume_token
+    params = {"_": timestamp}
+
+    payload = request_json(
+        session.get(
+            RESUME_PREVIEW_URL,
+            headers=headers,
+            params=params,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin resume preview",
+    )
+    code = api_code(payload, "Zhipin resume preview")
+    if code == 37:
+        pairs = apply_challenge(payload, pairs, session, deadline)
+        payload = request_json(
+            session.get(
+                RESUME_PREVIEW_URL,
+                headers=headers,
+                params=params,
+                timeout=request_timeout(deadline),
+            ),
+            "Zhipin resume preview",
+        )
+        code = api_code(payload, "Zhipin resume preview")
+    if code != 0:
+        raise SafeFailure(f"Zhipin resume preview failed with API code {code!r}")
+    data = payload.get("zpData")
+    if not isinstance(data, dict):
+        raise SafeFailure("Zhipin resume preview returned no result data")
+    response = {
+        "ok": True,
+        "action": "resume_show",
+        "verification": "resume_preview_api_code_0",
+        "updated_cookie": cookie_header(pairs),
+        "snapshot": resume_snapshot(data),
+    }
+    encoded = json.dumps(
+        response, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) + 1 > MAX_RESUME_RESPONSE_BYTES:
+        raise SafeFailure("Zhipin resume snapshot exceeded the safe output budget")
+    return response
+
+
 def encode_varint(value: int) -> bytes:
     if type(value) is not int or value < 0 or value > 2**64 - 1:
         raise SafeFailure("protobuf unsigned integer is invalid")
@@ -1024,7 +1508,14 @@ def main() -> int:
         if not isinstance(request, dict):
             raise SafeFailure("transport request must be an object")
         action = request.get("action")
-        if action not in {"refresh", "greet", "send", "history", "inbox"}:
+        if action not in {
+            "refresh",
+            "greet",
+            "send",
+            "history",
+            "inbox",
+            "resume_show",
+        }:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
         if not isinstance(cookie, str) or not cookie:
@@ -1061,13 +1552,17 @@ def main() -> int:
             if not isinstance(remote_id, str) or not remote_id:
                 raise SafeFailure("cached Zhipin job identifier is required")
             response = readable_history(cookie, remote_id, limit)
-        else:
+        elif action == "inbox":
             if set(request) != {"action", "cookie", "remote_ids"}:
                 raise SafeFailure("transport request contains unsupported fields")
             response = readable_inbox(
                 cookie,
                 validate_inbox_remote_ids(request.get("remote_ids")),
             )
+        else:
+            if set(request) != {"action", "cookie"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = resume_show(cookie)
     except SafeFailure as error:
         response = {"ok": False, "error": str(error)}
     except Exception:

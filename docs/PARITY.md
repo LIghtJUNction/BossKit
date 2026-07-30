@@ -22,6 +22,7 @@ BossKit is an independently developed Rust 2024 product with its own command pro
 | Presets | `boss preset add/ls/show/rm`, matching MCP tools | Complete validated local search specifications with override-aware search |
 | Watches | `boss watch add/ls/show/rm/run`, matching MCP tools | Explicit foreground read-only searches with an exact deduplicated union of every seen stable ID; no scheduler |
 | Local resumes | `boss resume ...`, matching structured MCP tools | Strict typed documents in one local file; no platform resume synchronization |
+| Zhipin online resume snapshot | `boss account resume show` | CLI-only browserless read of one bounded, privacy-filtered online resume snapshot; no remote edit, polishing, application, or MCP surface |
 | Resume screening | `boss campaign screen`, MCP `campaign_screen` | Deterministic local-only title and skill matching over cached job title, skills, and description; policy and blacklist gates run first; creates only deduplicated `manual_review` / `dry_run` plans |
 | Campaign review plans | `boss campaign plan ...`, matching MCP tools | Local policy, blacklist, bounded ephemeral greeting previews, and human-recorded state transitions; never applies or chats |
 | Default Zhipin greeting | `boss chat greet <LOCAL_JOB_ID> --yes` | CLI-only browserless initial contact for one exact cached job; verifies the exact encrypted job ID, sends no custom text or resume, and is unavailable through MCP |
@@ -44,7 +45,7 @@ BossKit is an independently developed Rust 2024 product with its own command pro
 
 ## Pending
 
-Platform resume synchronization, background scheduling, crawling, batch greeting or message orchestration, reply polling, automatic conversations, and platform application workflows are not implemented.
+Platform resume editing or synchronization, background scheduling, crawling, batch greeting or message orchestration, reply polling, automatic conversations, and platform application workflows are not implemented.
 
 ## Policy-blocked / intentionally unimplemented
 

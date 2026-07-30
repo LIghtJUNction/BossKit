@@ -20,6 +20,12 @@ pub(crate) const MAX_CHAT_INBOX_CONVERSATIONS: usize = 5;
 const MAX_CHAT_INBOX_TEXT_CHARS: usize = 512;
 const MAX_CHAT_INBOX_RESPONSE_BYTES: usize = 60 * 1024;
 const MAX_ZHIPIN_REMOTE_ID_CHARS: usize = 2048;
+const MAX_RESUME_SCALAR_CHARS: usize = 128;
+const MAX_RESUME_SUMMARY_CHARS: usize = 2000;
+const MAX_RESUME_EXPECTATIONS: usize = 10;
+const MAX_RESUME_SECTION_ITEMS: usize = 8;
+const MAX_RESUME_CONTENT_CHARS: usize = 32 * 1024;
+const MAX_RESUME_RESPONSE_BYTES: usize = 60 * 1024;
 
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
@@ -58,6 +64,12 @@ struct InboxRequest<'a> {
     remote_ids: &'a [&'a str],
 }
 
+#[derive(Debug, Serialize)]
+struct ResumeShowRequest<'a> {
+    action: &'static str,
+    cookie: &'a str,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectChatMessage {
@@ -82,6 +94,41 @@ struct HelperInboxConversation {
     latest: Option<DirectInboxLatest>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectExpectedRole {
+    pub(crate) position: String,
+    pub(crate) city: String,
+    pub(crate) salary: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectResumeSectionCounts {
+    pub(crate) basic_info: usize,
+    pub(crate) expectations: usize,
+    pub(crate) personal_summary: usize,
+    pub(crate) work_experience: usize,
+    pub(crate) project_experience: usize,
+    pub(crate) education_experience: usize,
+    pub(crate) certifications: usize,
+    pub(crate) volunteer_experience: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectResumeSnapshot {
+    pub(crate) display_name: String,
+    pub(crate) work_years: String,
+    pub(crate) education: String,
+    pub(crate) job_status: String,
+    pub(crate) expected_roles: Vec<DirectExpectedRole>,
+    pub(crate) personal_summary: String,
+    pub(crate) content: String,
+    pub(crate) section_counts: DirectResumeSectionCounts,
+    pub(crate) truncated: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HelperResponse {
@@ -102,6 +149,8 @@ struct HelperResponse {
     messages: Option<Vec<DirectChatMessage>>,
     #[serde(default)]
     conversations: Option<Vec<HelperInboxConversation>>,
+    #[serde(default)]
+    snapshot: Option<DirectResumeSnapshot>,
 }
 
 /// A verified session refresh whose Cookie remains private to the service.
@@ -141,6 +190,14 @@ pub(crate) struct DirectInbox {
     pub(crate) cookie: String,
     pub(crate) verification: String,
     pub(crate) conversations: Vec<Option<DirectInboxLatest>>,
+}
+
+/// A bounded online resume snapshot whose refreshed Cookie remains private.
+#[derive(Debug)]
+pub(crate) struct DirectOnlineResume {
+    pub(crate) cookie: String,
+    pub(crate) verification: String,
+    pub(crate) snapshot: DirectResumeSnapshot,
 }
 
 /// Refreshes and verifies one stored Zhipin Cookie without a browser process.
@@ -240,6 +297,16 @@ pub(crate) fn inbox(cookie: &str, remote_ids: &[&str]) -> Result<DirectInbox, Bo
     parse_inbox_response(&invoke_helper(&request)?, remote_ids)
 }
 
+/// Reads the current BOSS Zhipin online resume without modifying it.
+pub(crate) fn resume_show(cookie: &str) -> Result<DirectOnlineResume, BossError> {
+    let request = serde_json::to_vec(&ResumeShowRequest {
+        action: "resume_show",
+        cookie,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_resume_show_response(&invoke_helper(&request)?)
+}
+
 fn invoke_helper(request: &[u8]) -> Result<Vec<u8>, BossError> {
     let mut child = Command::new("uv")
         .args([
@@ -303,6 +370,7 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
         || response.count.is_some()
         || response.messages.is_some()
         || response.conversations.is_some()
+        || response.snapshot.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -342,6 +410,7 @@ fn parse_greet_response(bytes: &[u8]) -> Result<DirectGreeting, BossError> {
         || response.count.is_some()
         || response.messages.is_some()
         || response.conversations.is_some()
+        || response.snapshot.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -380,6 +449,7 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
         || response.count.is_some()
         || response.messages.is_some()
         || response.conversations.is_some()
+        || response.snapshot.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -422,6 +492,7 @@ fn parse_history_response(bytes: &[u8]) -> Result<DirectHistory, BossError> {
     if response.action.as_deref() != Some("history")
         || response.state.is_some()
         || response.conversations.is_some()
+        || response.snapshot.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -500,6 +571,7 @@ fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox
         || response.state.is_some()
         || response.messages.is_some()
         || response.error.is_some()
+        || response.snapshot.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -546,6 +618,182 @@ fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox
             .map(|conversation| conversation.latest)
             .collect(),
     })
+}
+
+fn parse_resume_show_response(bytes: &[u8]) -> Result<DirectOnlineResume, BossError> {
+    if bytes.len() > MAX_RESUME_RESPONSE_BYTES {
+        return Err(transport_error(
+            "direct resume result exceeded the safe output budget",
+        ));
+    }
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error("direct Zhipin resume preview failed"));
+    }
+    if response.action.as_deref() != Some("resume_show")
+        || response.state.is_some()
+        || response.error.is_some()
+        || response.count.is_some()
+        || response.messages.is_some()
+        || response.conversations.is_some()
+    {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| value == "resume_preview_api_code_0")
+        .ok_or_else(|| transport_error("direct resume verification was invalid"))?;
+    let snapshot = response
+        .snapshot
+        .filter(valid_resume_snapshot)
+        .ok_or_else(|| transport_error("direct resume snapshot was invalid"))?;
+    Ok(DirectOnlineResume {
+        cookie,
+        verification,
+        snapshot,
+    })
+}
+
+fn valid_resume_snapshot(snapshot: &DirectResumeSnapshot) -> bool {
+    let scalar = |value: &str| valid_resume_text(value, MAX_RESUME_SCALAR_CHARS, false);
+    !snapshot.display_name.is_empty()
+        && scalar(&snapshot.display_name)
+        && scalar(&snapshot.work_years)
+        && scalar(&snapshot.education)
+        && scalar(&snapshot.job_status)
+        && snapshot.expected_roles.len() <= MAX_RESUME_EXPECTATIONS
+        && snapshot.expected_roles.iter().all(|role| {
+            !role.position.is_empty()
+                && scalar(&role.position)
+                && scalar(&role.city)
+                && scalar(&role.salary)
+        })
+        && valid_resume_text(&snapshot.personal_summary, MAX_RESUME_SUMMARY_CHARS, false)
+        && !snapshot.content.is_empty()
+        && valid_resume_text(&snapshot.content, MAX_RESUME_CONTENT_CHARS, true)
+        && [
+            "[Basic info]",
+            "[Expectations]",
+            "[Personal summary]",
+            "[Work experience]",
+            "[Project experience]",
+            "[Education experience]",
+            "[Certifications]",
+            "[Volunteer experience]",
+        ]
+        .iter()
+        .all(|heading| snapshot.content.contains(heading))
+        && (1..=4).contains(&snapshot.section_counts.basic_info)
+        && snapshot.section_counts.expectations == snapshot.expected_roles.len()
+        && snapshot.section_counts.personal_summary
+            == usize::from(!snapshot.personal_summary.is_empty())
+        && snapshot.section_counts.work_experience <= MAX_RESUME_SECTION_ITEMS
+        && snapshot.section_counts.project_experience <= MAX_RESUME_SECTION_ITEMS
+        && snapshot.section_counts.education_experience <= MAX_RESUME_SECTION_ITEMS
+        && snapshot.section_counts.certifications <= MAX_RESUME_SECTION_ITEMS
+        && snapshot.section_counts.volunteer_experience <= MAX_RESUME_SECTION_ITEMS
+}
+
+fn valid_resume_text(value: &str, maximum: usize, allow_newline: bool) -> bool {
+    value.chars().count() <= maximum
+        && value.chars().all(|character| {
+            (allow_newline && character == '\n') || is_safe_history_character(character)
+        })
+        && !value.contains('@')
+        && !contains_uri_scheme(value)
+        && !contains_bare_domain(value)
+        && !contains_phone_like(value)
+}
+
+fn contains_phone_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (0..bytes.len()).any(|start| {
+        if !(bytes[start].is_ascii_digit() || bytes[start] == b'+')
+            || (start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[start - 1], b'_' | b'+')))
+        {
+            return false;
+        }
+        let mut index = start + usize::from(bytes[start] == b'+');
+        let mut digits = 0;
+        let mut last_digit_end = index;
+        while index < bytes.len() {
+            if bytes[index].is_ascii_digit() {
+                digits += 1;
+                last_digit_end = index + 1;
+            } else if !matches!(bytes[index], b' ' | b'-' | b'.' | b'(' | b')') {
+                break;
+            }
+            index += 1;
+        }
+        (7..=15).contains(&digits)
+            && (last_digit_end == bytes.len()
+                || !(bytes[last_digit_end].is_ascii_alphanumeric()
+                    || bytes[last_digit_end] == b'_'))
+    })
+}
+
+fn contains_uri_scheme(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (0..bytes.len()).any(|start| {
+        if !bytes[start].is_ascii_alphabetic()
+            || (start > 0
+                && matches!(
+                    bytes[start - 1],
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'.'
+                ))
+        {
+            return false;
+        }
+        let mut index = start + 1;
+        while index < bytes.len()
+            && matches!(
+                bytes[index],
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'.'
+            )
+        {
+            index += 1;
+        }
+        index + 1 < bytes.len() && bytes[index] == b':' && !bytes[index + 1].is_ascii_whitespace()
+    })
+}
+
+fn contains_bare_domain(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+        })
+        .any(|token| {
+            let token = token.trim_matches('.');
+            let Some((prefix, suffix)) = token.rsplit_once('.') else {
+                return false;
+            };
+            suffix.len() >= 2
+                && suffix.bytes().all(|byte| byte.is_ascii_alphabetic())
+                && prefix.split('.').all(valid_domain_label)
+        })
+}
+
+fn valid_domain_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn is_safe_history_character(character: char) -> bool {
@@ -604,6 +852,37 @@ mod tests {
             .to_owned()
     }
 
+    fn valid_resume_payload() -> serde_json::Value {
+        serde_json::json!({
+            "ok":true,
+            "action":"resume_show",
+            "verification":"resume_preview_api_code_0",
+            "updated_cookie":"wt2=secret; __zp_stoken__=fresh",
+            "snapshot":{
+                "display_name":"Candidate",
+                "work_years":"5 years",
+                "education":"Bachelor",
+                "job_status":"Open",
+                "expected_roles":[
+                    {"position":"Rust Engineer","city":"Shenzhen","salary":"20-30K"}
+                ],
+                "personal_summary":"Builds reliable systems",
+                "content":"[Basic info]\n- Display name: Candidate\n\n[Expectations]\n- Position: Rust Engineer\n\n[Personal summary]\n- Builds reliable systems\n\n[Work experience]\n(none)\n\n[Project experience]\n(none)\n\n[Education experience]\n(none)\n\n[Certifications]\n(none)\n\n[Volunteer experience]\n(none)",
+                "section_counts":{
+                    "basic_info":4,
+                    "expectations":1,
+                    "personal_summary":1,
+                    "work_experience":0,
+                    "project_experience":0,
+                    "education_experience":0,
+                    "certifications":0,
+                    "volunteer_experience":0
+                },
+                "truncated":false
+            }
+        })
+    }
+
     #[test]
     fn parses_verified_refresh_without_exposing_cookie_in_debug_fields() {
         let result = parse_refresh_response(
@@ -635,6 +914,84 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("wt2="));
         assert!(!rendered.contains("__zp_stoken__="));
+    }
+
+    #[test]
+    fn resume_show_request_and_verified_snapshot_are_strictly_typed() {
+        let request = serde_json::to_value(ResumeShowRequest {
+            action: "resume_show",
+            cookie: "wt2=secret",
+        })
+        .expect("request");
+        assert_eq!(
+            request,
+            serde_json::json!({"action":"resume_show","cookie":"wt2=secret"})
+        );
+
+        let payload = serde_json::to_vec(&valid_resume_payload()).expect("payload");
+        let result = parse_resume_show_response(&payload).expect("resume");
+        assert_eq!(result.verification, "resume_preview_api_code_0");
+        assert_eq!(result.snapshot.expected_roles.len(), 1);
+        assert_eq!(result.snapshot.display_name, "Candidate");
+    }
+
+    #[test]
+    fn resume_show_parser_rejects_unknown_oversized_unsafe_and_private_fields() {
+        let mut invalid = Vec::new();
+
+        let mut unknown = valid_resume_payload();
+        unknown["snapshot"]["phone"] = serde_json::json!("13800000000");
+        invalid.push(unknown);
+
+        let mut oversized = valid_resume_payload();
+        oversized["snapshot"]["display_name"] =
+            serde_json::json!("x".repeat(MAX_RESUME_SCALAR_CHARS + 1));
+        invalid.push(oversized);
+
+        let mut unsafe_text = valid_resume_payload();
+        unsafe_text["snapshot"]["personal_summary"] = serde_json::json!("\u{202e}private");
+        invalid.push(unsafe_text);
+
+        let mut email = valid_resume_payload();
+        email["snapshot"]["personal_summary"] = serde_json::json!("candidate@example.test");
+        invalid.push(email);
+
+        let mut handle = valid_resume_payload();
+        handle["snapshot"]["personal_summary"] = serde_json::json!("Built tools with @platform");
+        invalid.push(handle);
+
+        let mut attachment = valid_resume_payload();
+        attachment["snapshot"]["content"] = serde_json::json!(
+            "[Basic info]\n[Expectations]\n[Personal summary]\n[Work experience]\n[Project experience]\n[Education experience]\n[Certifications]\n[Volunteer experience]\nhttps://example.test/resume.pdf"
+        );
+        invalid.push(attachment);
+
+        for private_text in [
+            "Call +86 138-0000-0000",
+            "Download ftp://example.test/resume",
+            "Contact mailto:candidate@example.test",
+            "Profile candidate.example.test",
+        ] {
+            let mut adversarial = valid_resume_payload();
+            adversarial["snapshot"]["personal_summary"] = serde_json::json!(private_text);
+            invalid.push(adversarial);
+        }
+
+        for payload in invalid {
+            let encoded = serde_json::to_vec(&payload).expect("payload");
+            assert!(parse_resume_show_response(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn resume_show_failure_never_echoes_helper_credentials() {
+        let error = parse_resume_show_response(
+            br#"{"ok":false,"error":"wt2=PRIVATE_COOKIE; token=PRIVATE_TOKEN"}"#,
+        )
+        .expect_err("failure");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("PRIVATE_COOKIE"));
+        assert!(!rendered.contains("PRIVATE_TOKEN"));
     }
 
     #[test]
@@ -868,6 +1225,174 @@ print('bounded')
 "#,
         );
         assert_eq!(result, "bounded");
+    }
+
+    #[test]
+    fn python_resume_show_uses_exact_read_endpoint_and_one_challenge_retry() {
+        let result = run_pure_helper(
+            r#"
+class FakeResponse:
+ def __init__(self,payload):
+  self.payload=payload
+ def json(self):
+  return self.payload
+class FakeSession:
+ def __init__(self,payloads):
+  self.payloads=list(payloads)
+  self.calls=[]
+ def get(self,url,headers,params,timeout):
+  self.calls.append((url,dict(headers),dict(params)))
+  return FakeResponse(self.payloads.pop(0))
+challenge={'code':37,'zpData':{'seed':'seed','name':'name','ts':1}}
+preview={'code':0,'zpData':{
+ 'baseInfo':{'nickName':'Candidate','workYearDesc':'5 years','degreeCategory':'Bachelor','phone':'13800000000'},
+ 'applyStatusDesc':'Open',
+ 'expectList':[{'positionName':'Rust Engineer','cityName':'Shenzhen','salaryDesc':'20-30K'}],
+ 'userDesc':'Contact candidate@example.test or 13800000000 at https://example.test/cv',
+ 'workExpList':[{'companyName':'Example','positionName':'Engineer','startDate':'2020','endDate':'2024','workContent':'Systems','workPerformance':'Reliable'}],
+ 'projectExpList':[{'name':'Compiler','roleName':'Lead','startDate':'2022','endDate':'2023','projectDesc':'Built it','performance':'Shipped'}],
+ 'educationExpList':[{'school':'University','major':'Computer Science','degreeName':'Bachelor','startYear':'2016','endYear':'2020'}],
+ 'certificationList':[{'certName':'Cloud Certificate'}],
+ 'volunteerExpList':[{'name':'Community','serviceLength':'20 hours','volunteerDesc':'Mentoring'}]
+}}
+challenge_calls=[]
+resume_token='PRIVATE_BST_TOKEN'
+def fake_apply(payload,pairs,session,deadline):
+ challenge_calls.append(payload)
+ return list(pairs)+[('__zp_stoken__','fresh')]
+session=FakeSession([challenge,preview])
+scope['prepare_session']=lambda cookie,deadline:(session,[('wt2','secret'),('bst',resume_token)],False)
+scope['apply_challenge']=fake_apply
+response=scope['resume_show']('wt2=secret')
+assert response['action'] == 'resume_show'
+assert response['verification'] == 'resume_preview_api_code_0'
+assert response['updated_cookie'].endswith('__zp_stoken__=fresh')
+snapshot=response['snapshot']
+assert snapshot['display_name'] == 'Candidate'
+assert snapshot['work_years'] == '5 years'
+assert snapshot['education'] == 'Bachelor'
+assert snapshot['job_status'] == 'Open'
+assert snapshot['personal_summary'].startswith('Contact')
+assert snapshot['expected_roles'] == [{'position':'Rust Engineer','city':'Shenzhen','salary':'20-30K'}]
+assert snapshot['section_counts'] == {
+ 'basic_info':4,
+ 'expectations':1,
+ 'personal_summary':1,
+ 'work_experience':1,
+ 'project_experience':1,
+ 'education_experience':1,
+ 'certifications':1,
+ 'volunteer_experience':1,
+}
+for expected in ['Reliable','Shipped','University','Cloud Certificate','20 hours','Mentoring']:
+ assert expected in snapshot['content']
+assert len(challenge_calls) == 1 and len(session.calls) == 2
+assert session.calls[0] == session.calls[1]
+assert session.calls[0][0] == scope['RESUME_PREVIEW_URL']
+assert session.calls[0][1]['Referer'] == scope['RESUME_REFERER']
+assert session.calls[0][1]['Zp_token'] == resume_token
+assert set(session.calls[0][2]) == {'_'}
+assert type(session.calls[0][2]['_']) is int and session.calls[0][2]['_'] > 0
+rendered=scope['json'].dumps(snapshot,ensure_ascii=False)
+assert 'candidate@example.test' not in rendered
+assert '13800000000' not in rendered
+assert 'https://example.test/cv' not in rendered
+assert resume_token not in rendered
+public_response={key:value for key,value in response.items() if key != 'updated_cookie'}
+assert resume_token not in scope['json'].dumps(public_response)
+assert 'Zp_token' not in response
+session=FakeSession([challenge,challenge])
+challenge_calls.clear()
+scope['prepare_session']=lambda cookie,deadline:(session,[('wt2','secret'),('bst',resume_token)],False)
+try:
+ scope['resume_show']('wt2=secret')
+ raise AssertionError('accepted repeated challenge')
+except scope['SafeFailure'] as error:
+ assert resume_token not in str(error)
+assert len(challenge_calls) == 1 and len(session.calls) == 2
+for invalid_pairs in [
+ [],
+ [('bst','')],
+ [('bst','FIRST_PRIVATE'),('bst','SECOND_PRIVATE')],
+ [('bst','x'*(scope['MAX_OPAQUE_VALUE_CHARS']+1))],
+]:
+ try:
+  scope['required_cookie_value'](invalid_pairs,'bst','resume token')
+  raise AssertionError('accepted invalid resume token')
+ except scope['SafeFailure'] as error:
+  assert 'PRIVATE' not in str(error) and 'xxxx' not in str(error)
+print('bounded')
+"#,
+        );
+        assert_eq!(result, "bounded");
+    }
+
+    #[test]
+    fn python_resume_text_normalizes_common_whitespace_and_rejects_unsafe_controls() {
+        let result = run_pure_helper(
+            r#"
+snapshot=scope['resume_snapshot']({
+ 'baseInfo':{'nickName':'Candidate'},
+ 'workExpList':[{
+  'companyName':'Example',
+  'workContent':'Line one\nLine two\tTabbed\rFinal'
+ }]
+})
+work_line=next(
+ line for line in snapshot['content'].splitlines()
+ if 'Company: Example' in line
+)
+assert 'Summary: Line one Line two Tabbed Final' in work_line
+assert '\t' not in work_line and '\r' not in work_line
+for unsafe in ['bad\x00text','bad\u202etext']:
+ try:
+  scope['resume_text'](unsafe,'test',128)
+  raise AssertionError('accepted unsafe resume text')
+ except scope['SafeFailure']:
+  pass
+for phone in [
+ '0755-12345678',
+ '+86 138-0000-0000',
+ '13800000000',
+ '1234567',
+ '12345678',
+]:
+ text,_=scope['resume_text'](f'Call {phone} now','test',128)
+ assert '[redacted-phone]' in text and phone not in text
+for adjacent in [
+ '电话13800138000微信同号',
+ '电话0755-12345678微信同号',
+]:
+ text,_=scope['resume_text'](adjacent,'test',128)
+ assert '[redacted-phone]' in text
+ assert not any(character.isdigit() for character in text)
+for url in [
+ 'ftp://example.test/file',
+ 'mailto:candidate@example.test',
+ 'tel:+8613800000000',
+ 'data:text/plain,private',
+ 'wss://example.test/socket',
+ 'candidate.example.test/profile',
+]:
+ text,_=scope['resume_text'](f'Link {url} now','test',128)
+ assert '[redacted-url]' in text and url not in text
+date,_=scope['resume_text']('Worked 2020-01 to 2024-01','test',128)
+assert date == 'Worked 2020-01 to 2024-01'
+handle,shortened=scope['resume_text'](
+ 'Built useful tools with @platform team and kept ordinary context',
+ 'test',
+ 128
+)
+assert not shortened
+assert '@' not in handle
+assert '[redacted-at]platform' in handle
+assert 'Built useful tools' in handle and 'kept ordinary context' in handle
+bounded,shortened=scope['resume_text']('@handle '*100,'test',32)
+assert shortened and len(bounded) == 32 and '@' not in bounded
+print('normalized')
+"#,
+        );
+        assert_eq!(result, "normalized");
     }
 
     #[test]

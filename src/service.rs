@@ -350,6 +350,27 @@ impl BossService {
         Ok(login_outcome(platform, "stored_unverified", source))
     }
 
+    /// Reads the current online BOSS Zhipin resume without modifying it.
+    pub fn account_resume_show(&mut self) -> Result<Value, BossError> {
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "account resume show requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        let resume = crate::zhipin_direct::resume_show(&cookie)?;
+        self.auth.store_session(Platform::Zhipin, resume.cookie)?;
+        Ok(json!({
+            "action":"account_resume_show",
+            "platform":"zhipin",
+            "source":"resume_preview_api",
+            "verification":resume.verification,
+            "network_checked":true,
+            "resume":resume.snapshot,
+            "remote_modified":false,
+            "resume_submitted":false
+        }))
+    }
+
     /// Establishes one explicitly confirmed default Zhipin greeting.
     pub fn chat_greet(&mut self, job_id: &str, yes: bool) -> Result<Value, BossError> {
         if !yes {

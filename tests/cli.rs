@@ -227,6 +227,7 @@ fn bare_invocation_and_help_print_the_same_complete_chinese_root_help() {
             "campaign",
             "watch",
             "resume",
+            "account",
             "ai",
             "notify",
             "stats",
@@ -333,6 +334,16 @@ fn nested_help_screens_localize_generated_and_authored_text() {
             ],
         ),
         (
+            &["account", "resume", "show", "--help"],
+            &[
+                "用法: boss account resume show",
+                "通过纯命令行只读获取在线简历快照",
+                "不启动浏览器、不修改或投递",
+                "选项:",
+                "-h, --help  显示帮助",
+            ],
+        ),
+        (
             &["search", "--help"],
             &[
                 "用法: boss search [OPTIONS] [QUERY]",
@@ -382,6 +393,23 @@ fn nested_help_screens_localize_generated_and_authored_text() {
             );
         }
     }
+}
+
+#[test]
+fn account_resume_show_is_read_only_and_fails_without_a_session_before_network() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .args(["account", "resume", "show"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "authentication_error");
+    assert!(!directory.path().join(".auth").exists());
 }
 
 #[test]

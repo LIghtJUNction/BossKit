@@ -88,6 +88,11 @@ enum Command {
         #[command(subcommand)]
         command: ResumeCommand,
     },
+    /// 只读查看 BOSS 直聘在线账户资料；纯命令行且不启动浏览器
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     /// 管理无凭据的本地 AI 配置与明确确认的模型调用
     Ai {
         #[command(subcommand)]
@@ -232,6 +237,21 @@ enum ChatCommand {
         #[arg(required = true, num_args = 1..=5, value_name = "LOCAL_JOB_ID")]
         job_ids: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// 只读查看 BOSS 直聘在线简历；不修改或投递
+    Resume {
+        #[command(subcommand)]
+        command: AccountResumeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountResumeCommand {
+    /// 通过纯命令行只读获取在线简历快照；不启动浏览器、不修改或投递
+    Show,
 }
 
 #[derive(Clone, Args)]
@@ -1107,6 +1127,13 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             ResumeCommand::Rm { name, yes } => {
                 print_json(&Envelope::success(service.resume_remove(&name, yes)?));
             }
+        },
+        Command::Account { command } => match command {
+            AccountCommand::Resume { command } => match command {
+                AccountResumeCommand::Show => {
+                    print_json(&Envelope::success(service.account_resume_show()?));
+                }
+            },
         },
         Command::Ai { command } => match command {
             AiCommand::Profile { command } => match command {
