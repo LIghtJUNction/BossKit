@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use std::path::PathBuf;
 
+use bosskit::auth::ZhipinRole;
 use bosskit::campaign::{
     ApplicationPlanState, BlacklistKind, CampaignField, CampaignPolicy, CampaignRule,
     DEFAULT_MINIMUM_RESUME_SCORE,
@@ -161,6 +162,14 @@ enum Command {
         /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
         #[arg(short = 'c', long, conflicts_with = "manual")]
         cookie_stdin: bool,
+        /// BOSS account surface to verify and save
+        #[arg(long, value_enum, default_value = "geek")]
+        role: RoleArg,
+    },
+    /// Read-only recruiter inbox states; this is intentionally CLI-only
+    Recruiter {
+        #[command(subcommand)]
+        command: RecruiterCommand,
     },
     /// 对一个本地缓存 BOSS 职位发送平台默认招呼
     Chat {
@@ -225,6 +234,54 @@ enum ChatCommand {
         #[arg(required = true, num_args = 1..=5, value_name = "LOCAL_JOB_ID")]
         job_ids: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum RecruiterCommand {
+    /// List bounded redacted candidate reply states from the recruiter friend list
+    Replies {
+        #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
+        limit: usize,
+        #[arg(long, default_value_t = 1, value_parser = parse_recruiter_page)]
+        page: usize,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RoleArg {
+    Geek,
+    Recruiter,
+}
+
+impl From<RoleArg> for ZhipinRole {
+    fn from(value: RoleArg) -> Self {
+        match value {
+            RoleArg::Geek => Self::Geek,
+            RoleArg::Recruiter => Self::Recruiter,
+        }
+    }
+}
+
+fn parse_recruiter_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer".to_owned())?;
+    if (1..=20).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("limit must be between 1 and 20".to_owned())
+    }
+}
+
+fn parse_recruiter_page(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "page must be an integer".to_owned())?;
+    if (1..=50).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("page must be between 1 and 50".to_owned())
+    }
 }
 
 #[derive(Subcommand)]
@@ -1209,14 +1266,22 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         Command::Login {
             manual,
             cookie_stdin,
+            role,
         } => {
             let cookie = if cookie_stdin {
                 Some(BossService::read_login_cookie_stdin()?)
             } else {
                 None
             };
-            print_json(&Envelope::success(service.login(manual, cookie).await?));
+            print_json(&Envelope::success(
+                service.login(manual, cookie, role.into()).await?,
+            ));
         }
+        Command::Recruiter { command } => match command {
+            RecruiterCommand::Replies { limit, page } => {
+                print_json(&Envelope::success(service.recruiter_replies(limit, page)?));
+            }
+        },
         Command::Chat { command } => match command {
             ChatCommand::Greet { job_id, yes } => {
                 print_json(&Envelope::success(service.chat_greet(&job_id, yes)?));

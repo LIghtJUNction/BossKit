@@ -26,6 +26,7 @@ const MAX_RESUME_EXPECTATIONS: usize = 10;
 const MAX_RESUME_SECTION_ITEMS: usize = 8;
 const MAX_RESUME_CONTENT_CHARS: usize = 32 * 1024;
 const MAX_RESUME_RESPONSE_BYTES: usize = 60 * 1024;
+const MAX_RECRUITER_REPLIES_RESPONSE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
@@ -68,6 +69,21 @@ struct InboxRequest<'a> {
 struct ResumeShowRequest<'a> {
     action: &'static str,
     cookie: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct RecruiterRepliesRequest<'a> {
+    action: &'static str,
+    cookie: &'a str,
+    limit: usize,
+    page: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectRecruiterReply {
+    pub(crate) direction: String,
+    pub(crate) pending: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -151,6 +167,8 @@ struct HelperResponse {
     conversations: Option<Vec<HelperInboxConversation>>,
     #[serde(default)]
     snapshot: Option<DirectResumeSnapshot>,
+    #[serde(default)]
+    replies: Option<Vec<DirectRecruiterReply>>,
 }
 
 /// A verified session refresh whose Cookie remains private to the service.
@@ -200,6 +218,14 @@ pub(crate) struct DirectOnlineResume {
     pub(crate) snapshot: DirectResumeSnapshot,
 }
 
+/// A bounded, identifier-free recruiter reply result.
+#[derive(Debug)]
+pub(crate) struct DirectRecruiterReplies {
+    pub(crate) cookie: String,
+    pub(crate) verification: String,
+    pub(crate) records: Vec<DirectRecruiterReply>,
+}
+
 /// Refreshes and verifies one stored Zhipin Cookie without a browser process.
 pub(crate) fn refresh_session(cookie: &str) -> Result<DirectSessionRefresh, BossError> {
     let request = serde_json::to_vec(&RefreshRequest {
@@ -208,6 +234,37 @@ pub(crate) fn refresh_session(cookie: &str) -> Result<DirectSessionRefresh, Boss
     })
     .map_err(|_| transport_error("unable to encode direct transport request"))?;
     parse_refresh_response(&invoke_helper(&request)?)
+}
+
+/// Refreshes a recruiter session using only the recruiter friend-list route.
+pub(crate) fn refresh_recruiter_session(cookie: &str) -> Result<DirectSessionRefresh, BossError> {
+    let request = serde_json::to_vec(&RefreshRequest {
+        action: "recruiter_refresh",
+        cookie,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_recruiter_refresh_response(&invoke_helper(&request)?)
+}
+
+/// Reads bounded recruiter reply states without candidate search or chat APIs.
+pub(crate) fn recruiter_replies(
+    cookie: &str,
+    limit: usize,
+    page: usize,
+) -> Result<DirectRecruiterReplies, BossError> {
+    if !(1..=20).contains(&limit) || !(1..=50).contains(&page) {
+        return Err(BossError::InvalidArgument(
+            "recruiter replies limit must be 1..=20 and page must be 1..=50".to_owned(),
+        ));
+    }
+    let request = serde_json::to_vec(&RecruiterRepliesRequest {
+        action: "recruiter_replies",
+        cookie,
+        limit,
+        page,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_recruiter_replies_response(&invoke_helper(&request)?, limit)
 }
 
 /// Establishes and verifies one default Zhipin conversation without custom text.
@@ -371,6 +428,7 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
         || response.messages.is_some()
         || response.conversations.is_some()
         || response.snapshot.is_some()
+        || response.replies.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -395,6 +453,106 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
     })
 }
 
+fn parse_recruiter_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossError> {
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("recruiter session refresh failed"),
+        ));
+    }
+    if response.action.as_deref() != Some("recruiter_refresh")
+        || response.state.is_some()
+        || response.count.is_some()
+        || response.messages.is_some()
+        || response.conversations.is_some()
+        || response.snapshot.is_some()
+        || response.replies.is_some()
+    {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "recruiter_friend_list_api_code_0"
+                    | "security_token_refreshed_and_recruiter_friend_list_api_code_0"
+            )
+        })
+        .ok_or_else(|| transport_error("recruiter transport verification was invalid"))?;
+    Ok(DirectSessionRefresh {
+        cookie,
+        verification,
+    })
+}
+
+fn parse_recruiter_replies_response(
+    bytes: &[u8],
+    limit: usize,
+) -> Result<DirectRecruiterReplies, BossError> {
+    if bytes.len() > MAX_RECRUITER_REPLIES_RESPONSE_BYTES {
+        return Err(transport_error(
+            "recruiter replies result exceeded the safe output budget",
+        ));
+    }
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("recruiter replies failed"),
+        ));
+    }
+    if response.action.as_deref() != Some("recruiter_replies")
+        || response.state.is_some()
+        || response.messages.is_some()
+        || response.conversations.is_some()
+        || response.snapshot.is_some()
+    {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| value == "recruiter_friend_list_api_code_0")
+        .ok_or_else(|| transport_error("recruiter transport verification was invalid"))?;
+    let records = response
+        .replies
+        .filter(|records| {
+            records.len() <= limit
+                && records.iter().all(|record| {
+                    matches!(
+                        record.direction.as_str(),
+                        "candidate_to_recruiter" | "unknown"
+                    ) && (record.pending == (record.direction == "candidate_to_recruiter"))
+                })
+        })
+        .ok_or_else(|| transport_error("recruiter replies were invalid"))?;
+    if response.count != Some(records.len()) {
+        return Err(transport_error("recruiter reply count was invalid"));
+    }
+    Ok(DirectRecruiterReplies {
+        cookie,
+        verification,
+        records,
+    })
+}
+
 fn parse_greet_response(bytes: &[u8]) -> Result<DirectGreeting, BossError> {
     let response: HelperResponse = serde_json::from_slice(bytes)
         .map_err(|_| transport_error("direct transport returned an invalid result"))?;
@@ -411,6 +569,7 @@ fn parse_greet_response(bytes: &[u8]) -> Result<DirectGreeting, BossError> {
         || response.messages.is_some()
         || response.conversations.is_some()
         || response.snapshot.is_some()
+        || response.replies.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -450,6 +609,7 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
         || response.messages.is_some()
         || response.conversations.is_some()
         || response.snapshot.is_some()
+        || response.replies.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -493,6 +653,7 @@ fn parse_history_response(bytes: &[u8]) -> Result<DirectHistory, BossError> {
         || response.state.is_some()
         || response.conversations.is_some()
         || response.snapshot.is_some()
+        || response.replies.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -572,6 +733,7 @@ fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox
         || response.messages.is_some()
         || response.error.is_some()
         || response.snapshot.is_some()
+        || response.replies.is_some()
     {
         return Err(transport_error("direct transport action mismatch"));
     }
@@ -1427,5 +1589,31 @@ print('normalized')
             "try:\n scope['encode_varint'](-1)\n print('accepted')\nexcept scope['SafeFailure']:\n print('rejected')",
         );
         assert_eq!(result, "rejected");
+    }
+
+    #[test]
+    fn recruiter_reply_parser_is_bounded_redacted_and_never_guesses_direction() {
+        let payload = br#"{"ok":true,"action":"recruiter_replies","verification":"recruiter_friend_list_api_code_0","updated_cookie":"wt2=secret","count":2,"replies":[{"direction":"candidate_to_recruiter","pending":true},{"direction":"unknown","pending":false}]}"#;
+        let parsed = parse_recruiter_replies_response(payload, 2).expect("safe replies");
+        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed.records[1].direction, "unknown");
+        for invalid in [
+            br#"{"ok":true,"action":"recruiter_replies","verification":"recruiter_friend_list_api_code_0","updated_cookie":"wt2=secret","count":1,"replies":[{"direction":"unknown","pending":true}]}"#.as_slice(),
+            br#"{"ok":true,"action":"recruiter_replies","verification":"recruiter_friend_list_api_code_0","updated_cookie":"wt2=secret","count":1,"replies":[{"direction":"candidate_to_recruiter","pending":true,"id":"private"}]}"#.as_slice(),
+        ] {
+            assert!(parse_recruiter_replies_response(invalid, 20).is_err());
+        }
+    }
+
+    #[test]
+    fn recruiter_helper_uses_only_the_fixed_get_friend_list_route() {
+        assert!(HELPER.contains("getBossFriendListV2.json"));
+        assert!(
+            HELPER.contains("params={\"page\": str(page), \"status\": \"0\", \"jobId\": \"0\"}")
+        );
+        let result = run_pure_helper(
+            "assert scope['recruiter_direction']({'isFromGeek': True}) == 'candidate_to_recruiter'\nassert scope['recruiter_direction']({}) == 'unknown'\nprint('safe')",
+        );
+        assert_eq!(result, "safe");
     }
 }

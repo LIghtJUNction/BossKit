@@ -23,6 +23,25 @@ const MAX_ACCOUNTS: usize = 32;
 pub(crate) const MAX_ACCOUNT_ALIAS_CHARS: usize = 32;
 pub(crate) const DEFAULT_ACCOUNT: &str = "default";
 
+/// The only supported BOSS account surfaces. This is safe local metadata.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZhipinRole {
+    #[default]
+    Geek,
+    Recruiter,
+}
+
+impl ZhipinRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Geek => "geek",
+            Self::Recruiter => "recruiter",
+        }
+    }
+}
+
 /// Safe, value-free health of the private credential store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthHealth {
@@ -77,6 +96,8 @@ impl Default for AuthDocument {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AccountAuth {
+    #[serde(default)]
+    role: ZhipinRole,
     #[serde(default)]
     zhipin: StoredAuth,
     #[serde(
@@ -230,6 +251,32 @@ impl AuthStore {
     #[must_use]
     pub(crate) fn account_aliases(&self) -> Vec<&str> {
         self.document.accounts.keys().map(String::as_str).collect()
+    }
+
+    #[must_use]
+    pub(crate) fn account_role(&self, alias: &str) -> ZhipinRole {
+        self.document
+            .accounts
+            .get(alias)
+            .map_or(ZhipinRole::Geek, |account| account.role)
+    }
+
+    #[must_use]
+    pub(crate) fn active_role(&self) -> ZhipinRole {
+        self.account_role(&self.active_account)
+    }
+
+    pub(crate) fn set_active_role(&mut self, role: ZhipinRole) -> Result<(), BossError> {
+        if !self.document.accounts.contains_key(&self.active_account) {
+            self.document
+                .accounts
+                .insert(self.active_account.clone(), AccountAuth::default());
+        }
+        let Some(account) = self.document.accounts.get_mut(&self.active_account) else {
+            return Err(auth_error("unable to select private credential account"));
+        };
+        account.role = role;
+        self.persist()
     }
 
     /// Creates or selects the persisted default account.
@@ -831,6 +878,28 @@ mod tests {
         assert_eq!(
             reloaded.session_cookie(Platform::Zhipin).as_deref(),
             Some("session=work-fixture")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_accounts_default_to_geek_and_persist_explicit_recruiter_role() {
+        let directory = tempdir().expect("tempdir");
+        let paths = DataPaths::new(directory.path());
+        fs::create_dir(paths.auth_dir()).expect("auth directory");
+        fs::set_permissions(paths.auth_dir(), fs::Permissions::from_mode(0o700))
+            .expect("secure directory");
+        fs::write(paths.auth_sessions(), br#"{"selected_account":"work","accounts":{"work":{"zhipin":{"cookie":"session=fixture"}}}}"#).expect("session");
+        fs::set_permissions(paths.auth_sessions(), fs::Permissions::from_mode(0o600))
+            .expect("secure session");
+        let mut store = AuthStore::from_paths(&paths);
+        assert_eq!(store.active_role(), ZhipinRole::Geek);
+        store
+            .set_active_role(ZhipinRole::Recruiter)
+            .expect("set role");
+        assert_eq!(
+            AuthStore::from_paths(&paths).active_role(),
+            ZhipinRole::Recruiter
         );
     }
 }

@@ -35,7 +35,7 @@ boss mcp
 
 ```bash
 boss account use work --yes
-wl-paste | boss login --account work -c
+wl-paste | boss login --account work --role geek -c
 boss --account work status
 boss logout --yes
 ```
@@ -43,6 +43,8 @@ boss logout --yes
 登录只支持 BOSS 直聘。Cookie 不进入命令行参数、shell 历史或 JSON 输出；`-c` 仅从非终端标准输入读取一个 Cookie，`--manual` 仅在终端以隐藏回显输入。会话保存于 `0700` 私有目录和 `0600` 私有文件。旧版其它平台会话在读取时被安全忽略，且不会阻塞启动或被重新写出。
 
 `login` 使用纯命令行 HTTPS 验证 BOSS 会话；遇到需要本地 V8 挑战计算的响应时，会在本机完成计算后再验证。整个过程不启动浏览器、不读取浏览器资料，也不输出 Cookie。
+
+每个本地账户保存安全元数据角色：旧账户默认 `geek`；可用 `boss login --role recruiter -c` 保存招聘者会话。招聘者只提供 CLI 的只读 `boss recruiter replies --limit 20 --page 1`：它仅访问招聘者好友列表，返回有界、无标识符和联系方式的候选回复状态。方向证据不精确时会明确返回 `unknown`，不会猜测为待处理。招聘者会话不能执行搜索、在线简历或聊天；这些能力保持 `geek` 专用。
 
 ## 本地筛选与人工复核
 
@@ -73,7 +75,7 @@ boss chat send <本地职位ID> --message "你好，想进一步了解这个职�
 boss mcp
 ```
 
-MCP 使用 2025-03-26 stdio JSON-RPC。它提供 BOSS 职位搜索、缓存、筛选和本地工作流工具；不提供账户选择、登录、登出、在线简历、聊天或凭据入口。
+MCP 使用 2025-03-26 stdio JSON-RPC。它提供 BOSS 职位搜索、缓存、筛选和本地工作流工具；不提供账户选择、登录、登出、招聘者、在线简历、聊天或凭据入口。
 
 ## 配置
 

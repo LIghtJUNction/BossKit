@@ -22,6 +22,9 @@ from urllib.parse import quote
 FRIEND_LIST_URL = (
     "https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json"
 )
+RECRUITER_FRIEND_LIST_URL = (
+    "https://www.zhipin.com/wapi/zprelation/friend/getBossFriendListV2.json"
+)
 FRIEND_ADD_URL = "https://www.zhipin.com/wapi/zpgeek/friend/add.json"
 API_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 USER_INFO_URL = "https://www.zhipin.com/wapi/zpuser/wap/getUserInfo.json"
@@ -257,6 +260,21 @@ def friend_list(
     )
 
 
+def recruiter_friend_list(
+    session: requests.Session, page: int, deadline: float | None = None
+) -> dict:
+    """The sole recruiter route: a GET with the fixed safe query contract."""
+    return request_json(
+        session.get(
+            RECRUITER_FRIEND_LIST_URL,
+            headers=HEADERS,
+            params={"page": str(page), "status": "0", "jobId": "0"},
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin recruiter friend list",
+    )
+
+
 def prepare_session(
     cookie: str,
     deadline: float | None = None,
@@ -327,6 +345,79 @@ def refresh(cookie: str) -> dict:
             else "authenticated_api_code_0"
         ),
         "updated_cookie": cookie_header(pairs),
+    }
+
+
+def prepare_recruiter_session(cookie: str) -> tuple[requests.Session, list[tuple[str, str]], bool, dict]:
+    """Verify recruiter auth without touching any geek route or candidate search."""
+    import requests
+
+    pairs = cookie_pairs(cookie)
+    session = requests.Session()
+    for name, value in pairs:
+        session.cookies.set(name, value, domain=".zhipin.com", path="/")
+    payload = recruiter_friend_list(session, 1)
+    code = api_code(payload, "Zhipin recruiter friend list")
+    refreshed = False
+    if code == 37:
+        pairs = apply_challenge(payload, pairs, session, None)
+        refreshed = True
+        payload = recruiter_friend_list(session, 1)
+        code = api_code(payload, "Zhipin recruiter friend list")
+    if code != 0:
+        raise SafeFailure(f"Zhipin recruiter friend list failed with API code {code!r}")
+    return session, pairs, refreshed, payload
+
+
+def recruiter_refresh(cookie: str) -> dict:
+    _, pairs, refreshed, _ = prepare_recruiter_session(cookie)
+    return {
+        "ok": True,
+        "action": "recruiter_refresh",
+        "verification": (
+            "security_token_refreshed_and_recruiter_friend_list_api_code_0"
+            if refreshed else "recruiter_friend_list_api_code_0"
+        ),
+        "updated_cookie": cookie_header(pairs),
+    }
+
+
+def recruiter_direction(item: dict) -> str:
+    """Only label pending when the payload gives exact sender evidence."""
+    if item.get("isFromGeek") is True:
+        return "candidate_to_recruiter"
+    latest = item.get("lastMessage")
+    if isinstance(latest, dict) and latest.get("fromGeek") is True:
+        return "candidate_to_recruiter"
+    return "unknown"
+
+
+def recruiter_replies(cookie: str, limit: int, page: int) -> dict:
+    if type(limit) is not int or not 1 <= limit <= 20:
+        raise SafeFailure("recruiter replies limit must be 1..=20")
+    if type(page) is not int or not 1 <= page <= 50:
+        raise SafeFailure("recruiter replies page must be 1..=50")
+    session, pairs, _, initial = prepare_recruiter_session(cookie)
+    payload = initial if page == 1 else recruiter_friend_list(session, page)
+    if api_code(payload, "Zhipin recruiter friend list") != 0:
+        raise SafeFailure("Zhipin recruiter friend list failed")
+    data = payload.get("zpData")
+    if not isinstance(data, dict):
+        raise SafeFailure("Zhipin recruiter friend list returned no result data")
+    items = data.get("result", [])
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise SafeFailure("Zhipin recruiter friend list returned invalid result entries")
+    records = []
+    for item in items[:limit]:
+        direction = recruiter_direction(item)
+        records.append({"direction": direction, "pending": direction == "candidate_to_recruiter"})
+    return {
+        "ok": True,
+        "action": "recruiter_replies",
+        "verification": "recruiter_friend_list_api_code_0",
+        "updated_cookie": cookie_header(pairs),
+        "count": len(records),
+        "replies": records,
     }
 
 
@@ -1515,6 +1606,8 @@ def main() -> int:
             "history",
             "inbox",
             "resume_show",
+            "recruiter_refresh",
+            "recruiter_replies",
         }:
             raise SafeFailure("unsupported transport action")
         cookie = request.get("cookie")
@@ -1524,6 +1617,14 @@ def main() -> int:
             if set(request) != {"action", "cookie"}:
                 raise SafeFailure("transport request contains unsupported fields")
             response = refresh(cookie)
+        elif action == "recruiter_refresh":
+            if set(request) != {"action", "cookie"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = recruiter_refresh(cookie)
+        elif action == "recruiter_replies":
+            if set(request) != {"action", "cookie", "limit", "page"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = recruiter_replies(cookie, request.get("limit"), request.get("page"))
         elif action == "greet":
             if set(request) != {"action", "cookie", "title", "remote_id"}:
                 raise SafeFailure("transport request contains unsupported fields")

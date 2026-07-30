@@ -169,6 +169,34 @@ fn invalid_limit_is_a_json_error() {
 }
 
 #[test]
+fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
+    let directory = tempdir().expect("temporary directory");
+    let login = run_json(directory.path(), &["login", "--role", "recruiter"]);
+    assert_eq!(
+        login["data"]["results"][0]["state"],
+        "manual_login_required"
+    );
+    let accounts = run_json(directory.path(), &["account", "list"]);
+    assert_eq!(accounts["data"]["accounts"][0]["role"], "recruiter");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["search", "rust"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["recruiter", "replies", "--limit", "21"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+}
+
+#[test]
 fn unknown_command_keeps_the_unlocalized_json_parse_error() {
     let output = Command::cargo_bin("boss")
         .expect("binary")

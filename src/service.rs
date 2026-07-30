@@ -16,7 +16,7 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde_json::{Value, json};
 
 use crate::ai::{AiProfile, AiProfileStore, AiScore};
-use crate::auth::{AuthStore, read_cookie_stdin, read_manual_cookie, validate_cookie};
+use crate::auth::{AuthStore, ZhipinRole, read_cookie_stdin, read_manual_cookie, validate_cookie};
 use crate::campaign::{
     ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
     CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult, ScreenPlanOptions,
@@ -229,6 +229,7 @@ impl BossService {
                     .collect();
                 json!({
                     "alias":alias,
+                    "role":self.auth.account_role(alias).as_str(),
                     "selected":*alias == self.auth.default_account(),
                     "active":*alias == self.auth.active_account(),
                     "stored_sessions":sessions
@@ -290,6 +291,7 @@ impl BossService {
         json!({
             "network_checked":false,
             "account":self.auth.active_account(),
+            "role":self.auth.active_role().as_str(),
             "selected_account":self.auth.default_account(),
             "auth_store":self.auth.health().as_str(),
             "providers":providers
@@ -325,6 +327,7 @@ impl BossService {
         &mut self,
         manual: bool,
         cookie: Option<String>,
+        role: ZhipinRole,
     ) -> Result<Value, BossError> {
         if manual && cookie.is_some() {
             return Err(BossError::InvalidArgument(
@@ -334,8 +337,9 @@ impl BossService {
         if let Some(cookie) = cookie.as_deref() {
             validate_cookie(cookie)?;
         }
+        self.auth.set_active_role(role)?;
         let results = vec![
-            self.login_platform(Platform::Zhipin, manual, cookie)
+            self.login_platform(Platform::Zhipin, manual, cookie, role)
                 .await?,
         ];
         let direct_verified = results
@@ -381,25 +385,30 @@ impl BossService {
         platform: Platform,
         manual: bool,
         cookie: Option<String>,
+        role: ZhipinRole,
     ) -> Result<Value, BossError> {
         if let Some(cookie) = cookie {
-            return self.store_login_cookie(platform, cookie, "stdin");
+            return self.store_login_cookie(platform, cookie, "stdin", role);
         }
         if manual {
-            return self.manual_login_result(platform);
+            return self.manual_login_result(platform, role);
         }
         if let Some(cookie) = self.auth.active_environment_cookie(platform) {
-            return self.store_login_cookie(platform, cookie, "environment");
+            return self.store_login_cookie(platform, cookie, "environment", role);
         }
         if let Some(cookie) = self.auth.session_cookie(platform) {
-            return self.store_login_cookie(platform, cookie, "stored_session");
+            return self.store_login_cookie(platform, cookie, "stored_session", role);
         }
-        self.manual_login_result(platform)
+        self.manual_login_result(platform, role)
     }
 
-    fn manual_login_result(&mut self, platform: Platform) -> Result<Value, BossError> {
+    fn manual_login_result(
+        &mut self,
+        platform: Platform,
+        role: ZhipinRole,
+    ) -> Result<Value, BossError> {
         match read_manual_cookie(platform)? {
-            Some(cookie) => self.store_login_cookie(platform, cookie, "manual"),
+            Some(cookie) => self.store_login_cookie(platform, cookie, "manual", role),
             None => Ok(login_outcome(platform, "manual_login_required", "none")),
         }
     }
@@ -409,14 +418,19 @@ impl BossService {
         platform: Platform,
         cookie: String,
         source: &'static str,
+        role: ZhipinRole,
     ) -> Result<Value, BossError> {
         if platform == Platform::Zhipin {
-            let refreshed = crate::zhipin_direct::refresh_session(&cookie)?;
+            let refreshed = match role {
+                ZhipinRole::Geek => crate::zhipin_direct::refresh_session(&cookie)?,
+                ZhipinRole::Recruiter => crate::zhipin_direct::refresh_recruiter_session(&cookie)?,
+            };
             self.auth.store_session(platform, refreshed.cookie)?;
             return Ok(json!({
                 "platform":platform,
                 "state":"direct_verified",
                 "source":source,
+                "role":role.as_str(),
                 "verification":refreshed.verification
             }));
         }
@@ -424,8 +438,51 @@ impl BossService {
         Ok(login_outcome(platform, "stored_unverified", source))
     }
 
+    fn require_geek(&self, operation: &str) -> Result<(), BossError> {
+        if self.auth.active_role() == ZhipinRole::Recruiter {
+            return Err(BossError::InvalidArgument(format!(
+                "{operation} requires a geek Zhipin session; the selected account is recruiter"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Lists bounded, redacted recruiter reply states using only the recruiter friend-list API.
+    pub fn recruiter_replies(&mut self, limit: usize, page: usize) -> Result<Value, BossError> {
+        if !(1..=20).contains(&limit) || !(1..=50).contains(&page) {
+            return Err(BossError::InvalidArgument(
+                "recruiter replies limit must be 1..=20 and page must be 1..=50".to_owned(),
+            ));
+        }
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter replies requires a selected saved recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter replies requires a selected saved recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let replies = crate::zhipin_direct::recruiter_replies(&cookie, limit, page)?;
+        self.auth.store_session(Platform::Zhipin, replies.cookie)?;
+        Ok(json!({
+            "action":"recruiter_replies",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "page":page,
+            "limit":limit,
+            "count":replies.records.len(),
+            "records":replies.records,
+            "verification":replies.verification,
+            "network_checked":true,
+            "remote_modified":false
+        }))
+    }
+
     /// Reads the current online BOSS Zhipin resume without modifying it.
     pub fn account_resume_show(&mut self) -> Result<Value, BossError> {
+        self.require_geek("account resume show")?;
         let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
             BossError::Authentication(
                 "account resume show requires a saved or environment Zhipin session".to_owned(),
@@ -448,6 +505,7 @@ impl BossService {
 
     /// Establishes one explicitly confirmed default Zhipin greeting.
     pub fn chat_greet(&mut self, job_id: &str, yes: bool) -> Result<Value, BossError> {
+        self.require_geek("chat greet")?;
         if !yes {
             return Err(BossError::InvalidArgument(
                 "chat greet requires --yes".to_owned(),
@@ -493,6 +551,7 @@ impl BossService {
         message: &str,
         yes: bool,
     ) -> Result<Value, BossError> {
+        self.require_geek("chat send")?;
         if !yes {
             return Err(BossError::InvalidArgument(
                 "chat send requires --yes".to_owned(),
@@ -532,6 +591,7 @@ impl BossService {
 
     /// Reads a bounded text snapshot from one existing exact Zhipin conversation.
     pub fn chat_history(&mut self, job_id: &str, limit: usize) -> Result<Value, BossError> {
+        self.require_geek("chat history")?;
         if !(1..=crate::zhipin_direct::MAX_CHAT_HISTORY_MESSAGES).contains(&limit) {
             return Err(BossError::InvalidArgument(
                 "chat history limit must be between 1 and 20".to_owned(),
@@ -571,6 +631,7 @@ impl BossService {
 
     /// Reads the latest safe text for up to five exact Zhipin conversations.
     pub fn chat_inbox(&mut self, job_ids: &[String]) -> Result<Value, BossError> {
+        self.require_geek("chat inbox")?;
         if !(1..=crate::zhipin_direct::MAX_CHAT_INBOX_CONVERSATIONS).contains(&job_ids.len()) {
             return Err(BossError::InvalidArgument(
                 "chat inbox requires between 1 and 5 jobs".to_owned(),
@@ -730,6 +791,7 @@ impl BossService {
         limit: u32,
         filters: SearchFilters,
     ) -> Result<SearchReport, BossError> {
+        self.require_geek("search")?;
         if let Some(city) = city {
             crate::city::validate_selection(city)?;
         }
@@ -815,6 +877,7 @@ impl BossService {
 
     /// Returns cached detail or refreshes it through the matching read-only provider.
     pub async fn detail(&self, id: &str, refresh: bool) -> Result<Job, BossError> {
+        self.require_geek("detail")?;
         let cached = self
             .cache
             .show(id)?
