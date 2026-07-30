@@ -511,18 +511,19 @@ impl BossService {
             for page_number in 1..=50 {
                 let page_records =
                     crate::zhipin_http::recruiter_inbox(&cookie, 20, page_number, job_filter)?;
-                let page_count = page_records.len();
+                let page_count = page_records.raw_count;
                 pages_scanned += 1;
-                records.extend(page_records);
+                records.extend(page_records.records);
                 // A job filter is applied before history reads, so the
-                // filtered count cannot indicate that the remote page ended.
-                // Scan the bounded page range in full when filtering.
-                if job_filter.is_none() && page_count < 20 {
+                // raw page count, rather than the filtered count, determines
+                // whether the bounded friend-list pagination has ended.
+                if page_count < 20 {
                     break;
                 }
             }
         } else {
-            records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page, job_filter)?;
+            records =
+                crate::zhipin_http::recruiter_inbox(&cookie, limit, page, job_filter)?.records;
             pages_scanned = 1;
         }
         let records = records

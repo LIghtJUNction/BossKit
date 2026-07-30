@@ -123,6 +123,12 @@ pub(crate) struct RecruiterReplies {
     pub(crate) records: Vec<RecruiterReplyRecord>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RecruiterInboxPage {
+    pub(crate) records: Vec<RecruiterInboxRecord>,
+    pub(crate) raw_count: usize,
+}
+
 /// Fetches one bounded recruiter friend-list page without invoking Python.
 pub(crate) fn recruiter_replies(
     cookie: &str,
@@ -177,7 +183,7 @@ pub(crate) fn recruiter_inbox(
     limit: usize,
     page: usize,
     job_filter: Option<&str>,
-) -> Result<Vec<RecruiterInboxRecord>, BossError> {
+) -> Result<RecruiterInboxPage, BossError> {
     if !(1..=MAX_RECRUITER_INBOX_RECORDS).contains(&limit) || !(1..=50).contains(&page) {
         return Err(BossError::InvalidArgument(
             "recruiter inbox limit must be 1..=20 and page must be 1..=50".to_owned(),
@@ -478,7 +484,7 @@ fn recruiter_inbox_blocking(
     limit: usize,
     page: usize,
     job_filter: Option<String>,
-) -> Result<Vec<RecruiterInboxRecord>, BossError> {
+) -> Result<RecruiterInboxPage, BossError> {
     let client = Client::builder()
         .redirect(Policy::none())
         .timeout(REQUEST_TIMEOUT)
@@ -564,7 +570,10 @@ fn recruiter_inbox_blocking(
             last_message,
         });
     }
-    Ok(records)
+    Ok(RecruiterInboxPage {
+        records,
+        raw_count: items.len(),
+    })
 }
 
 /// Sends one recruiter message through the native MQTT-over-WebSocket path
