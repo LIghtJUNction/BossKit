@@ -278,6 +278,7 @@ impl BossService {
                     "present":env_present,
                     "environment_allowed":environment_allowed,
                     "stored_session_present":stored_session_present,
+                    "session_health":self.auth.session_health(selected),
                     "auth_state":if env_present {
                         "env_cookie_present"
                     } else if stored_session_present {

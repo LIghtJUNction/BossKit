@@ -44,6 +44,8 @@ boss logout --yes
 
 `login` 使用纯命令行 HTTPS 验证 BOSS 会话；遇到需要本地 V8 挑战计算的响应时，会在本机完成计算后再验证。整个过程不启动浏览器、不读取浏览器资料，也不输出 Cookie。
 
+`boss status` 始终是离线检查：除环境变量和会话是否存在外，还会报告 `wt2`、`__zp_stoken__` 及辅助 Cookie 的存在状态，并给出下一步建议；不会输出 Cookie 值，也不会发起平台请求。
+
 每个本地账户保存安全元数据角色：旧账户默认 `geek`；可用 `boss login --account lty --role recruiter -c` 保存招聘者会话。招聘者命令必须显式带 `--account <招聘者账户>`，避免误用默认求职者身份。招聘者 CLI 提供有界的 `boss --account lty recruiter replies` 状态列表、`boss --account lty recruiter inbox --limit 20 --page 1` 会话预览，也支持一次性原生扫描和筛选：`boss --account lty recruiter inbox --all --pending --job 'AI应用提效官'`。此外可用 `boss --account lty recruiter resume <UID>` 读取一个候选人的完整在线简历详情（只读、限量、脱敏、不落盘）。预览只保留最近一条文本并脱敏联系方式；返回的会话 UID 仅用于人工确认后的精确回复。发送必须显式执行 `boss --account lty recruiter reply <UID> --message '...' --yes`，每次只发一条并通过历史记录核验，不自动发 Offer、不批量群发。
 
 命令默认输出紧凑 Markdown；需要脚本解析时显式加全局 `--json`，例如 `boss --json --account lty recruiter resume <UID>`。

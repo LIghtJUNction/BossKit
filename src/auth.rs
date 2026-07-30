@@ -53,6 +53,31 @@ pub enum AuthHealth {
     Unavailable,
 }
 
+/// Value-free health of a stored Zhipin session.
+///
+/// This intentionally exposes only the presence of cookie classes. Cookie
+/// values, names, and paths never leave the private auth store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SessionHealth {
+    pub(crate) cookie_present: bool,
+    pub(crate) primary_cookie_present: bool,
+    pub(crate) stoken_present: bool,
+    pub(crate) auxiliary_cookie_present: bool,
+    pub(crate) state: &'static str,
+    pub(crate) next_action: &'static str,
+}
+
+impl SessionHealth {
+    const MISSING: Self = Self {
+        cookie_present: false,
+        primary_cookie_present: false,
+        stoken_present: false,
+        auxiliary_cookie_present: false,
+        state: "missing",
+        next_action: "boss login",
+    };
+}
+
 impl AuthHealth {
     /// Returns the stable, safe diagnostic value.
     #[must_use]
@@ -322,6 +347,43 @@ impl AuthStore {
     #[must_use]
     pub fn has_session(&self, platform: Platform) -> bool {
         self.session_cookie(platform).is_some()
+    }
+
+    /// Returns safe, local-only health for the active account's stored session.
+    #[must_use]
+    pub(crate) fn session_health(&self, platform: Platform) -> SessionHealth {
+        let Some(cookie) = self.session_cookie(platform) else {
+            return SessionHealth::MISSING;
+        };
+        let mut primary_cookie_present = false;
+        let mut stoken_present = false;
+        let mut auxiliary_cookie_present = false;
+        for part in cookie.split(';') {
+            let Some((name, _)) = part.trim().split_once('=') else {
+                continue;
+            };
+            match name.trim() {
+                "wt2" => primary_cookie_present = true,
+                "__zp_stoken__" => stoken_present = true,
+                "wbg" | "zp_at" => auxiliary_cookie_present = true,
+                _ => {}
+            }
+        }
+        let complete = primary_cookie_present && stoken_present;
+        SessionHealth {
+            cookie_present: true,
+            primary_cookie_present,
+            stoken_present,
+            auxiliary_cookie_present,
+            state: if complete { "ready" } else { "partial" },
+            next_action: if complete {
+                "none"
+            } else if primary_cookie_present {
+                "boss login --repair"
+            } else {
+                "boss login"
+            },
+        }
     }
 
     /// Returns whether one named account has a saved session.
@@ -879,6 +941,42 @@ mod tests {
             reloaded.session_cookie(Platform::Zhipin).as_deref(),
             Some("session=work-fixture")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_health_reports_cookie_classes_without_values() {
+        let directory = tempdir().expect("tempdir");
+        let paths = DataPaths::new(directory.path());
+        let mut store = AuthStore::from_paths(&paths);
+        assert_eq!(
+            store.session_health(Platform::Zhipin),
+            SessionHealth::MISSING
+        );
+
+        store
+            .store_session(Platform::Zhipin, "wt2=primary-fixture".to_owned())
+            .expect("store partial session");
+        let partial = store.session_health(Platform::Zhipin);
+        assert_eq!(partial.state, "partial");
+        assert_eq!(partial.next_action, "boss login --repair");
+        assert!(!partial.stoken_present);
+
+        store
+            .store_session(
+                Platform::Zhipin,
+                "wt2=primary-fixture; __zp_stoken__=stoken-fixture; wbg=aux-fixture".to_owned(),
+            )
+            .expect("store session");
+        let health = store.session_health(Platform::Zhipin);
+        assert_eq!(health.state, "ready");
+        assert!(health.cookie_present);
+        assert!(health.primary_cookie_present);
+        assert!(health.stoken_present);
+        assert!(health.auxiliary_cookie_present);
+        let serialized = serde_json::to_string(&health).expect("serialize health");
+        assert!(!serialized.contains("primary-fixture"));
+        assert!(!serialized.contains("stoken-fixture"));
     }
 
     #[cfg(unix)]
