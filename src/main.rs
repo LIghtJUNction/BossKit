@@ -48,6 +48,9 @@ fn localize_generated_help(help: &str) -> String {
     arg_required_else_help = true
 )]
 struct Cli {
+    /// 临时选择本次命令使用的本地账户，不更改默认账户
+    #[arg(long, global = true, value_name = "ALIAS")]
+    account: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -88,7 +91,7 @@ enum Command {
         #[command(subcommand)]
         command: ResumeCommand,
     },
-    /// 只读查看 BOSS 直聘在线账户资料；纯命令行且不启动浏览器
+    /// 管理本地会话账户并只读查看 BOSS 直聘资料；纯命令行且不启动浏览器
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -241,6 +244,17 @@ enum ChatCommand {
 
 #[derive(Subcommand)]
 enum AccountCommand {
+    /// 列出安全的本地账户元数据；不显示凭据或路径
+    #[command(alias = "ls")]
+    List,
+    /// 创建或选择后续命令使用的默认本地账户
+    Use {
+        /// 账户别名
+        alias: String,
+        /// 明确确认本次本地账户写操作
+        #[arg(long)]
+        yes: bool,
+    },
     /// 只读查看 BOSS 直聘在线简历；不修改或投递
     Resume {
         #[command(subcommand)]
@@ -884,7 +898,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             | ChatCommand::Inbox { .. } => {}
         }
     }
-    let mut service = BossService::discover()?;
+    let mut service = BossService::discover_for_account(cli.account.as_deref())?;
     match cli.command {
         Command::Platforms => print_json(&Envelope::success(service.platforms())),
         Command::Cities => print_json(&Envelope::success(service.cities())),
@@ -1129,6 +1143,12 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             }
         },
         Command::Account { command } => match command {
+            AccountCommand::List => {
+                print_json(&Envelope::success(service.account_list()));
+            }
+            AccountCommand::Use { alias, yes } => {
+                print_json(&Envelope::success(service.account_use(&alias, yes)?));
+            }
             AccountCommand::Resume { command } => match command {
                 AccountResumeCommand::Show => {
                     print_json(&Envelope::success(service.account_resume_show()?));

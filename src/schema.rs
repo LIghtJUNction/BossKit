@@ -533,7 +533,8 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
                     "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. greet and send are explicitly confirmed writes; history reads one bounded exact conversation; inbox reads only the latest safe text for 1 to 5 exact conversations without polling or replying. send verifies exact outgoing history, none submits a resume, and no chat command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
-                "authentication":"login and logout are CLI-only private credential operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use environment, stored, or hidden manual Cookie input. Authentication remains unavailable through MCP."
+                    "accounts":"Named accounts are CLI-only local session profiles. --account selects one profile for the current CLI process; account use changes the saved default. Generic environment Cookies are eligible only for the literal default account.",
+                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only account operations. Zhipin sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; other platforms use stored or hidden manual Cookie input, while generic environment Cookies are limited to the default account. Credential actions remain unavailable through MCP."
                 },
                 "risk":{
                     "remote_writes":true,
@@ -619,6 +620,9 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("config get", &[]),
         ("config set", &["config"]),
         ("config reset", &["config"]),
+        ("account list", &[]),
+        ("account use", &["private_auth_store"]),
+        ("account resume show", &["private_auth_store"]),
         ("login", &["private_auth_store"]),
         ("chat greet", &["private_auth_store"]),
         ("chat send", &["private_auth_store"]),
@@ -764,12 +768,20 @@ mod tests {
     fn authentication_commands_are_native_only() {
         let native = render(SchemaFormat::Native).expect("native");
         let commands = native["commands"].as_array().expect("commands");
-        assert!(commands.iter().any(|command| command["name"] == "login"));
-        assert!(commands.iter().any(|command| command["name"] == "logout"));
         assert!(
-            tool_registry()
-                .iter()
-                .all(|tool| !matches!(tool.name, "login" | "logout"))
+            [
+                "account list",
+                "account use",
+                "account resume show",
+                "login",
+                "logout"
+            ]
+            .into_iter()
+            .all(|name| commands.iter().any(|command| command["name"] == name))
+                && tool_registry().iter().all(|tool| !matches!(
+                    tool.name,
+                    "account_list" | "account_use" | "account_resume_show" | "login" | "logout"
+                ))
         );
     }
 

@@ -131,10 +131,22 @@ impl BossService {
         Self::from_paths(DataPaths::discover())
     }
 
+    /// Constructs the CLI service with an optional process-local account override.
+    pub fn discover_for_account(account: Option<&str>) -> Result<Self, BossError> {
+        Self::from_paths_with_account(DataPaths::discover(), account)
+    }
+
     pub(crate) fn from_paths(paths: DataPaths) -> Result<Self, BossError> {
+        Self::from_paths_with_account(paths, None)
+    }
+
+    fn from_paths_with_account(paths: DataPaths, account: Option<&str>) -> Result<Self, BossError> {
         let config = ConfigStore::from_paths(&paths)?;
         let client = http_client(config.effective().request_timeout_secs)?;
-        let auth = AuthStore::from_paths(&paths);
+        let mut auth = AuthStore::from_paths(&paths);
+        if let Some(account) = account {
+            auth.select_runtime_account(account)?;
+        }
         let zhipin_cookie = auth.runtime_cookie(Platform::Zhipin);
         let zhilian_cookie = auth.runtime_cookie(Platform::Zhilian);
         let qiancheng_cookie = auth.runtime_cookie(Platform::Qiancheng);
@@ -206,6 +218,53 @@ impl BossService {
         json!({"count":cities.len(),"cities":cities})
     }
 
+    /// Lists safe local account metadata without exposing credentials or paths.
+    #[must_use]
+    pub fn account_list(&self) -> Value {
+        let aliases = self.auth.account_aliases();
+        let accounts: Vec<Value> = aliases
+            .iter()
+            .map(|alias| {
+                let sessions: Vec<&str> =
+                    [Platform::Zhipin, Platform::Zhilian, Platform::Qiancheng]
+                        .into_iter()
+                        .filter(|platform| self.auth.account_has_session(alias, *platform))
+                        .map(Platform::as_str)
+                        .collect();
+                json!({
+                    "alias":alias,
+                    "selected":*alias == self.auth.default_account(),
+                    "active":*alias == self.auth.active_account(),
+                    "stored_sessions":sessions
+                })
+            })
+            .collect();
+        json!({
+            "network_checked":false,
+            "selected_account":self.auth.default_account(),
+            "active_account":self.auth.active_account(),
+            "count":accounts.len(),
+            "accounts":accounts
+        })
+    }
+
+    /// Creates or selects the account used by subsequent no-override commands.
+    pub fn account_use(&mut self, alias: &str, yes: bool) -> Result<Value, BossError> {
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "account use requires --yes".to_owned(),
+            ));
+        }
+        let created = !self.auth.account_aliases().contains(&alias);
+        self.auth.use_account(alias)?;
+        Ok(json!({
+            "network_checked":false,
+            "account":alias,
+            "selected":true,
+            "created":created
+        }))
+    }
+
     /// Reports configured authentication state without exposing values or paths.
     #[must_use]
     pub fn status(&self, platform: Option<Platform>) -> Value {
@@ -213,12 +272,14 @@ impl BossService {
             .into_iter()
             .map(|selected| {
                 let variable = AuthStore::cookie_env(selected);
-                let env_present = AuthStore::environment_cookie(selected).is_some();
+                let environment_allowed = self.auth.allows_environment_cookie();
+                let env_present = self.auth.active_environment_cookie(selected).is_some();
                 let stored_session_present = self.auth.has_session(selected);
                 json!({
                     "platform":selected,
                     "cookie_env":variable,
                     "present":env_present,
+                    "environment_allowed":environment_allowed,
                     "stored_session_present":stored_session_present,
                     "auth_state":if env_present {
                         "env_cookie_present"
@@ -232,6 +293,8 @@ impl BossService {
             .collect();
         json!({
             "network_checked":false,
+            "account":self.auth.active_account(),
+            "selected_account":self.auth.default_account(),
             "configured_default":self.config.effective().platform,
             "auth_store":self.auth.health().as_str(),
             "providers":providers
@@ -278,6 +341,7 @@ impl BossService {
             .any(|result| result.get("state").and_then(Value::as_str) == Some("direct_verified"));
         Ok(json!({
             "network_checked":direct_verified,
+            "account":self.auth.active_account(),
             "verification":if direct_verified {
                 "zhipin_authenticated_api_code_0"
             } else {
@@ -303,7 +367,11 @@ impl BossService {
                 }))
             })
             .collect::<Result<Vec<_>, BossError>>()?;
-        Ok(json!({"network_checked":false,"results":results}))
+        Ok(json!({
+            "network_checked":false,
+            "account":self.auth.active_account(),
+            "results":results
+        }))
     }
 
     async fn login_platform(
@@ -314,10 +382,10 @@ impl BossService {
         if manual {
             return self.manual_login_result(platform);
         }
-        if let Some(cookie) = AuthStore::environment_cookie(platform) {
+        if let Some(cookie) = self.auth.active_environment_cookie(platform) {
             return self.store_login_cookie(platform, cookie, "environment");
         }
-        if let Some(cookie) = self.auth.runtime_cookie(platform) {
+        if let Some(cookie) = self.auth.session_cookie(platform) {
             return self.store_login_cookie(platform, cookie, "stored_session");
         }
         self.manual_login_result(platform)
@@ -361,6 +429,7 @@ impl BossService {
         self.auth.store_session(Platform::Zhipin, resume.cookie)?;
         Ok(json!({
             "action":"account_resume_show",
+            "account":self.auth.active_account(),
             "platform":"zhipin",
             "source":"resume_preview_api",
             "verification":resume.verification,
@@ -401,6 +470,7 @@ impl BossService {
         self.auth.store_session(Platform::Zhipin, greeting.cookie)?;
         Ok(json!({
             "action":"chat_greet",
+            "account":self.auth.active_account(),
             "job_id":job.id,
             "state":greeting.state,
             "verification":greeting.verification,
@@ -445,6 +515,7 @@ impl BossService {
         let sent = crate::zhipin_direct::send(&cookie, &job.remote_id, &message)?;
         self.auth.store_session(Platform::Zhipin, sent.cookie)?;
         Ok(json!({
+            "account":self.auth.active_account(),
             "job_id":job.id,
             "state":sent.state,
             "verification":sent.verification,
@@ -482,6 +553,7 @@ impl BossService {
         let history = crate::zhipin_direct::history(&cookie, &job.remote_id, limit)?;
         self.auth.store_session(Platform::Zhipin, history.cookie)?;
         Ok(json!({
+            "account":self.auth.active_account(),
             "job_id":job.id,
             "verification":history.verification,
             "network_checked":true,
@@ -545,6 +617,7 @@ impl BossService {
             })
             .collect();
         Ok(json!({
+            "account":self.auth.active_account(),
             "count":conversations.len(),
             "conversations":conversations,
             "network_checked":true,

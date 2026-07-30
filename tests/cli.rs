@@ -161,7 +161,10 @@ fn unknown_command_keeps_the_unlocalized_json_parse_error() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(value["error"]["code"], "invalid_argument");
     let message = value["error"]["message"].as_str().expect("message");
-    assert!(message.contains("Usage: boss <COMMAND>"), "{message}");
+    assert!(
+        message.contains("Usage: boss [OPTIONS] <COMMAND>"),
+        "{message}"
+    );
     assert!(!message.contains("<命令>"), "{message}");
 }
 
@@ -206,7 +209,7 @@ fn bare_invocation_and_help_print_the_same_complete_chinese_root_help() {
         let help = String::from_utf8(output.stdout.clone()).expect("utf8");
         for expected in [
             "BossKit — 多平台招聘求职辅助工具",
-            "用法: boss <命令>",
+            "用法: boss [OPTIONS] <命令>",
             "命令:",
             "选项:",
             "保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话",
@@ -282,20 +285,20 @@ fn nested_help_screens_localize_generated_and_authored_text() {
         (
             &["ai", "--help"],
             &[
-                "用法: boss ai <命令>",
+                "用法: boss ai [OPTIONS] <命令>",
                 "命令:",
                 "profile  添加或更新无凭据的 HTTPS OpenAI 兼容配置",
                 "draft    使用一个缓存职位和一份本地类型化简历生成 AI 文稿",
                 "score    根据一份本地类型化简历评估一个缓存职位",
                 "help     显示当前命令或指定子命令的帮助",
                 "选项:",
-                "-h, --help  显示帮助",
+                "-h, --help",
             ],
         ),
         (
             &["ai", "profile", "--help"],
             &[
-                "用法: boss ai profile <命令>",
+                "用法: boss ai profile [OPTIONS] <命令>",
                 "add   仅添加或更新配置元数据；不接受或存储密钥",
                 "ls    列出本地配置 [别名: list]",
                 "show  查看一个本地配置",
@@ -305,7 +308,7 @@ fn nested_help_screens_localize_generated_and_authored_text() {
         (
             &["notify", "--help"],
             &[
-                "用法: boss notify <命令>",
+                "用法: boss notify [OPTIONS] <命令>",
                 "preview  仅渲染受限的本地载荷；不会读取 Webhook 或访问网络",
                 "send     明确确认后，将受限载荷发送到仅运行时提供的 Webhook",
             ],
@@ -334,13 +337,22 @@ fn nested_help_screens_localize_generated_and_authored_text() {
             ],
         ),
         (
+            &["account", "--help"],
+            &[
+                "用法: boss account [OPTIONS] <命令>",
+                "list    列出安全的本地账户元数据",
+                "use     创建或选择后续命令使用的默认本地账户",
+                "resume  只读查看 BOSS 直聘在线简历",
+            ],
+        ),
+        (
             &["account", "resume", "show", "--help"],
             &[
-                "用法: boss account resume show",
+                "用法: boss account resume show [OPTIONS]",
                 "通过纯命令行只读获取在线简历快照",
                 "不启动浏览器、不修改或投递",
                 "选项:",
-                "-h, --help  显示帮助",
+                "-h, --help",
             ],
         ),
         (
@@ -410,6 +422,111 @@ fn account_resume_show_is_read_only_and_fails_without_a_session_before_network()
     let value: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(value["error"]["code"], "authentication_error");
     assert!(!directory.path().join(".auth").exists());
+}
+
+#[test]
+fn account_list_use_and_ephemeral_override_are_local_and_safe() {
+    let directory = tempdir().expect("temporary directory");
+    let initial = run_json(directory.path(), &["account", "list"]);
+    assert!(
+        initial["data"]["selected_account"] == "default"
+            && initial["data"]["active_account"] == "default"
+            && initial["data"]["count"] == 1
+            && initial["data"]["accounts"][0]["alias"] == "default"
+            && initial["data"]["accounts"][0]["selected"] == true
+    );
+
+    let unconfirmed = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["account", "use", "work"])
+        .output()
+        .expect("unconfirmed account use");
+    assert!(!unconfirmed.status.success());
+    let unconfirmed: Value = serde_json::from_slice(&unconfirmed.stdout).expect("error json");
+    assert_eq!(unconfirmed["error"]["code"], "invalid_argument");
+
+    let selected = run_json(directory.path(), &["account", "use", "work", "--yes"]);
+    let listed = run_json(directory.path(), &["account", "list"]);
+    let overridden = run_json(
+        directory.path(),
+        &["--account", "default", "status", "--platform", "zhipin"],
+    );
+    let persisted = run_json(directory.path(), &["status", "--platform", "zhipin"]);
+    let logout = run_json(
+        directory.path(),
+        &[
+            "logout",
+            "--account",
+            "work",
+            "--platform",
+            "zhipin",
+            "--yes",
+        ],
+    );
+    assert!(
+        selected["data"]["account"] == "work"
+            && selected["data"]["created"] == true
+            && listed["data"]["count"] == 2
+            && listed["data"]["selected_account"] == "work"
+            && overridden["data"]["account"] == "default"
+            && overridden["data"]["selected_account"] == "work"
+            && persisted["data"]["account"] == "work"
+            && persisted["data"]["selected_account"] == "work"
+            && logout["data"]["account"] == "work"
+            && logout["data"]["results"][0]["revoked"] == false
+    );
+
+    let invalid = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["--account", "bad account", "status"])
+        .output()
+        .expect("invalid account override");
+    assert!(!invalid.status.success());
+    let invalid: Value = serde_json::from_slice(&invalid.stdout).expect("error json");
+    assert_eq!(invalid["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn non_default_account_never_consumes_generic_environment_cookie() {
+    let directory = tempdir().expect("temporary directory");
+    let fixture_cookie = "session=CROSS_ACCOUNT_SECRET";
+    let login_output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
+        .env_remove("BOSS_ZHIPIN_COOKIE")
+        .env_remove("BOSS_QIANCHENG_COOKIE")
+        .args(["login", "--account", "work", "--platform", "zhilian"])
+        .output()
+        .expect("isolated login");
+    assert!(login_output.status.success());
+    let login: Value = serde_json::from_slice(&login_output.stdout).expect("login json");
+    assert!(
+        login["data"]["account"] == "work"
+            && login["data"]["results"][0]["state"] == "manual_login_required"
+            && login["data"]["results"][0]["source"] == "none"
+            && !String::from_utf8_lossy(&login_output.stdout).contains(fixture_cookie)
+            && !directory.path().join(".auth").exists()
+    );
+
+    let status_output = Command::cargo_bin("boss")
+        .expect("binary")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHILIAN_COOKIE", fixture_cookie)
+        .args(["--account", "work", "status", "--platform", "zhilian"])
+        .output()
+        .expect("isolated status");
+    assert!(status_output.status.success());
+    let status: Value = serde_json::from_slice(&status_output.stdout).expect("status json");
+    assert!(
+        status["data"]["account"] == "work"
+            && status["data"]["providers"][0]["environment_allowed"] == false
+            && status["data"]["providers"][0]["present"] == false
+            && status["data"]["providers"][0]["stored_session_present"] == false
+            && !String::from_utf8_lossy(&status_output.stdout).contains(fixture_cookie)
+    );
 }
 
 #[test]
@@ -880,9 +997,19 @@ fn schema_formats_use_expected_wrappers() {
     assert!(
         commands.iter().any(|command| command["name"] == "login")
             && commands.iter().any(|command| command["name"] == "logout")
-            && mcp_tools
+            && commands
                 .iter()
-                .all(|tool| !matches!(tool["name"].as_str(), Some("login" | "logout")))
+                .any(|command| command["name"] == "account list")
+            && commands
+                .iter()
+                .any(|command| command["name"] == "account use")
+            && commands
+                .iter()
+                .any(|command| command["name"] == "account resume show")
+            && mcp_tools.iter().all(|tool| !matches!(
+                tool["name"].as_str(),
+                Some("login" | "logout" | "account_list" | "account_use" | "account_resume_show")
+            ))
     );
 }
 
