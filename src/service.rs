@@ -480,8 +480,20 @@ impl BossService {
         }))
     }
 
-    /// Reads exact recruiter conversations and latest redacted text for review.
-    pub fn recruiter_inbox(&mut self, limit: usize, page: usize) -> Result<Value, BossError> {
+    /// Reads recruiter conversations with optional native pagination and filters.
+    pub fn recruiter_inbox(
+        &mut self,
+        limit: usize,
+        page: usize,
+        all_pages: bool,
+        pending_only: bool,
+        job_filter: Option<&str>,
+    ) -> Result<Value, BossError> {
+        if !(1..=20).contains(&limit) || !(1..=50).contains(&page) {
+            return Err(BossError::InvalidArgument(
+                "recruiter inbox limit must be 1..=20 and page must be 1..=50".to_owned(),
+            ));
+        }
         if self.auth.active_role() != ZhipinRole::Recruiter {
             return Err(BossError::Authentication(
                 "recruiter inbox requires a selected saved recruiter Zhipin session".to_owned(),
@@ -492,13 +504,38 @@ impl BossService {
                 "recruiter inbox requires a selected saved recruiter Zhipin session".to_owned(),
             )
         })?;
-        let records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page)?;
+        let job_filter = job_filter.map(str::trim).filter(|value| !value.is_empty());
+        let mut pages_scanned = 0;
+        let mut records = Vec::new();
+        if all_pages {
+            for page_number in 1..=50 {
+                let page_records = crate::zhipin_http::recruiter_inbox(&cookie, 20, page_number)?;
+                let page_count = page_records.len();
+                pages_scanned += 1;
+                records.extend(page_records);
+                if page_count < 20 {
+                    break;
+                }
+            }
+        } else {
+            records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page)?;
+            pages_scanned = 1;
+        }
+        let records = records
+            .into_iter()
+            .filter(|record| !pending_only || record.pending)
+            .filter(|record| job_filter.is_none_or(|filter| record.job.contains(filter)))
+            .collect::<Vec<_>>();
         Ok(json!({
             "action":"recruiter_inbox",
             "account":self.auth.active_account(),
             "role":"recruiter",
-            "page":page,
+            "page":if all_pages { Value::Null } else { json!(page) },
             "limit":limit,
+            "all_pages":all_pages,
+            "pages_scanned":pages_scanned,
+            "pending_only":pending_only,
+            "job_filter":job_filter,
             "count":records.len(),
             "records":records,
             "network_checked":true,

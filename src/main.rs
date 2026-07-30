@@ -255,8 +255,17 @@ enum RecruiterCommand {
     Inbox {
         #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
         limit: usize,
-        #[arg(long, default_value_t = 1, value_parser = parse_recruiter_page)]
-        page: usize,
+        #[arg(long, value_parser = parse_recruiter_page, conflicts_with = "all")]
+        page: Option<usize>,
+        /// Scan all recruiter pages in one native CLI operation
+        #[arg(long, conflicts_with = "page")]
+        all: bool,
+        /// Keep only conversations whose latest message is from the candidate
+        #[arg(long)]
+        pending: bool,
+        /// Keep jobs whose title contains this text
+        #[arg(long, value_name = "TEXT")]
+        job: Option<String>,
     },
     /// Read one exact candidate's full recruiter-side online resume
     Resume {
@@ -922,6 +931,11 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         print_json(&Envelope::success(BossService::doctor_local()));
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(&cli.command, Command::Recruiter { .. }) && cli.account.is_none() {
+        return Err(BossError::InvalidArgument(
+            "recruiter commands require explicit --account <recruiter alias>".to_owned(),
+        ));
+    }
     if let Command::Chat { command } = &cli.command {
         match command {
             ChatCommand::Greet { yes: false, .. } => {
@@ -1315,8 +1329,20 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             RecruiterCommand::Replies { limit, page } => {
                 print_json(&Envelope::success(service.recruiter_replies(limit, page)?));
             }
-            RecruiterCommand::Inbox { limit, page } => {
-                print_json(&Envelope::success(service.recruiter_inbox(limit, page)?));
+            RecruiterCommand::Inbox {
+                limit,
+                page,
+                all,
+                pending,
+                job,
+            } => {
+                print_json(&Envelope::success(service.recruiter_inbox(
+                    limit,
+                    page.unwrap_or(1),
+                    all,
+                    pending,
+                    job.as_deref(),
+                )?));
             }
             RecruiterCommand::Resume { uid } => {
                 print_json(&Envelope::success(service.recruiter_resume(&uid)?));

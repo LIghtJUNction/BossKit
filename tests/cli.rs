@@ -227,6 +227,50 @@ fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
 }
 
 #[test]
+fn recruiter_inbox_requires_an_explicit_account_and_supports_native_filters() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["recruiter", "inbox", "--pending", "--job", "AI应用提效官"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "--account",
+            "lty",
+            "recruiter",
+            "inbox",
+            "--all",
+            "--page",
+            "2",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be used with"))
+    );
+}
+
+#[test]
 fn unknown_command_keeps_the_unlocalized_json_parse_error() {
     let output = Command::cargo_bin("boss")
         .expect("binary")
