@@ -176,6 +176,7 @@ pub(crate) fn recruiter_inbox(
     cookie: &str,
     limit: usize,
     page: usize,
+    job_filter: Option<&str>,
 ) -> Result<Vec<RecruiterInboxRecord>, BossError> {
     if !(1..=MAX_RECRUITER_INBOX_RECORDS).contains(&limit) || !(1..=50).contains(&page) {
         return Err(BossError::InvalidArgument(
@@ -184,7 +185,8 @@ pub(crate) fn recruiter_inbox(
     }
     auth::validate_cookie(cookie)?;
     let cookie = cookie.to_owned();
-    std::thread::spawn(move || recruiter_inbox_blocking(&cookie, limit, page))
+    let job_filter = job_filter.map(str::to_owned);
+    std::thread::spawn(move || recruiter_inbox_blocking(&cookie, limit, page, job_filter))
         .join()
         .map_err(|_| transport_error("native Zhipin recruiter inbox thread panicked"))?
 }
@@ -475,6 +477,7 @@ fn recruiter_inbox_blocking(
     cookie: &str,
     limit: usize,
     page: usize,
+    job_filter: Option<String>,
 ) -> Result<Vec<RecruiterInboxRecord>, BossError> {
     let client = Client::builder()
         .redirect(Policy::none())
@@ -504,6 +507,13 @@ fn recruiter_inbox_blocking(
             .and_then(Value::as_i64)
             .filter(|value| *value > 0)
             .ok_or_else(|| transport_error("native recruiter conversation has invalid uid"))?;
+        let job = object.get("jobName").and_then(Value::as_str).unwrap_or("");
+        if job_filter
+            .as_deref()
+            .is_some_and(|filter| !job.contains(filter))
+        {
+            continue;
+        }
         let security_id = object
             .get("securityId")
             .and_then(Value::as_str)
@@ -548,10 +558,7 @@ fn recruiter_inbox_blocking(
                     .unwrap_or("候选人"),
                 128,
             ),
-            job: bounded_text(
-                object.get("jobName").and_then(Value::as_str).unwrap_or(""),
-                256,
-            ),
+            job: bounded_text(job, 256),
             pending: last_direction == "candidate_to_recruiter",
             last_direction,
             last_message,

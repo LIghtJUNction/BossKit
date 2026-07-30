@@ -509,7 +509,8 @@ impl BossService {
         let mut records = Vec::new();
         if all_pages {
             for page_number in 1..=50 {
-                let page_records = crate::zhipin_http::recruiter_inbox(&cookie, 20, page_number)?;
+                let page_records =
+                    crate::zhipin_http::recruiter_inbox(&cookie, 20, page_number, job_filter)?;
                 let page_count = page_records.len();
                 pages_scanned += 1;
                 records.extend(page_records);
@@ -518,7 +519,7 @@ impl BossService {
                 }
             }
         } else {
-            records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page)?;
+            records = crate::zhipin_http::recruiter_inbox(&cookie, limit, page, job_filter)?;
             pages_scanned = 1;
         }
         let records = records
