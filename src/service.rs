@@ -488,6 +488,7 @@ impl BossService {
         all_pages: bool,
         pending_only: bool,
         job_filter: Option<&str>,
+        brief: bool,
     ) -> Result<Value, BossError> {
         if !(1..=20).contains(&limit) || !(1..=50).contains(&page) {
             return Err(BossError::InvalidArgument(
@@ -531,6 +532,27 @@ impl BossService {
             .filter(|record| !pending_only || record.pending)
             .filter(|record| job_filter.is_none_or(|filter| record.job.contains(filter)))
             .collect::<Vec<_>>();
+        let records = records
+            .into_iter()
+            .map(|record| {
+                if brief {
+                    json!({
+                        "name": record.name,
+                        "uid": record.uid,
+                        "last_message": record.last_message,
+                    })
+                } else {
+                    json!({
+                        "uid": record.uid,
+                        "name": record.name,
+                        "job": record.job,
+                        "last_direction": record.last_direction,
+                        "last_message": record.last_message,
+                        "pending": record.pending,
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "action":"recruiter_inbox",
             "account":self.auth.active_account(),
@@ -541,6 +563,7 @@ impl BossService {
             "pages_scanned":pages_scanned,
             "pending_only":pending_only,
             "job_filter":job_filter,
+            "brief":brief,
             "count":records.len(),
             "records":records,
             "network_checked":true,

@@ -271,6 +271,34 @@ fn recruiter_inbox_requires_an_explicit_account_and_supports_native_filters() {
 }
 
 #[test]
+fn recruiter_inbox_brief_is_a_native_candidate_projection() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "recruiter",
+            "inbox",
+            "--brief",
+            "--job",
+            "AI应用提效官",
+            "--page",
+            "3",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
+}
+
+#[test]
 fn unknown_command_keeps_the_unlocalized_json_parse_error() {
     let output = Command::cargo_bin("boss")
         .expect("binary")

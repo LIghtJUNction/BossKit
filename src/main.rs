@@ -266,6 +266,9 @@ enum RecruiterCommand {
         /// Keep jobs whose title contains this text
         #[arg(long, value_name = "TEXT")]
         job: Option<String>,
+        /// Return only name, UID, and the latest safe message for quick candidate review
+        #[arg(long)]
+        brief: bool,
     },
     /// Read one exact candidate's full recruiter-side online resume
     Resume {
@@ -1335,6 +1338,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 all,
                 pending,
                 job,
+                brief,
             } => {
                 print_json(&Envelope::success(service.recruiter_inbox(
                     limit,
@@ -1342,6 +1346,7 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                     all,
                     pending,
                     job.as_deref(),
+                    brief,
                 )?));
             }
             RecruiterCommand::Resume { uid } => {
