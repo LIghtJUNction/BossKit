@@ -11,7 +11,8 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Read;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, http::HeaderValue as WsHeaderValue,
@@ -40,6 +41,12 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 // The inbox can expose up to 50 pages, so stopping at page five silently made
 // later candidates look nonexistent.
 const MAX_FRIEND_SEARCH_PAGES: usize = 50;
+// Recruiter resume screening can touch the friend list and history endpoints
+// repeatedly. Serialize native requests and leave a conservative, jittered
+// gap between them so bulk read-only scans do not resemble a bursty client.
+const RECRUITER_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+const RECRUITER_REQUEST_MAX_JITTER: Duration = Duration::from_millis(1000);
+static LAST_RECRUITER_REQUEST: OnceLock<Mutex<Instant>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecruiterReplyRecord {
@@ -140,6 +147,7 @@ fn recruiter_replies_blocking(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| transport_error("unable to build native Zhipin HTTP client"))?;
+    wait_for_recruiter_request_slot();
     let response = client
         .get(format!("{BASE_URL}{RECRUITER_FRIEND_LIST_PATH}"))
         .headers(headers(cookie)?)
@@ -669,6 +677,7 @@ fn native_json_get(
     path: &str,
     query: &[(&str, String)],
 ) -> Result<Value, BossError> {
+    wait_for_recruiter_request_slot();
     let response = client
         .get(format!("{BASE_URL}{path}"))
         .headers(headers(cookie)?)
@@ -700,6 +709,30 @@ fn native_json_get(
         )));
     }
     Ok(payload)
+}
+
+fn wait_for_recruiter_request_slot() {
+    let initial = Instant::now()
+        .checked_sub(RECRUITER_REQUEST_MIN_INTERVAL + RECRUITER_REQUEST_MAX_JITTER)
+        .unwrap_or_else(Instant::now);
+    let last_request = LAST_RECRUITER_REQUEST.get_or_init(|| Mutex::new(initial));
+    let mut last_request = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let interval = RECRUITER_REQUEST_MIN_INTERVAL + request_jitter();
+    let next_allowed = *last_request + interval;
+    if let Some(wait) = next_allowed.checked_duration_since(Instant::now()) {
+        std::thread::sleep(wait);
+    }
+    *last_request = Instant::now();
+}
+
+fn request_jitter() -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(nanos % (RECRUITER_REQUEST_MAX_JITTER.as_millis() as u64 + 1))
 }
 
 fn read_bounded_response(response: reqwest::blocking::Response) -> Result<Vec<u8>, BossError> {
@@ -1317,6 +1350,17 @@ mod tests {
         assert!(validate_bounds(20, 50).is_ok());
         assert!(validate_bounds(0, 1).is_err());
         assert!(validate_bounds(1, 51).is_err());
+    }
+
+    #[test]
+    fn recruiter_request_pacing_has_a_conservative_jittered_gap() {
+        assert!(RECRUITER_REQUEST_MIN_INTERVAL >= Duration::from_secs(1));
+        assert!(RECRUITER_REQUEST_MAX_JITTER <= Duration::from_secs(2));
+        for _ in 0..32 {
+            let interval = RECRUITER_REQUEST_MIN_INTERVAL + request_jitter();
+            assert!(interval >= RECRUITER_REQUEST_MIN_INTERVAL);
+            assert!(interval <= RECRUITER_REQUEST_MIN_INTERVAL + RECRUITER_REQUEST_MAX_JITTER);
+        }
     }
 
     #[test]

@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "bosskit"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "assert_cmd",
  "async-trait",
