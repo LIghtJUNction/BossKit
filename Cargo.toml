@@ -1,6 +1,6 @@
 [package]
 name = "bosskit"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "MIT"
 description = "Read-only multi-platform job search CLI and MCP server"

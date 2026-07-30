@@ -29,7 +29,7 @@ boss ls --limit 10
 boss mcp
 ```
 
-普通命令向 stdout 输出 JSON 信封；`--help` 和 `--version` 输出文本。数据目录依次使用 `BOSS_DATA_DIR`、系统本地数据目录的 `bosskit`、当前目录的 `.boss`。
+普通命令默认向 stdout 输出紧凑 Markdown；明确加全局 `--json` 才输出 JSON。`--help` 和 `--version` 输出文本。数据目录依次使用 `BOSS_DATA_DIR`、系统本地数据目录的 `bosskit`、当前目录的 `.boss`。
 
 ## 登录与安全
 
