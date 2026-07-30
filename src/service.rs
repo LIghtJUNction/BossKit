@@ -514,7 +514,10 @@ impl BossService {
                 let page_count = page_records.len();
                 pages_scanned += 1;
                 records.extend(page_records);
-                if page_count < 20 {
+                // A job filter is applied before history reads, so the
+                // filtered count cannot indicate that the remote page ended.
+                // Scan the bounded page range in full when filtering.
+                if job_filter.is_none() && page_count < 20 {
                     break;
                 }
             }
