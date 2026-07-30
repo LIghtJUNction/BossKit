@@ -404,7 +404,11 @@ def recruiter_replies(cookie: str, limit: int, page: int) -> dict:
     data = payload.get("zpData")
     if not isinstance(data, dict):
         raise SafeFailure("Zhipin recruiter friend list returned no result data")
-    items = data.get("result", [])
+    # The recruiter friend-list API returns `friendList`; keep `result` as a
+    # compatibility fallback for older payloads used by fixtures.
+    items = data.get("friendList")
+    if items is None:
+        items = data.get("result", [])
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
         raise SafeFailure("Zhipin recruiter friend list returned invalid result entries")
     records = []
