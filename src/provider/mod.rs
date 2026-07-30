@@ -54,7 +54,12 @@ pub(crate) fn stable_id(platform: Platform, remote_id: &str, url: &str) -> Strin
     hasher.update(remote_id);
     hasher.update([0]);
     hasher.update(url);
-    format!("{}-{:x}", platform.as_str(), hasher.finalize())
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{}-{hex}", platform.as_str())
 }
 
 pub(crate) async fn send_json(

@@ -16,7 +16,10 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde_json::{Value, json};
 
 use crate::ai::{AiProfile, AiProfileStore, AiScore};
-use crate::auth::{AuthStore, ZhipinRole, read_cookie_stdin, read_manual_cookie, validate_cookie};
+use crate::auth::{
+    AuthStore, ZhipinRole, read_cookie_stdin, read_manual_cookie, read_manual_phone,
+    validate_cookie,
+};
 use crate::campaign::{
     ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
     CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult, ScreenPlanOptions,
@@ -278,6 +281,7 @@ impl BossService {
                     "present":env_present,
                     "environment_allowed":environment_allowed,
                     "stored_session_present":stored_session_present,
+                    "session_health":self.auth.session_health(selected),
                     "auth_state":if env_present {
                         "env_cookie_present"
                     } else if stored_session_present {
@@ -354,6 +358,81 @@ impl BossService {
                 "local_unverified"
             },
             "results":results
+        }))
+    }
+
+    /// Logs in through BOSS's visible phone/SMS page and stores only the
+    /// resulting validated session Cookie.
+    pub fn login_phone(&mut self, role: ZhipinRole) -> Result<Value, BossError> {
+        self.auth.set_active_role(role)?;
+        let Some(phone) = read_manual_phone()? else {
+            return Ok(json!({
+                "network_checked":false,
+                "account":self.auth.active_account(),
+                "verification":"local_phone_input_required",
+                "results":[{
+                    "platform":Platform::Zhipin,
+                    "role":role.as_str(),
+                    "state":"phone_login_required",
+                    "source":"none"
+                }]
+            }));
+        };
+        // ChromeDriver uses reqwest's blocking client; keep it off the CLI's
+        // Tokio runtime, just like the existing browser exchange action.
+        let logged_in = std::thread::spawn(move || crate::zhipin_browser::phone_login(&phone))
+            .join()
+            .map_err(|_| BossError::Network("browser phone-login worker panicked".to_owned()))??;
+        self.auth
+            .store_session(Platform::Zhipin, logged_in.cookie)?;
+        Ok(json!({
+            "network_checked":true,
+            "account":self.auth.active_account(),
+            "verification":"zhipin_phone_sms_browser_login",
+            "results":[{
+                "platform":Platform::Zhipin,
+                "role":role.as_str(),
+                "state":"direct_verified",
+                "source":"phone",
+                "verification":logged_in.verification
+            }]
+        }))
+    }
+
+    /// Repairs a stored BOSS session through the same local browser context
+    /// that owns its security cookie, then verifies it with the requested
+    /// authenticated API surface before replacing the saved session.
+    pub fn repair_login(&mut self, role: ZhipinRole) -> Result<Value, BossError> {
+        self.auth.set_active_role(role)?;
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "login --repair requires a stored Zhipin session; run login first".to_owned(),
+            )
+        })?;
+        let repaired = std::thread::spawn(move || crate::zhipin_browser::repair_session(&cookie))
+            .join()
+            .map_err(|_| {
+                BossError::Network("browser session-repair worker panicked".to_owned())
+            })??;
+        let verified = match role {
+            ZhipinRole::Geek => crate::zhipin_direct::refresh_session(&repaired.cookie)?,
+            ZhipinRole::Recruiter => {
+                crate::zhipin_direct::refresh_recruiter_session(&repaired.cookie)?
+            }
+        };
+        self.auth.store_session(Platform::Zhipin, verified.cookie)?;
+        Ok(json!({
+            "network_checked":true,
+            "account":self.auth.active_account(),
+            "verification":"zhipin_browser_session_repaired",
+            "results":[{
+                "platform":Platform::Zhipin,
+                "role":role.as_str(),
+                "state":"direct_verified",
+                "source":"browser_session_repair",
+                "verification":repaired.verification,
+                "api_verification":verified.verification
+            }]
         }))
     }
 
@@ -595,6 +674,60 @@ impl BossService {
         }))
     }
 
+    /// Reads several exact recruiter resumes serially without persisting them.
+    /// The native transport applies the shared recruiter request pacing between
+    /// each UID, and the brief projection mirrors the common CLI parsing shape.
+    pub fn recruiter_resumes(&mut self, uids: &[String], brief: bool) -> Result<Value, BossError> {
+        if !(1..=10).contains(&uids.len()) {
+            return Err(BossError::InvalidArgument(
+                "recruiter resumes requires between 1 and 10 UIDs".to_owned(),
+            ));
+        }
+        for uid in uids {
+            if uid.parse::<i64>().ok().filter(|value| *value > 0).is_none() {
+                return Err(BossError::InvalidArgument(
+                    "recruiter resume uid must be a positive integer".to_owned(),
+                ));
+            }
+        }
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter resumes requires a selected recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter resumes requires a selected recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let mut resumes = Vec::with_capacity(uids.len());
+        for uid in uids {
+            let resume = crate::zhipin_http::recruiter_resume(&cookie, uid)?;
+            if brief {
+                resumes.push(json!({
+                    "uid": resume.uid,
+                    "name": resume.name,
+                    "expected_positions": resume.expected_positions,
+                    "summary": resume.summary,
+                    "projects": resume.projects,
+                }));
+            } else {
+                resumes.push(serde_json::to_value(resume)?);
+            }
+        }
+        Ok(json!({
+            "action":"recruiter_resumes",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "count":resumes.len(),
+            "brief":brief,
+            "resumes":resumes,
+            "network_checked":true,
+            "remote_modified":false,
+            "persisted":false
+        }))
+    }
+
     /// Sends one explicitly confirmed recruiter follow-up and verifies it.
     pub fn recruiter_reply(
         &mut self,
@@ -739,6 +872,57 @@ impl BossService {
         }))
     }
 
+    /// Exchanges WeChat through the native BOSS chat UI without sending a
+    /// resume, phone number, or chat message.
+    pub fn chat_exchange_wechat(&mut self, job_id: &str, yes: bool) -> Result<Value, BossError> {
+        self.require_geek("chat exchange-wechat")?;
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "chat exchange-wechat requires --yes".to_owned(),
+            ));
+        }
+        let job = self
+            .cache
+            .show(job_id)?
+            .ok_or_else(|| BossError::InvalidArgument(format!("job not found: {job_id}")))?;
+        if job.platform != Platform::Zhipin {
+            return Err(BossError::InvalidArgument(
+                "chat exchange-wechat supports only cached Zhipin jobs".to_owned(),
+            ));
+        }
+        if job.title.trim().is_empty() || job.company.trim().is_empty() {
+            return Err(BossError::InvalidArgument(
+                "cached Zhipin job is missing browser chat metadata".to_owned(),
+            ));
+        }
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "chat exchange-wechat requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        // reqwest's blocking client owns a Tokio runtime internally. Keep its
+        // lifecycle on a plain worker thread instead of dropping it inside
+        // the CLI's async runtime.
+        let title = job.title.clone();
+        let company = job.company.clone();
+        let exchanged = std::thread::spawn(move || {
+            crate::zhipin_browser::exchange_wechat(&cookie, &title, &company)
+        })
+        .join()
+        .map_err(|_| BossError::Network("browser exchange worker panicked".to_owned()))??;
+        Ok(json!({
+            "action":"chat_exchange_wechat",
+            "account":self.auth.active_account(),
+            "job_id":job.id,
+            "state":exchanged.state,
+            "verification":exchanged.verification,
+            "network_checked":true,
+            "resume_submitted":false,
+            "phone_exposed":false,
+            "wechat_exposed":false
+        }))
+    }
+
     /// Reads a bounded text snapshot from one existing exact Zhipin conversation.
     pub fn chat_history(&mut self, job_id: &str, limit: usize) -> Result<Value, BossError> {
         self.require_geek("chat history")?;
@@ -782,6 +966,9 @@ impl BossService {
     /// Reads the latest safe text for up to five exact Zhipin conversations.
     pub fn chat_inbox(&mut self, job_ids: &[String]) -> Result<Value, BossError> {
         self.require_geek("chat inbox")?;
+        if job_ids.is_empty() {
+            return self.chat_inbox_cached_conversations();
+        }
         if !(1..=crate::zhipin_direct::MAX_CHAT_INBOX_CONVERSATIONS).contains(&job_ids.len()) {
             return Err(BossError::InvalidArgument(
                 "chat inbox requires between 1 and 5 jobs".to_owned(),
@@ -830,6 +1017,68 @@ impl BossService {
                 json!({
                     "job_id":job.id,
                     "latest":latest
+                })
+            })
+            .collect();
+        Ok(json!({
+            "account":self.auth.active_account(),
+            "count":conversations.len(),
+            "conversations":conversations,
+            "network_checked":true,
+            "verification":inbox.verification,
+            "resume_submitted":false
+        }))
+    }
+
+    /// Reads existing conversations for the locally cached Zhipin jobs when no
+    /// explicit IDs were supplied. Jobs without a current conversation are
+    /// ignored by the direct transport and never cause a batch failure.
+    fn chat_inbox_cached_conversations(&mut self) -> Result<Value, BossError> {
+        let cached_jobs = self.cache.all()?;
+        let mut jobs = Vec::new();
+        let mut remote_ids = std::collections::HashSet::new();
+        for job in cached_jobs {
+            if job.remote_id.trim().is_empty() || !remote_ids.insert(job.remote_id.clone()) {
+                continue;
+            }
+            jobs.push(job);
+            if jobs.len() == crate::zhipin_direct::MAX_CHAT_INBOX_CANDIDATES {
+                break;
+            }
+        }
+        if jobs.is_empty() {
+            return Ok(json!({
+                "account":self.auth.active_account(),
+                "count":0,
+                "conversations":[],
+                "network_checked":false,
+                "verification":"no_cached_zhipin_jobs",
+                "resume_submitted":false
+            }));
+        }
+
+        let cookie = self.auth.runtime_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "chat inbox requires a saved or environment Zhipin session".to_owned(),
+            )
+        })?;
+        let requested_remote_ids: Vec<&str> =
+            jobs.iter().map(|job| job.remote_id.as_str()).collect();
+        let inbox = crate::zhipin_direct::inbox_existing(&cookie, &requested_remote_ids)?;
+        self.auth.store_session(Platform::Zhipin, inbox.cookie)?;
+        let jobs_by_remote_id: std::collections::HashMap<&str, &Job> = jobs
+            .iter()
+            .map(|job| (job.remote_id.as_str(), job))
+            .collect();
+        let conversations: Vec<Value> = inbox
+            .conversations
+            .into_iter()
+            .filter_map(|(remote_id, latest)| {
+                jobs_by_remote_id.get(remote_id.as_str()).map(|job| {
+                    json!({
+                        "job_id":job.id,
+                        "latest":latest
+                    })
                 })
             })
             .collect();

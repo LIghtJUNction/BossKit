@@ -18,6 +18,8 @@ use crate::data::atomic_write_private;
 use crate::{BossError, DataPaths, Platform};
 
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
+const MAX_PHONE_CHARS: usize = 32;
+const MAX_SMS_CODE_CHARS: usize = 8;
 const MAX_AUTH_STORE_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNTS: usize = 32;
 pub(crate) const MAX_ACCOUNT_ALIAS_CHARS: usize = 32;
@@ -63,6 +65,31 @@ impl AuthHealth {
             Self::Unavailable => "unavailable",
         }
     }
+}
+
+/// Value-free health of a stored Zhipin session.
+///
+/// This intentionally exposes only the presence of cookie classes. Cookie
+/// values, names, and paths never leave the private auth store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct SessionHealth {
+    pub(crate) cookie_present: bool,
+    pub(crate) primary_cookie_present: bool,
+    pub(crate) stoken_present: bool,
+    pub(crate) auxiliary_cookie_present: bool,
+    pub(crate) state: &'static str,
+    pub(crate) next_action: &'static str,
+}
+
+impl SessionHealth {
+    const MISSING: Self = Self {
+        cookie_present: false,
+        primary_cookie_present: false,
+        stoken_present: false,
+        auxiliary_cookie_present: false,
+        state: "missing",
+        next_action: "boss login",
+    };
 }
 
 /// Local private Cookie sessions.
@@ -324,6 +351,43 @@ impl AuthStore {
         self.session_cookie(platform).is_some()
     }
 
+    /// Returns safe, local-only health for the active account's stored session.
+    #[must_use]
+    pub(crate) fn session_health(&self, platform: Platform) -> SessionHealth {
+        let Some(cookie) = self.session_cookie(platform) else {
+            return SessionHealth::MISSING;
+        };
+        let mut primary_cookie_present = false;
+        let mut stoken_present = false;
+        let mut auxiliary_cookie_present = false;
+        for part in cookie.split(';') {
+            let Some((name, _)) = part.trim().split_once('=') else {
+                continue;
+            };
+            match name.trim() {
+                "wt2" => primary_cookie_present = true,
+                "__zp_stoken__" => stoken_present = true,
+                "wbg" | "zp_at" => auxiliary_cookie_present = true,
+                _ => {}
+            }
+        }
+        let complete = primary_cookie_present && stoken_present;
+        SessionHealth {
+            cookie_present: true,
+            primary_cookie_present,
+            stoken_present,
+            auxiliary_cookie_present,
+            state: if complete { "ready" } else { "partial" },
+            next_action: if complete {
+                "none"
+            } else if primary_cookie_present {
+                "boss login --repair"
+            } else {
+                "boss login"
+            },
+        }
+    }
+
     /// Returns whether one named account has a saved session.
     #[must_use]
     pub(crate) fn account_has_session(&self, alias: &str, platform: Platform) -> bool {
@@ -479,6 +543,85 @@ pub fn read_manual_cookie(platform: Platform) -> Result<Option<String>, BossErro
     #[cfg(not(unix))]
     {
         let _ = platform;
+        Ok(None)
+    }
+}
+
+/// Reads a mainland-China BOSS phone number with terminal echo disabled.
+///
+/// The normalized number is returned only to the immediate browser login
+/// flow. It is never persisted or included in structured output.
+pub(crate) fn read_manual_phone() -> Result<Option<String>, BossError> {
+    read_manual_secret("Enter BOSS phone number (input hidden): ", validate_phone)
+}
+
+/// Reads one SMS verification code with terminal echo disabled.
+pub(crate) fn read_manual_sms_code() -> Result<Option<String>, BossError> {
+    read_manual_secret("Enter BOSS SMS code (input hidden): ", validate_sms_code)
+}
+
+pub(crate) fn validate_phone(raw: &str) -> Result<String, BossError> {
+    let compact: String = raw
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
+        .collect();
+    let digits = compact.strip_prefix("+86").unwrap_or(&compact);
+    if compact.chars().count() > MAX_PHONE_CHARS
+        || digits.len() != 11
+        || !digits.starts_with('1')
+        || !digits.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(auth_error("phone input is invalid"));
+    }
+    Ok(digits.to_owned())
+}
+
+pub(crate) fn validate_sms_code(raw: &str) -> Result<String, BossError> {
+    let code = raw.trim();
+    if code.is_empty()
+        || code.chars().count() > MAX_SMS_CODE_CHARS
+        || !code.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(auth_error("SMS code input is invalid"));
+    }
+    Ok(code.to_owned())
+}
+
+fn read_manual_secret(
+    prompt: &str,
+    validator: fn(&str) -> Result<String, BossError>,
+) -> Result<Option<String>, BossError> {
+    #[cfg(unix)]
+    {
+        if !io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        eprint!("{prompt}");
+        io::stderr()
+            .flush()
+            .map_err(|_| auth_error("unable to prepare hidden credential input"))?;
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return Err(auth_error("unable to configure hidden credential input"));
+        }
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+            return Err(auth_error("unable to configure hidden credential input"));
+        }
+        let restore = EchoRestore { original };
+        let mut input = String::new();
+        let read_result = io::stdin().read_line(&mut input);
+        drop(restore);
+        eprintln!();
+        read_result.map_err(|_| auth_error("unable to read hidden credential input"))?;
+        let input = input.trim_end_matches(['\r', '\n']);
+        return validator(input).map(Some);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (prompt, validator);
         Ok(None)
     }
 }
@@ -837,6 +980,57 @@ mod tests {
                 "authentication setup failed: credential input is invalid"
             );
         }
+    }
+
+    #[test]
+    fn phone_and_sms_inputs_are_normalized_without_exposing_values() {
+        assert_eq!(
+            validate_phone("+86 138-0013-8000").expect("phone"),
+            "13800138000"
+        );
+        assert_eq!(validate_sms_code(" 123456 ").expect("code"), "123456");
+        for invalid in ["", "123", "+1 13800138000", "1380013800x"] {
+            assert!(validate_phone(invalid).is_err());
+        }
+        for invalid in ["", "12a456", "123456789"] {
+            assert!(validate_sms_code(invalid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_health_reports_cookie_classes_without_values() {
+        let directory = tempdir().expect("tempdir");
+        let paths = DataPaths::new(directory.path());
+        let mut store = AuthStore::from_paths(&paths);
+        assert_eq!(
+            store.session_health(Platform::Zhipin),
+            SessionHealth::MISSING
+        );
+
+        store
+            .store_session(Platform::Zhipin, "wt2=primary-fixture".to_owned())
+            .expect("store partial session");
+        let partial = store.session_health(Platform::Zhipin);
+        assert_eq!(partial.state, "partial");
+        assert_eq!(partial.next_action, "boss login --repair");
+        assert!(!partial.stoken_present);
+
+        store
+            .store_session(
+                Platform::Zhipin,
+                "wt2=primary-fixture; __zp_stoken__=stoken-fixture; wbg=aux-fixture".to_owned(),
+            )
+            .expect("store session");
+        let health = store.session_health(Platform::Zhipin);
+        assert_eq!(health.state, "ready");
+        assert!(health.cookie_present);
+        assert!(health.primary_cookie_present);
+        assert!(health.stoken_present);
+        assert!(health.auxiliary_cookie_present);
+        let serialized = serde_json::to_string(&health).expect("serialize health");
+        assert!(!serialized.contains("primary-fixture"));
+        assert!(!serialized.contains("stoken-fixture"));
     }
 
     #[cfg(unix)]

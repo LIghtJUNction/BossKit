@@ -161,13 +161,19 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 保存本地 Cookie；BOSS 直聘会通过纯命令行直连刷新并验证会话
+    /// 保存本地 Cookie；可选用本地浏览器修复会话后再验证
     Login {
+        /// 通过 BOSS 可见登录页输入手机号并填写短信验证码
+        #[arg(long, conflicts_with_all = ["manual", "cookie_stdin", "repair"])]
+        phone: bool,
         #[arg(long)]
         manual: bool,
         /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
-        #[arg(short = 'c', long, conflicts_with = "manual")]
+        #[arg(short = 'c', long, conflicts_with_all = ["manual", "repair"])]
         cookie_stdin: bool,
+        /// 连接已登录的本地 Chrome 会话，人工完成校验后再验证并保存新 Cookie
+        #[arg(long, conflicts_with_all = ["manual", "cookie_stdin", "phone"])]
+        repair: bool,
         /// BOSS account surface to verify and save
         #[arg(long, value_enum, default_value = "geek")]
         role: RoleArg,
@@ -226,6 +232,14 @@ enum ChatCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// 通过 BOSS 原生聊天界面请求交换微信；不发送手机号、消息或简历
+    ExchangeWechat {
+        /// 本地缓存职位 ID
+        job_id: String,
+        /// 明确确认本次平台写操作
+        #[arg(long)]
+        yes: bool,
+    },
     /// 读取既有精确职位会话的最近文本；不发送消息或简历
     History {
         /// 本地缓存职位 ID
@@ -236,8 +250,8 @@ enum ChatCommand {
     },
     /// 批量读取既有精确职位会话的最新文本；不轮询、回复或投递简历
     Inbox {
-        /// 1 至 5 个本地缓存职位 ID
-        #[arg(required = true, num_args = 1..=5, value_name = "LOCAL_JOB_ID")]
+        /// 可选的本地缓存职位 ID；省略时只扫描最近 3 个缓存职位的既有会话
+        #[arg(num_args = 0..=5, value_name = "LOCAL_JOB_ID")]
         job_ids: Vec<String>,
     },
 }
@@ -274,6 +288,15 @@ enum RecruiterCommand {
     Resume {
         /// Numeric candidate uid from `boss recruiter inbox`
         uid: String,
+    },
+    /// Read several exact candidate resumes serially; no messages or writes
+    Resumes {
+        /// Numeric candidate UIDs from `boss recruiter inbox` (maximum 10)
+        #[arg(required = true, num_args = 1..=10, value_name = "UID")]
+        uids: Vec<String>,
+        /// Return only uid, name, expected positions, summary, and projects
+        #[arg(long)]
+        brief: bool,
     },
     /// Send one explicitly confirmed recruiter follow-up to an exact candidate
     Reply {
@@ -951,8 +974,14 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                     "chat send requires --yes".to_owned(),
                 ));
             }
+            ChatCommand::ExchangeWechat { yes: false, .. } => {
+                return Err(BossError::InvalidArgument(
+                    "chat exchange-wechat requires --yes".to_owned(),
+                ));
+            }
             ChatCommand::Greet { yes: true, .. }
             | ChatCommand::Send { yes: true, .. }
+            | ChatCommand::ExchangeWechat { yes: true, .. }
             | ChatCommand::History { .. }
             | ChatCommand::Inbox { .. } => {}
         }
@@ -1315,10 +1344,20 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             }
         },
         Command::Login {
+            phone,
             manual,
             cookie_stdin,
+            repair,
             role,
         } => {
+            if phone {
+                print_json(&Envelope::success(service.login_phone(role.into())?));
+                return Ok(ExitCode::SUCCESS);
+            }
+            if repair {
+                print_json(&Envelope::success(service.repair_login(role.into())?));
+                return Ok(ExitCode::SUCCESS);
+            }
             let cookie = if cookie_stdin {
                 Some(BossService::read_login_cookie_stdin()?)
             } else {
@@ -1352,6 +1391,9 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             RecruiterCommand::Resume { uid } => {
                 print_json(&Envelope::success(service.recruiter_resume(&uid)?));
             }
+            RecruiterCommand::Resumes { uids, brief } => {
+                print_json(&Envelope::success(service.recruiter_resumes(&uids, brief)?));
+            }
             RecruiterCommand::Reply { uid, message, yes } => {
                 print_json(&Envelope::success(
                     service.recruiter_reply(&uid, &message, yes)?,
@@ -1369,6 +1411,11 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             } => {
                 print_json(&Envelope::success(
                     service.chat_send(&job_id, &message, yes)?,
+                ));
+            }
+            ChatCommand::ExchangeWechat { job_id, yes } => {
+                print_json(&Envelope::success(
+                    service.chat_exchange_wechat(&job_id, yes)?,
                 ));
             }
             ChatCommand::History { job_id, limit } => {

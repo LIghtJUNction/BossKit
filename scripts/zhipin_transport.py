@@ -43,6 +43,7 @@ MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_TEXT_CHARS = 2000
 MAX_HISTORY_RESPONSE_BYTES = 60 * 1024
 MAX_INBOX_CONVERSATIONS = 5
+MAX_INBOX_CANDIDATES = 3
 MAX_INBOX_TEXT_CHARS = 512
 MAX_INBOX_RESPONSE_BYTES = 60 * 1024
 MAX_REMOTE_ID_CHARS = 2048
@@ -63,10 +64,14 @@ USER_AGENT = (
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
     "Content-Type": "application/x-www-form-urlencoded",
     "Origin": BASE_URL,
     "Referer": f"{BASE_URL}/web/geek/jobs?query=AI%20Agent",
     "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 SEARCH_DATA = {
     "scene": "1",
@@ -315,6 +320,11 @@ def prepare_session(
                 f"Zhipin refreshed security check failed with API code {verified_code!r}"
             )
     elif code != 0:
+        if code == 7:
+            raise SafeFailure(
+                "Zhipin session check returned API code 7; run `boss login --repair` "
+                "with the same logged-in local Chrome session"
+            )
         raise SafeFailure(f"Zhipin session check failed with API code {code!r}")
 
     authenticated = friend_list(session, 1, deadline)
@@ -328,6 +338,11 @@ def prepare_session(
             "Zhipin authenticated session check",
         )
     if authenticated_code != 0:
+        if authenticated_code == 7:
+            raise SafeFailure(
+                "Zhipin authenticated session check returned API code 7; run "
+                "`boss login --repair` with the same logged-in local Chrome session"
+            )
         raise SafeFailure(
             f"Zhipin authenticated session check failed with API code {authenticated_code!r}"
         )
@@ -523,6 +538,48 @@ def exact_friends(
     return [matches[remote_id] for remote_id in remote_ids]
 
 
+def validate_inbox_candidates(value: object) -> list[str]:
+    if type(value) is not list or not 1 <= len(value) <= MAX_INBOX_CANDIDATES:
+        raise SafeFailure("chat inbox cache scan requires between 1 and 3 jobs")
+    remote_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if (
+            type(item) is not str
+            or not item
+            or len(item) > MAX_REMOTE_ID_CHARS
+            or not item.isprintable()
+            or item in seen
+        ):
+            raise SafeFailure(
+                "chat inbox cache scan requires unique valid Zhipin job identifiers"
+            )
+        seen.add(item)
+        remote_ids.append(item)
+    return remote_ids
+
+
+def existing_friends(
+    session: requests.Session,
+    remote_ids: list[str],
+    deadline: float,
+) -> list[dict]:
+    requested = set(remote_ids)
+    matches: dict[str, dict] = {}
+    payload = friend_list(session, 1, deadline)
+    code = api_code(payload, "Zhipin friend list")
+    if code != 0:
+        raise SafeFailure(f"Zhipin friend list failed with API code {code!r}")
+    for item in result_items(payload, "Zhipin friend list"):
+        remote_id = friend_job_id(item)
+        if remote_id not in requested:
+            continue
+        if remote_id in matches:
+            raise SafeFailure("Zhipin conversation lookup was ambiguous")
+        matches[remote_id] = item
+    return [matches[remote_id] for remote_id in remote_ids if remote_id in matches]
+
+
 def has_exact_friend(session: requests.Session, remote_id: str) -> bool:
     return exact_friend(session, remote_id) is not None
 
@@ -638,6 +695,19 @@ def normalize_message(message: str) -> str:
     ):
         raise SafeFailure(
             "chat message must contain 1 to 200 printable single-line characters"
+        )
+    lower = normalized.lower()
+    if any(
+        marker in lower
+        for marker in ("http://", "https://", "ftp://", "www.", "github.com/")
+    ) or (
+        "[" in normalized
+        and "]" in normalized
+        and "(" in normalized
+        and ")" in normalized
+    ):
+        raise SafeFailure(
+            "Zhipin message must be plain text without links or rich-message references"
         )
     return normalized
 
@@ -878,6 +948,25 @@ def bounded_inbox_response(updated_cookie: str, conversations: list[dict]) -> di
     return response
 
 
+def bounded_existing_inbox_response(
+    updated_cookie: str, conversations: list[dict]
+) -> dict:
+    response = {
+        "ok": True,
+        "action": "inbox_existing",
+        "verification": "cached_existing_conversations_and_user_id",
+        "count": len(conversations),
+        "conversations": conversations,
+        "updated_cookie": updated_cookie,
+    }
+    encoded = json.dumps(
+        response, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) + 1 > MAX_INBOX_RESPONSE_BYTES:
+        raise SafeFailure("Zhipin chat inbox result exceeded the safe output budget")
+    return response
+
+
 def readable_inbox(cookie: str, remote_ids: list[str]) -> dict:
     deadline = time.monotonic() + SEND_DEADLINE_SECONDS
     remote_ids = validate_inbox_remote_ids(remote_ids)
@@ -919,6 +1008,52 @@ def readable_inbox(cookie: str, remote_ids: list[str]) -> dict:
         conversations.append({"remote_id": remote_id, "latest": latest})
 
     return bounded_inbox_response(cookie_header(pairs), conversations)
+
+
+def readable_inbox_existing(cookie: str, remote_ids: list[str]) -> dict:
+    deadline = time.monotonic() + SEND_DEADLINE_SECONDS
+    remote_ids = validate_inbox_candidates(remote_ids)
+    session, pairs, _ = prepare_session(cookie, deadline)
+    friends = existing_friends(session, remote_ids, deadline)
+
+    user_payload = request_json(
+        session.get(
+            USER_INFO_URL,
+            headers=HEADERS,
+            timeout=request_timeout(deadline),
+        ),
+        "Zhipin user info",
+    )
+    user_data = response_data(user_payload, "Zhipin user info")
+    user_id = positive_int(user_data.get("userId"), "user id")
+
+    conversations: list[dict] = []
+    for friend in friends:
+        remote_id = friend_job_id(friend)
+        if remote_id is None:
+            raise SafeFailure("Zhipin friend list returned an invalid job identifier")
+        boss_id = bounded_string(friend.get("encryptBossId"), "encrypted boss id")
+        readable = [
+            message
+            for item in recent_history_page(session, boss_id, deadline)
+            if (message := readable_message(item, user_id)) is not None
+        ]
+        latest = (
+            max(readable, key=lambda item: item["timestamp_ms"])
+            if readable
+            else None
+        )
+        if latest is not None:
+            text = latest["text"]
+            latest = {
+                "direction": latest["direction"],
+                "text": text[:MAX_INBOX_TEXT_CHARS],
+                "timestamp_ms": latest["timestamp_ms"],
+                "truncated": len(text) > MAX_INBOX_TEXT_CHARS,
+            }
+        conversations.append({"remote_id": remote_id, "latest": latest})
+
+    return bounded_existing_inbox_response(cookie_header(pairs), conversations)
 
 
 def first_resume_value(mapping: dict, keys: tuple[str, ...]) -> object:
@@ -1609,6 +1744,7 @@ def main() -> int:
             "send",
             "history",
             "inbox",
+            "inbox_existing",
             "resume_show",
             "recruiter_refresh",
             "recruiter_replies",
@@ -1663,6 +1799,13 @@ def main() -> int:
             response = readable_inbox(
                 cookie,
                 validate_inbox_remote_ids(request.get("remote_ids")),
+            )
+        elif action == "inbox_existing":
+            if set(request) != {"action", "cookie", "remote_ids"}:
+                raise SafeFailure("transport request contains unsupported fields")
+            response = readable_inbox_existing(
+                cookie,
+                validate_inbox_candidates(request.get("remote_ids")),
             )
         else:
             if set(request) != {"action", "cookie"}:

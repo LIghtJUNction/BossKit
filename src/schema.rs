@@ -525,10 +525,10 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
-                    "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. greet and send are explicitly confirmed writes; history reads one bounded exact conversation; inbox reads only the latest safe text for 1 to 5 exact conversations without polling or replying. send verifies exact outgoing history, none submits a resume, and no chat command is exposed through MCP.",
+                    "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. chat exchange-wechat is a CLI-only browser-backed native BOSS UI action and requires a local ChromeDriver. greet, send, and exchange-wechat are explicitly confirmed writes; history reads one bounded exact conversation; inbox with explicit IDs reads at most 5 exact conversations, while no-ID inbox scans at most 3 newest cached jobs without pagination, polling, or replying. No chat command submits a resume, sends a phone number, or exposes a WeChat ID, and no chat command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
                     "accounts":"Named accounts are CLI-only local session profiles. --account selects one profile for the current CLI process; account use changes the saved default. Generic environment Cookies are eligible only for the literal default account.",
-                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only BOSS 直聘 account operations. Sessions are refreshed and verified through a browserless HTTPS and V8 challenge flow; generic environment Cookies are limited to the default account. Credential actions remain unavailable through MCP."
+                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only BOSS 直聘 account operations. Cookie login uses the browserless HTTPS and V8 challenge flow; login --phone uses a visible localhost ChromeDriver page for transient phone/SMS input. Phone, SMS code, and credential actions remain unavailable through MCP; generic environment Cookies are limited to the default account."
                 },
                 "risk":{
                     "remote_writes":true,
@@ -613,6 +613,7 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("login", &["private_auth_store"]),
         ("chat greet", &["private_auth_store"]),
         ("chat send", &["private_auth_store"]),
+        ("chat exchange-wechat", &["private_auth_store"]),
         ("chat history", &["private_auth_store"]),
         ("chat inbox", &["private_auth_store"]),
         ("logout", &["private_auth_store"]),
@@ -714,7 +715,10 @@ fn command_registry() -> Vec<CommandDefinition> {
     .into_iter()
     .map(|(name, local_write_targets)| CommandDefinition {
         name,
-        remote_write: matches!(name, "chat greet" | "chat send" | "notify send" | "mcp"),
+        remote_write: matches!(
+            name,
+            "chat greet" | "chat send" | "chat exchange-wechat" | "notify send" | "mcp"
+        ),
         local_write: !local_write_targets.is_empty(),
         local_write_targets,
     })
@@ -784,6 +788,10 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "chat send")
             .expect("native chat send");
+        let exchange = commands
+            .iter()
+            .find(|command| command["name"] == "chat exchange-wechat")
+            .expect("native chat exchange-wechat");
         let history = commands
             .iter()
             .find(|command| command["name"] == "chat history")
@@ -797,6 +805,8 @@ mod tests {
                 && greet["local_write"] == true
                 && send["remote_write"] == true
                 && send["local_write"] == true
+                && exchange["remote_write"] == true
+                && exchange["local_write"] == true
                 && history["remote_write"] == false
                 && history["local_write"] == true
                 && inbox["remote_write"] == false
