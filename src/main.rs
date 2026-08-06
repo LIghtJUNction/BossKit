@@ -161,19 +161,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// 保存本地 Cookie；可选用本地浏览器修复会话后再验证
+    /// 验证并保存一个新提供的 BOSS Cookie
     Login {
-        /// 通过 BOSS 可见登录页输入手机号并填写短信验证码
-        #[arg(long, conflicts_with_all = ["manual", "cookie_stdin", "repair"])]
-        phone: bool,
-        #[arg(long)]
-        manual: bool,
         /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
-        #[arg(short = 'c', long, conflicts_with_all = ["manual", "repair"])]
+        #[arg(short = 'c', long)]
         cookie_stdin: bool,
-        /// 连接已登录的本地 Chrome 会话，人工完成校验后再验证并保存新 Cookie
-        #[arg(long, conflicts_with_all = ["manual", "cookie_stdin", "phone"])]
-        repair: bool,
         /// BOSS account surface to verify and save
         #[arg(long, value_enum, default_value = "geek")]
         role: RoleArg,
@@ -258,6 +250,20 @@ enum ChatCommand {
 
 #[derive(Subcommand)]
 enum RecruiterCommand {
+    /// Search one bounded first page of masked candidates; read-only and no gender filter
+    Candidates {
+        /// Search keywords, for example `视频剪辑`
+        keywords: String,
+        /// Optional BOSS city code, for example `101230100`
+        #[arg(long)]
+        city: Option<String>,
+        /// Maximum candidates returned after local screening (1..=5)
+        #[arg(long, default_value_t = 5, value_parser = parse_candidate_limit)]
+        limit: usize,
+        /// Read one selected candidate's structured resume summary; no contacts
+        #[arg(long)]
+        detail: bool,
+    },
     /// List bounded redacted candidate reply states from the recruiter friend list
     Replies {
         #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
@@ -271,7 +277,7 @@ enum RecruiterCommand {
         limit: usize,
         #[arg(long, value_parser = parse_recruiter_page, conflicts_with = "all")]
         page: Option<usize>,
-        /// Scan all recruiter pages in one native CLI operation
+        /// Scan up to three recruiter pages, bounded by --limit
         #[arg(long, conflicts_with = "page")]
         all: bool,
         /// Keep only conversations whose latest message is from the candidate
@@ -345,6 +351,17 @@ fn parse_recruiter_page(value: &str) -> Result<usize, String> {
         Ok(parsed)
     } else {
         Err("page must be between 1 and 50".to_owned())
+    }
+}
+
+fn parse_candidate_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer".to_owned())?;
+    if (1..=5).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("candidate limit must be between 1 and 5".to_owned())
     }
 }
 
@@ -962,6 +979,16 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             "recruiter commands require explicit --account <recruiter alias>".to_owned(),
         ));
     }
+    if matches!(
+        &cli.command,
+        Command::Recruiter {
+            command: RecruiterCommand::Reply { yes: false, .. }
+        }
+    ) {
+        return Err(BossError::InvalidArgument(
+            "recruiter reply requires --yes".to_owned(),
+        ));
+    }
     if let Command::Chat { command } = &cli.command {
         match command {
             ChatCommand::Greet { yes: false, .. } => {
@@ -1343,31 +1370,32 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(service.config_reset(key.as_deref())?));
             }
         },
-        Command::Login {
-            phone,
-            manual,
-            cookie_stdin,
-            repair,
-            role,
-        } => {
-            if phone {
-                print_json(&Envelope::success(service.login_phone(role.into())?));
-                return Ok(ExitCode::SUCCESS);
-            }
-            if repair {
-                print_json(&Envelope::success(service.repair_login(role.into())?));
-                return Ok(ExitCode::SUCCESS);
-            }
+        Command::Login { cookie_stdin, role } => {
             let cookie = if cookie_stdin {
-                Some(BossService::read_login_cookie_stdin()?)
+                BossService::read_login_cookie_stdin()?
             } else {
-                None
+                BossService::read_login_cookie_tty()?
             };
-            print_json(&Envelope::success(
-                service.login(manual, cookie, role.into()).await?,
-            ));
+            print_json(&Envelope::success(service.login(
+                cookie,
+                role.into(),
+                cookie_stdin,
+            )?));
         }
         Command::Recruiter { command } => match command {
+            RecruiterCommand::Candidates {
+                keywords,
+                city,
+                limit,
+                detail,
+            } => {
+                print_json(&Envelope::success(service.recruiter_candidates(
+                    &keywords,
+                    city.as_deref(),
+                    limit,
+                    detail,
+                )?));
+            }
             RecruiterCommand::Replies { limit, page } => {
                 print_json(&Envelope::success(service.recruiter_replies(limit, page)?));
             }

@@ -18,8 +18,6 @@ use crate::data::atomic_write_private;
 use crate::{BossError, DataPaths, Platform};
 
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
-const MAX_PHONE_CHARS: usize = 32;
-const MAX_SMS_CODE_CHARS: usize = 8;
 const MAX_AUTH_STORE_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNTS: usize = 32;
 pub(crate) const MAX_ACCOUNT_ALIAS_CHARS: usize = 32;
@@ -293,19 +291,6 @@ impl AuthStore {
         self.account_role(&self.active_account)
     }
 
-    pub(crate) fn set_active_role(&mut self, role: ZhipinRole) -> Result<(), BossError> {
-        if !self.document.accounts.contains_key(&self.active_account) {
-            self.document
-                .accounts
-                .insert(self.active_account.clone(), AccountAuth::default());
-        }
-        let Some(account) = self.document.accounts.get_mut(&self.active_account) else {
-            return Err(auth_error("unable to select private credential account"));
-        };
-        account.role = role;
-        self.persist()
-    }
-
     /// Creates or selects the persisted default account.
     pub(crate) fn use_account(&mut self, alias: &str) -> Result<(), BossError> {
         validate_account_alias(alias)?;
@@ -378,13 +363,7 @@ impl AuthStore {
             stoken_present,
             auxiliary_cookie_present,
             state: if complete { "ready" } else { "partial" },
-            next_action: if complete {
-                "none"
-            } else if primary_cookie_present {
-                "boss login --repair"
-            } else {
-                "boss login"
-            },
+            next_action: if complete { "none" } else { "boss login" },
         }
     }
 
@@ -414,6 +393,38 @@ impl AuthStore {
         };
         account.entry_mut(platform).cookie = Some(cookie);
         self.persist()
+    }
+
+    /// Stores a newly verified Cookie and its requested account role in one
+    /// private-store update. Verification happens before this method is called.
+    pub(crate) fn store_verified_login(
+        &mut self,
+        platform: Platform,
+        cookie: String,
+        role: ZhipinRole,
+    ) -> Result<(), BossError> {
+        validate_cookie(&cookie)?;
+        let previous_document = self.document.clone();
+        let previous_health = self.health;
+        if !self.document.accounts.contains_key(&self.active_account) {
+            if self.document.accounts.len() >= MAX_ACCOUNTS {
+                return Err(auth_error("private credential account limit was exceeded"));
+            }
+            self.document
+                .accounts
+                .insert(self.active_account.clone(), AccountAuth::default());
+        }
+        let Some(account) = self.document.accounts.get_mut(&self.active_account) else {
+            return Err(auth_error("unable to select private credential account"));
+        };
+        account.role = role;
+        account.entry_mut(platform).cookie = Some(cookie);
+        if let Err(error) = self.persist() {
+            self.document = previous_document;
+            self.health = previous_health;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Removes the saved session for one platform.
@@ -478,7 +489,7 @@ impl AccountAuth {
 pub(crate) fn read_cookie_stdin() -> Result<String, BossError> {
     if io::stdin().is_terminal() {
         return Err(auth_error(
-            "terminal credential input is not allowed; use login --manual",
+            "--cookie-stdin requires non-terminal standard input",
         ));
     }
     let mut input = Vec::with_capacity(MAX_COOKIE_BYTES.min(4096));
@@ -506,15 +517,14 @@ fn parse_cookie_stdin(input: &[u8]) -> Result<String, BossError> {
     Ok(cookie.to_owned())
 }
 
-/// Reads one manual Cookie with terminal echo disabled, if stdin is a TTY.
-///
-/// A non-terminal stdin is deliberately never read or prompted and returns
-/// `Ok(None)` so the CLI can emit a structured manual-login-required result.
-pub fn read_manual_cookie(platform: Platform) -> Result<Option<String>, BossError> {
+/// Reads exactly one newly supplied Cookie from a TTY with echo disabled.
+pub(crate) fn read_cookie_tty(platform: Platform) -> Result<String, BossError> {
     #[cfg(unix)]
     {
         if !io::stdin().is_terminal() {
-            return Ok(None);
+            return Err(auth_error(
+                "login requires hidden terminal Cookie input; use --cookie-stdin for piped input",
+            ));
         }
         eprint!("Enter {} Cookie (input hidden): ", platform.display_name());
         io::stderr()
@@ -537,92 +547,15 @@ pub fn read_manual_cookie(platform: Platform) -> Result<Option<String>, BossErro
         read_result.map_err(|_| auth_error("unable to read hidden credential input"))?;
         let cookie = input.trim_end_matches(['\r', '\n']);
         validate_cookie(cookie)?;
-        Ok(Some(cookie.to_owned()))
+        Ok(cookie.to_owned())
     }
 
     #[cfg(not(unix))]
     {
         let _ = platform;
-        Ok(None)
-    }
-}
-
-/// Reads a mainland-China BOSS phone number with terminal echo disabled.
-///
-/// The normalized number is returned only to the immediate browser login
-/// flow. It is never persisted or included in structured output.
-pub(crate) fn read_manual_phone() -> Result<Option<String>, BossError> {
-    read_manual_secret("Enter BOSS phone number (input hidden): ", validate_phone)
-}
-
-/// Reads one SMS verification code with terminal echo disabled.
-pub(crate) fn read_manual_sms_code() -> Result<Option<String>, BossError> {
-    read_manual_secret("Enter BOSS SMS code (input hidden): ", validate_sms_code)
-}
-
-pub(crate) fn validate_phone(raw: &str) -> Result<String, BossError> {
-    let compact: String = raw
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
-        .collect();
-    let digits = compact.strip_prefix("+86").unwrap_or(&compact);
-    if compact.chars().count() > MAX_PHONE_CHARS
-        || digits.len() != 11
-        || !digits.starts_with('1')
-        || !digits.chars().all(|character| character.is_ascii_digit())
-    {
-        return Err(auth_error("phone input is invalid"));
-    }
-    Ok(digits.to_owned())
-}
-
-pub(crate) fn validate_sms_code(raw: &str) -> Result<String, BossError> {
-    let code = raw.trim();
-    if code.is_empty()
-        || code.chars().count() > MAX_SMS_CODE_CHARS
-        || !code.chars().all(|character| character.is_ascii_digit())
-    {
-        return Err(auth_error("SMS code input is invalid"));
-    }
-    Ok(code.to_owned())
-}
-
-fn read_manual_secret(
-    prompt: &str,
-    validator: fn(&str) -> Result<String, BossError>,
-) -> Result<Option<String>, BossError> {
-    #[cfg(unix)]
-    {
-        if !io::stdin().is_terminal() {
-            return Ok(None);
-        }
-        eprint!("{prompt}");
-        io::stderr()
-            .flush()
-            .map_err(|_| auth_error("unable to prepare hidden credential input"))?;
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-            return Err(auth_error("unable to configure hidden credential input"));
-        }
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
-            return Err(auth_error("unable to configure hidden credential input"));
-        }
-        let restore = EchoRestore { original };
-        let mut input = String::new();
-        let read_result = io::stdin().read_line(&mut input);
-        drop(restore);
-        eprintln!();
-        read_result.map_err(|_| auth_error("unable to read hidden credential input"))?;
-        let input = input.trim_end_matches(['\r', '\n']);
-        return validator(input).map(Some);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (prompt, validator);
-        Ok(None)
+        Err(auth_error(
+            "hidden terminal Cookie input is unsupported on this platform; use --cookie-stdin",
+        ))
     }
 }
 
@@ -982,21 +915,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn phone_and_sms_inputs_are_normalized_without_exposing_values() {
-        assert_eq!(
-            validate_phone("+86 138-0013-8000").expect("phone"),
-            "13800138000"
-        );
-        assert_eq!(validate_sms_code(" 123456 ").expect("code"), "123456");
-        for invalid in ["", "123", "+1 13800138000", "1380013800x"] {
-            assert!(validate_phone(invalid).is_err());
-        }
-        for invalid in ["", "12a456", "123456789"] {
-            assert!(validate_sms_code(invalid).is_err());
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn session_health_reports_cookie_classes_without_values() {
@@ -1013,7 +931,7 @@ mod tests {
             .expect("store partial session");
         let partial = store.session_health(Platform::Zhipin);
         assert_eq!(partial.state, "partial");
-        assert_eq!(partial.next_action, "boss login --repair");
+        assert_eq!(partial.next_action, "boss login");
         assert!(!partial.stoken_present);
 
         store
@@ -1031,6 +949,43 @@ mod tests {
         let serialized = serde_json::to_string(&health).expect("serialize health");
         assert!(!serialized.contains("primary-fixture"));
         assert!(!serialized.contains("stoken-fixture"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_login_updates_role_and_cookie_together_after_validation() {
+        let directory = tempdir().expect("tempdir");
+        let paths = DataPaths::new(directory.path());
+        let mut store = AuthStore::from_paths(&paths);
+        store
+            .store_session(Platform::Zhipin, "wt2=previous".to_owned())
+            .expect("previous session");
+        let error = store
+            .store_verified_login(
+                Platform::Zhipin,
+                "not-a-cookie".to_owned(),
+                ZhipinRole::Recruiter,
+            )
+            .expect_err("invalid Cookie");
+        assert!(matches!(error, BossError::Authentication(_)));
+        assert_eq!(store.active_role(), ZhipinRole::Geek);
+        assert_eq!(
+            store.session_cookie(Platform::Zhipin).as_deref(),
+            Some("wt2=previous")
+        );
+
+        store
+            .store_verified_login(
+                Platform::Zhipin,
+                "wt2=replacement".to_owned(),
+                ZhipinRole::Recruiter,
+            )
+            .expect("verified login");
+        assert_eq!(store.active_role(), ZhipinRole::Recruiter);
+        assert_eq!(
+            store.session_cookie(Platform::Zhipin).as_deref(),
+            Some("wt2=replacement")
+        );
     }
 
     #[cfg(unix)]
@@ -1089,8 +1044,12 @@ mod tests {
         let mut store = AuthStore::from_paths(&paths);
         assert_eq!(store.active_role(), ZhipinRole::Geek);
         store
-            .set_active_role(ZhipinRole::Recruiter)
-            .expect("set role");
+            .store_verified_login(
+                Platform::Zhipin,
+                "session=replacement".to_owned(),
+                ZhipinRole::Recruiter,
+            )
+            .expect("store role with verified login");
         assert_eq!(
             AuthStore::from_paths(&paths).active_role(),
             ZhipinRole::Recruiter

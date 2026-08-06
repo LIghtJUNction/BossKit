@@ -256,7 +256,7 @@ pub(crate) fn refresh_session(cookie: &str) -> Result<DirectSessionRefresh, Boss
 pub(crate) fn refresh_recruiter_session(cookie: &str) -> Result<DirectSessionRefresh, BossError> {
     let response = match crate::zhipin_http::recruiter_replies(cookie, 1, 1) {
         Ok(response) => response,
-        Err(error) if is_recruiter_challenge(&error) => {
+        Err(error) if is_recruiter_helper_recoverable(&error) => {
             let request = serde_json::to_vec(&RefreshRequest {
                 action: "recruiter_refresh",
                 cookie,
@@ -285,7 +285,7 @@ pub(crate) fn recruiter_replies(
     }
     let response = match crate::zhipin_http::recruiter_replies(cookie, limit, page) {
         Ok(response) => response,
-        Err(error) if is_recruiter_challenge(&error) => {
+        Err(error) if is_recruiter_helper_recoverable(&error) => {
             let request = serde_json::to_vec(&RecruiterRepliesRequest {
                 action: "recruiter_replies",
                 cookie,
@@ -363,10 +363,23 @@ fn has_link_or_reference_markup(message: &str) -> bool {
     ["http://", "https://", "ftp://", "www.", "github.com/"]
         .iter()
         .any(|marker| lower.contains(marker))
-        || (message.contains('[')
-            && message.contains(']')
-            && message.contains('(')
-            && message.contains(')'))
+        || has_structural_markdown_link(message)
+}
+
+fn has_structural_markdown_link(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    for close_label in 0..bytes.len().saturating_sub(1) {
+        if bytes[close_label] != b']' || bytes[close_label + 1] != b'(' {
+            continue;
+        }
+        if !bytes[..close_label].contains(&b'[') {
+            continue;
+        }
+        if bytes[close_label + 2..].contains(&b')') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Sends one custom message to an existing exact Zhipin conversation.
@@ -533,8 +546,14 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
     })
 }
 
-fn is_recruiter_challenge(error: &BossError) -> bool {
-    matches!(error, BossError::Authentication(message) if message.contains("API code 37"))
+fn is_recruiter_helper_recoverable(error: &BossError) -> bool {
+    // reqwest can fail before exposing BOSS's code 37; the embedded helper can
+    // perform one bounded token retry, while all other failures remain stop signals.
+    matches!(
+        error,
+        BossError::Authentication(message)
+            if message.contains("API code 37") || message == "native Zhipin request failed"
+    )
 }
 
 fn parse_recruiter_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossError> {
@@ -686,11 +705,21 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
     crate::auth::validate_cookie(&cookie)?;
     let state = response
         .state
-        .filter(|value| matches!(value.as_str(), "already_sent" | "message_verified"))
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "already_sent" | "message_verified" | "rejected" | "unverified"
+            )
+        })
         .ok_or_else(|| transport_error("direct message state was invalid"))?;
     let verification = response
         .verification
-        .filter(|value| value == "exact_outgoing_text_in_history")
+        .filter(|value| match state.as_str() {
+            "already_sent" | "message_verified" => value == "exact_outgoing_text_in_history",
+            "rejected" => value == "explicit_application_rejection_without_exact_history",
+            "unverified" => value == "exact_outgoing_text_absent_after_publication",
+            _ => false,
+        })
         .ok_or_else(|| transport_error("direct message verification was invalid"))?;
     Ok(DirectMessage {
         cookie,
@@ -1360,18 +1389,68 @@ mod tests {
             "项目地址 https://github.com/example/project",
             "查看 github.com/example/project",
             "[项目](https://example.test/project)",
+            "[项目](内部说明)",
         ] {
             let error = normalize_message(message).expect_err("link/reference must be rejected");
             assert!(error.to_string().contains("plain text"));
         }
         assert!(normalize_message("可以先聊聊岗位的业务范围").is_ok());
+        assert!(normalize_message("数组[0]、区间(1, 3)和值]可以分开讨论(").is_ok());
+    }
+
+    #[test]
+    fn send_reconciliation_accepts_exact_outgoing_top_level_text_after_publish() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'text':'hello','time':11,'quote':{'text':'earlier'}}]\nprint(scope['has_exact_outgoing_text'](messages,7,9,'hello'))",
+        );
+        assert_eq!(result, "True");
+    }
+
+    #[test]
+    fn send_reconciliation_accepts_body_text_and_ignores_quote_metadata() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'body':{'text':'hello'},'time':11,'quote':{'id':3,'body':{'text':'quoted'}}}]\nprint(scope['has_exact_outgoing_text'](messages,7,9,'hello'))",
+        );
+        assert_eq!(result, "True");
+    }
+
+    #[test]
+    fn send_reconciliation_rejects_wrong_sender_target_and_malformed_records() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':8},'to':{'uid':9},'text':'hello'},{'from':{'uid':7},'to':{'uid':10},'body':{'text':'hello'}},{'from':'bad','text':'hello'},None]\nvalid=[item for item in messages if isinstance(item,dict)]\nprint(scope['has_exact_outgoing_text'](valid,7,9,'hello'))",
+        );
+        assert_eq!(result, "False");
+    }
+
+    #[test]
+    fn send_reconciliation_prefers_exact_history_over_quote_error() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'text':'hello','quote':{'invalid':True}}]\noutcome=scope['reconcile_send_outcome'](messages,7,9,'hello',True,'引用内容无效')\nprint(outcome['state']+'|'+outcome['verification'])",
+        );
+        assert_eq!(result, "message_verified|exact_outgoing_text_in_history");
+    }
+
+    #[test]
+    fn send_reconciliation_distinguishes_rejected_unverified_and_delayed_visibility() {
+        let result = run_pure_helper(
+            "empty=[]\nrejected=scope['reconcile_send_outcome'](empty,7,9,'hello',True,'invalid reference')\nunverified=scope['reconcile_send_outcome'](empty,7,9,'hello',True)\ndelayed=[empty,[{'from':{'uid':7},'to':{'uid':9},'body':{'text':'hello'}}]]\nstates=[scope['reconcile_send_outcome'](page,7,9,'hello',True)['state'] for page in delayed]\nprint('|'.join([rejected['state'],unverified['state'],*states]))",
+        );
+        assert_eq!(result, "rejected|unverified|unverified|message_verified");
     }
 
     #[test]
     fn parses_only_history_verified_message_states() {
-        for state in ["already_sent", "message_verified"] {
+        for (state, verification) in [
+            ("already_sent", "exact_outgoing_text_in_history"),
+            ("message_verified", "exact_outgoing_text_in_history"),
+            (
+                "rejected",
+                "explicit_application_rejection_without_exact_history",
+            ),
+            ("unverified", "exact_outgoing_text_absent_after_publication"),
+        ] {
             let payload = format!(
-                "{{\"ok\":true,\"action\":\"send\",\"state\":\"{state}\",\"verification\":\"exact_outgoing_text_in_history\",\"updated_cookie\":\"wt2=secret\"}}"
+                "{{\"ok\":true,\"action\":\"send\",\"state\":\"{state}\",\"verification\":\"{verification}\",\"updated_cookie\":\"wt2=secret\"}}"
             );
             let result = parse_send_response(payload.as_bytes()).expect("verified message");
             assert_eq!(result.state, state);
@@ -1820,13 +1899,19 @@ print('normalized')
     }
 
     #[test]
-    fn native_recruiter_challenge_error_routes_to_legacy_token_retry() {
-        assert!(is_recruiter_challenge(&BossError::Authentication(
+    fn native_recruiter_recoverable_errors_route_to_helper() {
+        assert!(is_recruiter_helper_recoverable(&BossError::Authentication(
             "Zhipin security challenge requires native token support; API code 37 request was not retried"
                 .to_owned(),
         )));
-        assert!(!is_recruiter_challenge(&BossError::Authentication(
-            "Zhipin request failed with API code 24".to_owned(),
+        assert!(is_recruiter_helper_recoverable(&BossError::Authentication(
+            "native Zhipin request failed".to_owned(),
         )));
+        assert!(!is_recruiter_helper_recoverable(
+            &BossError::Authentication("Zhipin request failed with API code 24".to_owned(),)
+        ));
+        assert!(!is_recruiter_helper_recoverable(
+            &BossError::Authentication("native recruiter MQTT connection failed".to_owned(),)
+        ));
     }
 }

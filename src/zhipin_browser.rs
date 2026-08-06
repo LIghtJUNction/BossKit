@@ -9,40 +9,21 @@ use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::BossError;
-use crate::auth::{read_manual_sms_code, validate_phone};
-
 const DEFAULT_DRIVER_URL: &str = "http://127.0.0.1:9515";
 const BOSS_HOME: &str = "https://www.zhipin.com/";
-const BOSS_USER: &str = "https://www.zhipin.com/web/user/";
-const BOSS_JOBS: &str = "https://www.zhipin.com/web/geek/jobs";
 const BOSS_CHAT: &str = "https://www.zhipin.com/web/geek/chat";
-const SECURITY_SEED: &str = "ttttZij2JIIK+xUw73+6ZmzsaYKTbDQuIH6OR6Bm54o=";
-const SECURITY_NAME: &str = "e331459e";
 const MAX_COOKIE_PAIRS: usize = 64;
 const MAX_RESPONSE_CHARS: usize = 64 * 1024;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const REPAIR_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) struct BrowserExchangeResult {
     pub(crate) state: &'static str,
-    pub(crate) verification: &'static str,
-}
-
-#[derive(Debug)]
-pub(crate) struct BrowserPhoneLoginResult {
-    pub(crate) cookie: String,
-    pub(crate) verification: &'static str,
-}
-
-#[derive(Debug)]
-pub(crate) struct BrowserSessionRepairResult {
-    pub(crate) cookie: String,
     pub(crate) verification: &'static str,
 }
 
@@ -54,20 +35,6 @@ struct Driver {
 
 impl Driver {
     fn connect() -> Result<Self, BossError> {
-        Self::connect_inner(false)
-    }
-
-    fn connect_attached() -> Result<Self, BossError> {
-        if std::env::var_os("BOSS_CHROMEDRIVER_DEBUGGER_ADDRESS").is_none() {
-            return Err(BossError::Authentication(
-                "BOSS session repair requires an already logged-in local Chrome; set BOSS_CHROMEDRIVER_DEBUGGER_ADDRESS"
-                    .to_owned(),
-            ));
-        }
-        Self::connect_inner(true)
-    }
-
-    fn connect_inner(require_attached: bool) -> Result<Self, BossError> {
         let raw = std::env::var("BOSS_CHROMEDRIVER_URL")
             .unwrap_or_else(|_| DEFAULT_DRIVER_URL.to_owned());
         let base_url = validate_driver_url(&raw)?;
@@ -89,10 +56,6 @@ impl Driver {
         if let Ok(raw_address) = std::env::var("BOSS_CHROMEDRIVER_DEBUGGER_ADDRESS") {
             let address = validate_debugger_address(&raw_address)?;
             chrome_options["debuggerAddress"] = Value::String(address);
-        } else if require_attached {
-            return Err(BossError::Authentication(
-                "BOSS session repair requires an attached local Chrome debugger".to_owned(),
-            ));
         }
         if let Ok(raw_dir) = std::env::var("BOSS_CHROMEDRIVER_USER_DATA_DIR") {
             let user_data_dir = validate_user_data_dir(&raw_dir)?;
@@ -181,38 +144,6 @@ impl Driver {
         )?;
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     }
-
-    fn cookies(&self) -> Result<String, BossError> {
-        let response = self.command(Method::GET, "/cookie", Value::Null)?;
-        let values = response
-            .get("value")
-            .and_then(Value::as_array)
-            .ok_or_else(|| BossError::Parse("ChromeDriver returned invalid cookies".to_owned()))?;
-        let mut pairs = Vec::new();
-        for value in values {
-            let Some(name) = value.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(cookie) = value.get("value").and_then(Value::as_str) else {
-                continue;
-            };
-            if name.is_empty()
-                || cookie.is_empty()
-                || name.chars().any(char::is_control)
-                || cookie.chars().any(char::is_control)
-            {
-                continue;
-            }
-            pairs.push(format!("{name}={cookie}"));
-            if pairs.len() > MAX_COOKIE_PAIRS {
-                return Err(BossError::Authentication(
-                    "BOSS browser returned too many cookies".to_owned(),
-                ));
-            }
-        }
-        let cookie = pairs.join("; ");
-        parse_cookie(&cookie).map(|_| cookie)
-    }
 }
 
 impl Drop for Driver {
@@ -225,249 +156,6 @@ impl Drop for Driver {
             Value::Null,
         );
     }
-}
-
-/// Completes the BOSS phone/SMS login flow through the visible login page.
-///
-/// The phone and SMS code stay in this process and are never returned to the
-/// caller. The page's own JavaScript performs current encryption and security
-/// checks; this function does not emulate or bypass those checks.
-pub(crate) fn phone_login(phone: &str) -> Result<BrowserPhoneLoginResult, BossError> {
-    let phone = validate_phone(phone)?;
-    let driver = Driver::connect()?;
-    driver.navigate(BOSS_USER)?;
-
-    let loaded = wait_until(&driver, |driver| {
-        driver.script(
-            r#"const input = document.querySelector('input[name="phone"], input[type="tel"], input[placeholder*="手机号"]');
-const button = Array.from(document.querySelectorAll("button, a")).find((element) => {
-  const text = (element.textContent || "").replace(/\s+/g, "");
-  return /获取验证码|发送验证码/.test(text);
-});
-return {ready: document.readyState === "complete" && Boolean(input) && Boolean(button)};"#,
-            &[],
-        )
-    })?;
-    if !loaded
-        .get("ready")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS phone login page did not load a phone input".to_owned(),
-        ));
-    }
-
-    let sent = driver.script(
-        r#"const input = document.querySelector('input[name="phone"], input[type="tel"], input[placeholder*="手机号"]');
-const setValue = (element, value) => {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-  if (setter) setter.call(element, value); else element.value = value;
-  element.dispatchEvent(new Event("input", {bubbles: true}));
-  element.dispatchEvent(new Event("change", {bubbles: true}));
-};
-if (!input) return {sent:false, reason:"phone_input_missing"};
-setValue(input, arguments[0]);
-const button = Array.from(document.querySelectorAll("button, a")).find((element) => {
-  const text = (element.textContent || "").replace(/\s+/g, "");
-  return /获取验证码|发送验证码/.test(text);
-});
-if (!button) return {sent:false, reason:"sms_button_missing"};
-if (button.disabled || /disabled|forbid/i.test(String(button.className || ""))) {
-  return {sent:false, reason:"sms_button_disabled"};
-}
-
-button.click();
-return {sent:true};"#,
-        &[Value::String(phone)],
-    )?;
-    if !sent.get("sent").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(BossError::Authentication(
-            "BOSS did not expose an enabled SMS-code action".to_owned(),
-        ));
-    }
-
-    let code = read_manual_sms_code()?.ok_or_else(|| {
-        BossError::Authentication(
-            "terminal SMS-code input is required; rerun login --phone from a TTY".to_owned(),
-        )
-    })?;
-    let submitted = driver.script(
-        r#"const input = document.querySelector('input[name="phoneCode"], input[placeholder*="验证码"]');
-const setValue = (element, value) => {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-  if (setter) setter.call(element, value); else element.value = value;
-  element.dispatchEvent(new Event("input", {bubbles: true}));
-  element.dispatchEvent(new Event("change", {bubbles: true}));
-};
-if (!input) return {submitted:false};
-setValue(input, arguments[0]);
-const button = Array.from(document.querySelectorAll("button, a")).find((element) => {
-  const text = (element.textContent || "").replace(/\s+/g, "");
-  return /登录|注册/.test(text) && !/验证码/.test(text);
-});
-if (!button || button.disabled) return {submitted:false};
-button.click();
-return {submitted:true};"#,
-        &[Value::String(code)],
-    )?;
-    if !submitted
-        .get("submitted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS login page did not accept the SMS code".to_owned(),
-        ));
-    }
-
-    let logged_in = wait_until(&driver, |driver| {
-        driver.script(
-            r#"const path = location.pathname || "";
-const pageText = (document.body?.innerText || "").replace(/\s+/g, "");
-const loggedIn = !/\/web\/user\/?$/.test(path) && !/验证码错误|登录失败|安全验证/.test(pageText);
-return {logged_in: loggedIn, pathname: path};"#,
-            &[],
-        )
-    })?;
-    if !logged_in
-        .get("logged_in")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS phone login was not verified; complete any visible security check and retry"
-                .to_owned(),
-        ));
-    }
-    let cookie = driver.cookies()?;
-    crate::auth::validate_cookie(&cookie)?;
-    Ok(BrowserPhoneLoginResult {
-        cookie,
-        verification: "visible_phone_sms_login",
-    })
-}
-
-/// Refreshes the session-bound security cookie in a local browser context.
-///
-/// The browser performs the current BOSS security-check JavaScript. The
-/// returned cookie is only accepted after the page leaves the login/security
-/// routes and contains a freshly minted `__zp_stoken__`; the caller still
-/// performs the browserless authenticated API probe before persisting it.
-pub(crate) fn repair_session(cookie: &str) -> Result<BrowserSessionRepairResult, BossError> {
-    let pairs = parse_cookie(cookie)?;
-    let stored_wt2 = cookie_value(&pairs, "wt2").ok_or_else(|| {
-        BossError::Authentication(
-            "stored BOSS session is missing its primary session cookie".to_owned(),
-        )
-    })?;
-    let driver = Driver::connect_attached()?;
-    driver.navigate(BOSS_HOME)?;
-
-    let attached_pairs = parse_cookie(&driver.cookies()?)?;
-    if cookie_value(&attached_pairs, "wt2") != Some(stored_wt2) {
-        return Err(BossError::Authentication(
-            "attached Chrome session does not match the stored BOSS account".to_owned(),
-        ));
-    }
-
-    driver.navigate(&security_check_url()?)?;
-    let loaded = wait_until_for(
-        &driver,
-        |driver| {
-            driver.script(
-                r#"return {ready: document.readyState === "complete"};"#,
-                &[],
-            )
-        },
-        REPAIR_WAIT_TIMEOUT,
-    )?;
-    if !loaded
-        .get("ready")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS security-check page did not finish loading".to_owned(),
-        ));
-    }
-    let token_ready = wait_until_for(
-        &driver,
-        |driver| {
-            let browser_cookie = driver.cookies()?;
-            let has_stoken = parse_cookie(&browser_cookie).ok().is_some_and(|pairs| {
-                cookie_value(&pairs, "__zp_stoken__").is_some_and(|value| !value.is_empty())
-            });
-            Ok(json!({"ready":has_stoken}))
-        },
-        REPAIR_WAIT_TIMEOUT,
-    )?;
-    if !token_ready
-        .get("ready")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS security-check did not complete; finish the visible browser verification and retry"
-                .to_owned(),
-        ));
-    }
-
-    driver.navigate(BOSS_JOBS)?;
-    let logged_in = wait_until_for(
-        &driver,
-        |driver| {
-            driver.script(
-                r#"const path = location.pathname || "";
-const blocked = /\/web\/user|\/login|\/passport|安全验证|验证码错误/.test(path + " " + (document.body?.innerText || ""));
-return {logged_in: !blocked && document.readyState === "complete", pathname: path};"#,
-                &[],
-            )
-        },
-        REPAIR_WAIT_TIMEOUT,
-    )?;
-    if !logged_in
-        .get("logged_in")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(BossError::Authentication(
-            "BOSS browser session still requires login or visible verification".to_owned(),
-        ));
-    }
-
-    let refreshed_cookie = driver.cookies()?;
-    let refreshed_pairs = parse_cookie(&refreshed_cookie)?;
-    if !refreshed_pairs
-        .iter()
-        .any(|(name, value)| name == "__zp_stoken__" && !value.is_empty())
-    {
-        return Err(BossError::Authentication(
-            "BOSS browser did not mint a session security token".to_owned(),
-        ));
-    }
-    crate::auth::validate_cookie(&refreshed_cookie)?;
-    Ok(BrowserSessionRepairResult {
-        cookie: refreshed_cookie,
-        verification: "browser_security_check_stoken",
-    })
-}
-
-fn security_check_url() -> Result<String, BossError> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| BossError::Authentication("system clock is before UNIX epoch".to_owned()))?
-        .as_millis();
-    Ok(format!(
-        "https://www.zhipin.com/web/common/security-check.html?seed={SECURITY_SEED}&name={SECURITY_NAME}&ts={timestamp}&callbackUrl=https%3A%2F%2Fwww.zhipin.com%2Fweb%2Fgeek%2Fjobs"
-    ))
-}
-
-fn cookie_value<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    pairs
-        .iter()
-        .find(|(cookie_name, _)| cookie_name == name)
-        .map(|(_, value)| value.as_str())
 }
 
 /// Exchanges WeChat through the platform's visible chat action.
@@ -874,14 +562,5 @@ mod tests {
             .collect::<Vec<_>>()
             .join(";");
         assert!(parse_cookie(&too_many).is_err());
-    }
-
-    #[test]
-    fn security_check_url_is_locally_constructed_with_fresh_timestamp() {
-        let url = security_check_url().expect("security check URL");
-        assert!(url.starts_with("https://www.zhipin.com/web/common/security-check.html?"));
-        assert!(url.contains("name=e331459e"));
-        assert!(url.contains("callbackUrl=https%3A%2F%2Fwww.zhipin.com%2Fweb%2Fgeek%2Fjobs"));
-        assert!(url.contains("ts=") && !url.ends_with("ts="));
     }
 }

@@ -16,10 +16,7 @@ use reqwest::redirect::Policy as RedirectPolicy;
 use serde_json::{Value, json};
 
 use crate::ai::{AiProfile, AiProfileStore, AiScore};
-use crate::auth::{
-    AuthStore, ZhipinRole, read_cookie_stdin, read_manual_cookie, read_manual_phone,
-    validate_cookie,
-};
+use crate::auth::{AuthStore, ZhipinRole, read_cookie_stdin, read_cookie_tty, validate_cookie};
 use crate::campaign::{
     ApplicationPlan, ApplicationPlanState, BlacklistKind, BlacklistRule, CampaignPolicy,
     CampaignStats, CampaignStore, GreetingTemplate, PlanBuildResult, ScreenPlanOptions,
@@ -45,6 +42,16 @@ use crate::{
 };
 
 const MAX_RESUME_IMPORT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RECRUITER_INBOX_SCAN_PAGES: usize = 3;
+const MAX_RECRUITER_CANDIDATE_LIMIT: usize = 5;
+
+fn chat_send_remote_modified(state: &str) -> Value {
+    match state {
+        "message_verified" => json!(true),
+        "already_sent" | "rejected" => json!(false),
+        "unverified" | _ => Value::Null,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileIdentity {
@@ -218,6 +225,11 @@ impl BossService {
         read_cookie_stdin()
     }
 
+    /// Reads one new Cookie from hidden terminal input.
+    pub fn read_login_cookie_tty() -> Result<String, BossError> {
+        read_cookie_tty(Platform::Zhipin)
+    }
+
     /// Lists safe local account metadata without exposing credentials or paths.
     #[must_use]
     pub fn account_list(&self) -> Value {
@@ -326,112 +338,30 @@ impl BossService {
         diagnose_local(&paths, &cache, &shortlist, &reply_rules, &auth, 1)
     }
 
-    /// Resolves a local Cookie source and verifies Zhipin directly.
-    pub async fn login(
+    /// Verifies one newly supplied Cookie before atomically replacing login state.
+    pub fn login(
         &mut self,
-        manual: bool,
-        cookie: Option<String>,
+        cookie: String,
         role: ZhipinRole,
+        cookie_stdin: bool,
     ) -> Result<Value, BossError> {
-        if manual && cookie.is_some() {
-            return Err(BossError::InvalidArgument(
-                "login --manual conflicts with --cookie-stdin".to_owned(),
-            ));
-        }
-        if let Some(cookie) = cookie.as_deref() {
-            validate_cookie(cookie)?;
-        }
-        self.auth.set_active_role(role)?;
-        let results = vec![
-            self.login_platform(Platform::Zhipin, manual, cookie, role)
-                .await?,
-        ];
-        let direct_verified = results
-            .iter()
-            .any(|result| result.get("state").and_then(Value::as_str) == Some("direct_verified"));
-        Ok(json!({
-            "network_checked":direct_verified,
-            "account":self.auth.active_account(),
-            "verification":if direct_verified {
-                "zhipin_authenticated_api_code_0"
-            } else {
-                "local_unverified"
-            },
-            "results":results
-        }))
-    }
-
-    /// Logs in through BOSS's visible phone/SMS page and stores only the
-    /// resulting validated session Cookie.
-    pub fn login_phone(&mut self, role: ZhipinRole) -> Result<Value, BossError> {
-        self.auth.set_active_role(role)?;
-        let Some(phone) = read_manual_phone()? else {
-            return Ok(json!({
-                "network_checked":false,
-                "account":self.auth.active_account(),
-                "verification":"local_phone_input_required",
-                "results":[{
-                    "platform":Platform::Zhipin,
-                    "role":role.as_str(),
-                    "state":"phone_login_required",
-                    "source":"none"
-                }]
-            }));
-        };
-        // ChromeDriver uses reqwest's blocking client; keep it off the CLI's
-        // Tokio runtime, just like the existing browser exchange action.
-        let logged_in = std::thread::spawn(move || crate::zhipin_browser::phone_login(&phone))
-            .join()
-            .map_err(|_| BossError::Network("browser phone-login worker panicked".to_owned()))??;
-        self.auth
-            .store_session(Platform::Zhipin, logged_in.cookie)?;
-        Ok(json!({
-            "network_checked":true,
-            "account":self.auth.active_account(),
-            "verification":"zhipin_phone_sms_browser_login",
-            "results":[{
-                "platform":Platform::Zhipin,
-                "role":role.as_str(),
-                "state":"direct_verified",
-                "source":"phone",
-                "verification":logged_in.verification
-            }]
-        }))
-    }
-
-    /// Repairs a stored BOSS session through the same local browser context
-    /// that owns its security cookie, then verifies it with the requested
-    /// authenticated API surface before replacing the saved session.
-    pub fn repair_login(&mut self, role: ZhipinRole) -> Result<Value, BossError> {
-        self.auth.set_active_role(role)?;
-        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
-            BossError::Authentication(
-                "login --repair requires a stored Zhipin session; run login first".to_owned(),
-            )
-        })?;
-        let repaired = std::thread::spawn(move || crate::zhipin_browser::repair_session(&cookie))
-            .join()
-            .map_err(|_| {
-                BossError::Network("browser session-repair worker panicked".to_owned())
-            })??;
+        validate_cookie(&cookie)?;
         let verified = match role {
-            ZhipinRole::Geek => crate::zhipin_direct::refresh_session(&repaired.cookie)?,
-            ZhipinRole::Recruiter => {
-                crate::zhipin_direct::refresh_recruiter_session(&repaired.cookie)?
-            }
+            ZhipinRole::Geek => crate::zhipin_direct::refresh_session(&cookie)?,
+            ZhipinRole::Recruiter => crate::zhipin_direct::refresh_recruiter_session(&cookie)?,
         };
-        self.auth.store_session(Platform::Zhipin, verified.cookie)?;
+        self.auth
+            .store_verified_login(Platform::Zhipin, verified.cookie, role)?;
         Ok(json!({
             "network_checked":true,
             "account":self.auth.active_account(),
-            "verification":"zhipin_browser_session_repaired",
+            "verification":"zhipin_authenticated_api_code_0",
             "results":[{
                 "platform":Platform::Zhipin,
-                "role":role.as_str(),
                 "state":"direct_verified",
-                "source":"browser_session_repair",
-                "verification":repaired.verification,
-                "api_verification":verified.verification
+                "source":if cookie_stdin { "stdin" } else { "hidden_tty" },
+                "role":role.as_str(),
+                "verification":verified.verification
             }]
         }))
     }
@@ -459,64 +389,6 @@ impl BossService {
         }))
     }
 
-    async fn login_platform(
-        &mut self,
-        platform: Platform,
-        manual: bool,
-        cookie: Option<String>,
-        role: ZhipinRole,
-    ) -> Result<Value, BossError> {
-        if let Some(cookie) = cookie {
-            return self.store_login_cookie(platform, cookie, "stdin", role);
-        }
-        if manual {
-            return self.manual_login_result(platform, role);
-        }
-        if let Some(cookie) = self.auth.active_environment_cookie(platform) {
-            return self.store_login_cookie(platform, cookie, "environment", role);
-        }
-        if let Some(cookie) = self.auth.session_cookie(platform) {
-            return self.store_login_cookie(platform, cookie, "stored_session", role);
-        }
-        self.manual_login_result(platform, role)
-    }
-
-    fn manual_login_result(
-        &mut self,
-        platform: Platform,
-        role: ZhipinRole,
-    ) -> Result<Value, BossError> {
-        match read_manual_cookie(platform)? {
-            Some(cookie) => self.store_login_cookie(platform, cookie, "manual", role),
-            None => Ok(login_outcome(platform, "manual_login_required", "none")),
-        }
-    }
-
-    fn store_login_cookie(
-        &mut self,
-        platform: Platform,
-        cookie: String,
-        source: &'static str,
-        role: ZhipinRole,
-    ) -> Result<Value, BossError> {
-        if platform == Platform::Zhipin {
-            let refreshed = match role {
-                ZhipinRole::Geek => crate::zhipin_direct::refresh_session(&cookie)?,
-                ZhipinRole::Recruiter => crate::zhipin_direct::refresh_recruiter_session(&cookie)?,
-            };
-            self.auth.store_session(platform, refreshed.cookie)?;
-            return Ok(json!({
-                "platform":platform,
-                "state":"direct_verified",
-                "source":source,
-                "role":role.as_str(),
-                "verification":refreshed.verification
-            }));
-        }
-        self.auth.store_session(platform, cookie)?;
-        Ok(login_outcome(platform, "stored_unverified", source))
-    }
-
     fn require_geek(&self, operation: &str) -> Result<(), BossError> {
         if self.auth.active_role() == ZhipinRole::Recruiter {
             return Err(BossError::InvalidArgument(format!(
@@ -527,6 +399,95 @@ impl BossService {
     }
 
     /// Lists bounded, redacted recruiter reply states using only the recruiter friend-list API.
+    pub fn recruiter_candidates(
+        &mut self,
+        keywords: &str,
+        city: Option<&str>,
+        limit: usize,
+        detail: bool,
+    ) -> Result<Value, BossError> {
+        if !(1..=MAX_RECRUITER_CANDIDATE_LIMIT).contains(&limit) {
+            return Err(BossError::InvalidArgument(
+                "recruiter candidate limit must be 1..=5".to_owned(),
+            ));
+        }
+        let keywords = keywords.trim();
+        if keywords.is_empty() || keywords.chars().count() > 80 {
+            return Err(BossError::InvalidArgument(
+                "candidate keywords must contain 1 to 80 characters".to_owned(),
+            ));
+        }
+        let city = city.map(str::trim).filter(|value| !value.is_empty());
+        if city.is_some_and(|value| value.chars().count() > 32) {
+            return Err(BossError::InvalidArgument(
+                "candidate city must contain at most 32 characters".to_owned(),
+            ));
+        }
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter candidates requires a selected recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter candidates requires a selected recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let page = crate::zhipin_http::recruiter_candidates(&cookie, keywords, city, limit)?;
+        let scanned = page.records.len();
+        let has_more = page.has_more;
+        let mut ranked = page
+            .records
+            .into_iter()
+            .filter(|candidate| degree_is_bachelor_or_higher(&candidate.degree))
+            .map(|candidate| rank_recruiter_candidate(candidate, keywords))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let detail = if detail {
+            let security_id = ranked
+                .first()
+                .and_then(|(_, _, _, security_id)| security_id.as_deref())
+                .ok_or_else(|| {
+                    BossError::InvalidArgument(
+                        "selected candidate has no safe detail identifier".to_owned(),
+                    )
+                })?;
+            Some(crate::zhipin_http::recruiter_candidate_detail(
+                &cookie,
+                security_id,
+                keywords,
+            )?)
+        } else {
+            None
+        };
+        let candidates = ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, candidate, _)| candidate)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "action":"recruiter_candidates",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "keywords":keywords,
+            "city":city,
+            "page":1,
+            "page_cap":1,
+            "limit":limit,
+            "scanned":scanned,
+            "count":candidates.len(),
+            "degree_filter":"本科及以上",
+            "birth_year_preference":"1995-2000_soft",
+            "gender_filter":"none",
+            "candidates":candidates,
+            "detail":detail,
+            "has_more":has_more,
+            "network_checked":true,
+            "remote_modified":false,
+            "persisted":false
+        }))
+    }
+
     pub fn recruiter_replies(&mut self, limit: usize, page: usize) -> Result<Value, BossError> {
         if !(1..=20).contains(&limit) || !(1..=50).contains(&page) {
             return Err(BossError::InvalidArgument(
@@ -588,16 +549,24 @@ impl BossService {
         let mut pages_scanned = 0;
         let mut records = Vec::new();
         if all_pages {
-            for page_number in 1..=50 {
-                let page_records =
-                    crate::zhipin_http::recruiter_inbox(&cookie, 20, page_number, job_filter)?;
+            for page_number in 1..=MAX_RECRUITER_INBOX_SCAN_PAGES {
+                let page_records = crate::zhipin_http::recruiter_inbox(
+                    &cookie,
+                    limit.min(crate::zhipin_http::MAX_RECRUITER_INBOX_RECORDS),
+                    page_number,
+                    job_filter,
+                )?;
                 let page_count = page_records.raw_count;
                 pages_scanned += 1;
                 records.extend(page_records.records);
+                if records.len() >= limit {
+                    records.truncate(limit);
+                    break;
+                }
                 // A job filter is applied before history reads, so the
                 // raw page count, rather than the filtered count, determines
                 // whether the bounded friend-list pagination has ended.
-                if page_count < 20 {
+                if page_count < crate::zhipin_http::MAX_RECRUITER_INBOX_RECORDS {
                     break;
                 }
             }
@@ -639,6 +608,11 @@ impl BossService {
             "page":if all_pages { Value::Null } else { json!(page) },
             "limit":limit,
             "all_pages":all_pages,
+            "page_cap":if all_pages {
+                json!(MAX_RECRUITER_INBOX_SCAN_PAGES)
+            } else {
+                Value::Null
+            },
             "pages_scanned":pages_scanned,
             "pending_only":pending_only,
             "job_filter":job_filter,
@@ -740,6 +714,12 @@ impl BossService {
                 "recruiter reply requires --yes".to_owned(),
             ));
         }
+        if uid.parse::<u64>().ok().filter(|value| *value > 0).is_none() {
+            return Err(BossError::InvalidArgument(
+                "recruiter reply uid must be a positive integer".to_owned(),
+            ));
+        }
+        let message = crate::zhipin_direct::normalize_message(message)?;
         if self.auth.active_role() != ZhipinRole::Recruiter {
             return Err(BossError::Authentication(
                 "recruiter reply requires a selected recruiter Zhipin session".to_owned(),
@@ -750,7 +730,7 @@ impl BossService {
                 "recruiter reply requires a selected recruiter Zhipin session".to_owned(),
             )
         })?;
-        let sent = crate::zhipin_http::recruiter_send(&cookie, uid, message)?;
+        let sent = crate::zhipin_http::recruiter_send(&cookie, uid, &message)?;
         Ok(json!({
             "action":"recruiter_reply",
             "account":self.auth.active_account(),
@@ -868,6 +848,7 @@ impl BossService {
             "state":sent.state,
             "verification":sent.verification,
             "network_checked":true,
+            "remote_modified":chat_send_remote_modified(&sent.state),
             "resume_submitted":false
         }))
     }
@@ -2880,8 +2861,95 @@ fn diagnose_local(
     })
 }
 
-fn login_outcome(platform: Platform, state: &'static str, source: &'static str) -> Value {
-    json!({"platform":platform,"state":state,"source":source})
+fn degree_is_bachelor_or_higher(degree: &str) -> bool {
+    let degree = degree.to_ascii_lowercase();
+    degree.contains("本科") || degree.contains("硕士") || degree.contains("博士")
+}
+
+fn rank_recruiter_candidate(
+    candidate: crate::zhipin_http::RecruiterCandidateRecord,
+    keywords: &str,
+) -> (i32, String, Value, Option<String>) {
+    let searchable = format!(
+        "{} {} {} {} {} {}",
+        candidate.name,
+        candidate.degree,
+        candidate.expected_positions.join(" "),
+        candidate.summary,
+        candidate.projects.join(" "),
+        candidate.work_years
+    )
+    .to_ascii_lowercase();
+    let keywords = keywords.to_ascii_lowercase();
+    let mut score = 0;
+    let mut reasons = Vec::new();
+    if searchable.contains(&keywords) {
+        score += 3;
+        reasons.push("命中搜索关键词".to_owned());
+    }
+    if contains_any(
+        &searchable,
+        &[
+            "剪辑",
+            "视频",
+            "premiere",
+            "达芬奇",
+            "after effects",
+            "调色",
+            "短视频",
+            "作品集",
+        ],
+    ) {
+        score += 3;
+        reasons.push("有剪辑或视频作品信号".to_owned());
+    }
+    if contains_any(&searchable, &["项目", "作品", "案例", "上线", "交付"]) {
+        score += 2;
+        reasons.push("有项目经历信号".to_owned());
+    }
+    if contains_any(
+        &searchable,
+        &["学习", "自学", "成长", "复盘", "课程", "迭代", "研究"],
+    ) {
+        score += 2;
+        reasons.push("有学习成长信号".to_owned());
+    }
+    let age_target = candidate
+        .birth_year
+        .is_some_and(|year| (1995..=2000).contains(&year))
+        || candidate
+            .age
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u16>()
+            .is_ok_and(|age| (26..=31).contains(&age));
+    if age_target {
+        score += 1;
+        reasons.push("年龄接近 95-00 年偏好".to_owned());
+    }
+    (
+        score,
+        candidate.name.clone(),
+        json!({
+            "uid":candidate.uid,
+            "name":candidate.name,
+            "age":candidate.age,
+            "birth_year":candidate.birth_year,
+            "degree":candidate.degree,
+            "work_years":candidate.work_years,
+            "expected_positions":candidate.expected_positions,
+            "summary":candidate.summary,
+            "projects":candidate.projects,
+            "match_score":score,
+            "match_reasons":reasons
+        }),
+        candidate.security_id,
+    )
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
 }
 
 fn check(name: &str, status: &str, message: Option<String>) -> Value {
@@ -2965,6 +3033,15 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn chat_send_remote_modified_preserves_uncertainty() {
+        assert_eq!(chat_send_remote_modified("message_verified"), json!(true));
+        assert_eq!(chat_send_remote_modified("already_sent"), json!(false));
+        assert_eq!(chat_send_remote_modified("rejected"), json!(false));
+        assert_eq!(chat_send_remote_modified("unverified"), Value::Null);
+        assert_eq!(chat_send_remote_modified("unknown_state"), Value::Null);
+    }
 
     struct MockProvider {
         platform: Platform,

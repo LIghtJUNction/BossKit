@@ -526,14 +526,15 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
                     "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
                     "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. chat exchange-wechat is a CLI-only browser-backed native BOSS UI action and requires a local ChromeDriver. greet, send, and exchange-wechat are explicitly confirmed writes; history reads one bounded exact conversation; inbox with explicit IDs reads at most 5 exact conversations, while no-ID inbox scans at most 3 newest cached jobs without pagination, polling, or replying. No chat command submits a resume, sends a phone number, or exposes a WeChat ID, and no chat command is exposed through MCP.",
+                    "recruiter":"Recruiter candidate search, replies, inbox, and resume reads are CLI-only. recruiter reply is an explicitly confirmed, one-at-a-time, history-verified write. No recruiter command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
                     "accounts":"Named accounts are CLI-only local session profiles. --account selects one profile for the current CLI process; account use changes the saved default. Generic environment Cookies are eligible only for the literal default account.",
-                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only BOSS 直聘 account operations. Cookie login uses the browserless HTTPS and V8 challenge flow; login --phone uses a visible localhost ChromeDriver page for transient phone/SMS input. Phone, SMS code, and credential actions remain unavailable through MCP; generic environment Cookies are limited to the default account."
+                    "authentication":"account list, account use, login, logout, and account resume show are CLI-only BOSS 直聘 account operations. Login accepts exactly one newly supplied Cookie from hidden TTY input or explicit non-terminal --cookie-stdin, verifies the requested role, and only then persists it. Login never reuses a stored or environment Cookie as input; runtime operations may still use Cookie authentication from those sources. Credential actions remain unavailable through MCP."
                 },
                 "risk":{
                     "remote_writes":true,
                     "confirmed_remote_notifications":["notify send"],
-                    "confirmed_platform_messages":["chat greet","chat send"],
+                    "confirmed_platform_messages":["chat greet","chat send","chat exchange-wechat","recruiter reply"],
                     "confirmed_model_calls":["ai draft","ai score"],
                     "all_remote_operations_read_only":false,
                     "local_writes":local_writes
@@ -611,6 +612,12 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("account use", &["private_auth_store"]),
         ("account resume show", &["private_auth_store"]),
         ("login", &["private_auth_store"]),
+        ("recruiter candidates", &["private_auth_store"]),
+        ("recruiter replies", &["private_auth_store"]),
+        ("recruiter inbox", &["private_auth_store"]),
+        ("recruiter resume", &["private_auth_store"]),
+        ("recruiter resumes", &["private_auth_store"]),
+        ("recruiter reply", &["private_auth_store"]),
         ("chat greet", &["private_auth_store"]),
         ("chat send", &["private_auth_store"]),
         ("chat exchange-wechat", &["private_auth_store"]),
@@ -717,7 +724,12 @@ fn command_registry() -> Vec<CommandDefinition> {
         name,
         remote_write: matches!(
             name,
-            "chat greet" | "chat send" | "chat exchange-wechat" | "notify send" | "mcp"
+            "chat greet"
+                | "chat send"
+                | "chat exchange-wechat"
+                | "recruiter reply"
+                | "notify send"
+                | "mcp"
         ),
         local_write: !local_write_targets.is_empty(),
         local_write_targets,
@@ -814,12 +826,46 @@ mod tests {
         );
         assert_eq!(
             native["risk"]["confirmed_platform_messages"],
-            json!(["chat greet", "chat send"])
+            json!([
+                "chat greet",
+                "chat send",
+                "chat exchange-wechat",
+                "recruiter reply"
+            ])
         );
         assert!(tool_registry().iter().all(|tool| !matches!(
             tool.name,
             "chat_greet" | "chat_send" | "chat_history" | "chat_inbox"
         )));
+    }
+
+    #[test]
+    fn recruiter_commands_are_native_only_and_reply_is_risk_marked() {
+        let native = render(SchemaFormat::Native).expect("native");
+        let commands = native["commands"].as_array().expect("commands");
+        assert!(
+            [
+                "recruiter candidates",
+                "recruiter replies",
+                "recruiter inbox",
+                "recruiter resume",
+                "recruiter resumes",
+            ]
+            .into_iter()
+            .all(|name| commands
+                .iter()
+                .any(|command| { command["name"] == name && command["remote_write"] == false }))
+        );
+        let reply = commands
+            .iter()
+            .find(|command| command["name"] == "recruiter reply")
+            .expect("recruiter reply");
+        assert!(reply["remote_write"] == true && reply["local_write"] == true);
+        assert!(
+            tool_registry()
+                .iter()
+                .all(|tool| !tool.name.starts_with("recruiter_"))
+        );
     }
 
     #[test]

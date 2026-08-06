@@ -86,6 +86,10 @@ class SafeFailure(Exception):
     """An expected failure whose message contains no credential material."""
 
 
+class PostPublicationFailure(SafeFailure):
+    """A failure after the message publication attempt began."""
+
+
 def request_timeout(deadline: float | None) -> float:
     if deadline is None:
         return 15.0
@@ -322,8 +326,8 @@ def prepare_session(
     elif code != 0:
         if code == 7:
             raise SafeFailure(
-                "Zhipin session check returned API code 7; run `boss login --repair` "
-                "with the same logged-in local Chrome session"
+                "Zhipin session check returned API code 7; run `boss login` "
+                "and provide a fresh Cookie"
             )
         raise SafeFailure(f"Zhipin session check failed with API code {code!r}")
 
@@ -341,7 +345,7 @@ def prepare_session(
         if authenticated_code == 7:
             raise SafeFailure(
                 "Zhipin authenticated session check returned API code 7; run "
-                "`boss login --repair` with the same logged-in local Chrome session"
+                "`boss login` and provide a fresh Cookie"
             )
         raise SafeFailure(
             f"Zhipin authenticated session check failed with API code {authenticated_code!r}"
@@ -700,12 +704,7 @@ def normalize_message(message: str) -> str:
     if any(
         marker in lower
         for marker in ("http://", "https://", "ftp://", "www.", "github.com/")
-    ) or (
-        "[" in normalized
-        and "]" in normalized
-        and "(" in normalized
-        and ")" in normalized
-    ):
+    ) or re.search(r"\[[^\]\r\n]+\]\([^)]+\)", normalized):
         raise SafeFailure(
             "Zhipin message must be plain text without links or rich-message references"
         )
@@ -807,22 +806,75 @@ def recent_history_page(
     return messages
 
 
+def message_text(item: dict) -> str | None:
+    text = item.get("text")
+    if isinstance(text, str):
+        return text
+    body = item.get("body")
+    if isinstance(body, dict) and isinstance(body.get("text"), str):
+        return body["text"]
+    return None
+
+
 def has_exact_outgoing_text(
-    messages: list[dict], user_id: int, message: str
+    messages: list[dict], user_id: int, target_uid: int, message: str
 ) -> bool:
     for item in messages:
         sender = item.get("from")
-        body = item.get("body")
+        target = item.get("to")
         if (
             isinstance(sender, dict)
-            and isinstance(body, dict)
+            and isinstance(target, dict)
             and type(sender.get("uid")) is int
             and sender["uid"] == user_id
-            and isinstance(body.get("text"), str)
-            and body["text"] == message
+            and type(target.get("uid")) is int
+            and target["uid"] == target_uid
+            and message_text(item) == message
         ):
             return True
     return False
+
+
+def explicit_message_rejection(error: object) -> bool:
+    if error is None:
+        return False
+    rendered = str(error).lower()
+    return any(
+        marker in rendered
+        for marker in (
+            "引用内容无效",
+            "invalid quote",
+            "invalid reference",
+            "message rejected",
+            "application rejected",
+        )
+    )
+
+
+def reconcile_send_outcome(
+    messages: list[dict],
+    user_id: int,
+    target_uid: int,
+    message: str,
+    published: bool,
+    publication_error: object = None,
+) -> dict | None:
+    if has_exact_outgoing_text(messages, user_id, target_uid, message):
+        return {
+            "state": "message_verified" if published else "already_sent",
+            "verification": "exact_outgoing_text_in_history",
+        }
+    if not published:
+        return None
+    if explicit_message_rejection(publication_error):
+        return {
+            "state": "rejected",
+            "verification": "explicit_application_rejection_without_exact_history",
+        }
+    return {
+        "state": "unverified",
+        "verification": "exact_outgoing_text_absent_after_publication",
+    }
 
 
 def unsafe_history_character(character: str) -> bool:
@@ -850,12 +902,11 @@ def unsafe_history_character(character: str) -> bool:
 
 def readable_message(item: dict, user_id: int) -> dict | None:
     sender = item.get("from")
-    body = item.get("body")
     timestamp_ms = item.get("time")
-    if not isinstance(sender, dict) or not isinstance(body, dict):
+    if not isinstance(sender, dict):
         return None
     sender_id = sender.get("uid")
-    text = body.get("text")
+    text = message_text(item)
     if (
         type(sender_id) is not int
         or sender_id <= 0
@@ -1647,10 +1698,15 @@ def publish_once(
             raise SafeFailure(
                 f"Zhipin chat connection was rejected: {connection_result['reason']}"
             )
-        published = client.publish("chat", payload, qos=1, retain=False)
-        if published.rc != mqtt.MQTT_ERR_SUCCESS:
-            raise SafeFailure("Zhipin chat publish failed")
-        published.wait_for_publish(timeout=request_timeout(deadline))
+        try:
+            published = client.publish("chat", payload, qos=1, retain=False)
+            if published.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise PostPublicationFailure("Zhipin chat publish failed")
+            published.wait_for_publish(timeout=request_timeout(deadline))
+        except PostPublicationFailure:
+            raise
+        except Exception as error:
+            raise PostPublicationFailure(str(error)) from error
     finally:
         if started:
             client.disconnect()
@@ -1693,12 +1749,14 @@ def send(cookie: str, remote_id: str, message: str) -> dict:
     wt2 = bounded_string(wt_data.get("wt2"), "websocket credential")
 
     before = history_messages(session, target_name, deadline)
-    if has_exact_outgoing_text(before, user_id, message):
+    before_outcome = reconcile_send_outcome(
+        before, user_id, target_uid, message, False
+    )
+    if before_outcome is not None:
         return {
             "ok": True,
             "action": "send",
-            "state": "already_sent",
-            "verification": "exact_outgoing_text_in_history",
+            **before_outcome,
             "updated_cookie": cookie_header(pairs),
         }
 
@@ -1715,21 +1773,44 @@ def send(cookie: str, remote_id: str, message: str) -> dict:
         timestamp_ms,
         message_id,
     )
-    publish_once(payload, cookie_header(pairs), token, wt2, deadline)
+    publication_error = None
+    try:
+        publish_once(payload, cookie_header(pairs), token, wt2, deadline)
+    except PostPublicationFailure as error:
+        publication_error = error
+
+    if publication_error is not None:
+        after = history_messages(session, target_name, deadline)
+        outcome = reconcile_send_outcome(
+            after, user_id, target_uid, message, True, publication_error
+        )
+        return {
+            "ok": True,
+            "action": "send",
+            **outcome,
+            "updated_cookie": cookie_header(pairs),
+        }
 
     for attempt in range(3):
         after = history_messages(session, target_name, deadline)
-        if has_exact_outgoing_text(after, user_id, message):
+        outcome = reconcile_send_outcome(
+            after, user_id, target_uid, message, True
+        )
+        if outcome["state"] == "message_verified":
             return {
                 "ok": True,
                 "action": "send",
-                "state": "message_verified",
-                "verification": "exact_outgoing_text_in_history",
+                **outcome,
                 "updated_cookie": cookie_header(pairs),
             }
         if attempt < 2:
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-    raise SafeFailure("Zhipin message could not be verified")
+    return {
+        "ok": True,
+        "action": "send",
+        **outcome,
+        "updated_cookie": cookie_header(pairs),
+    }
 
 
 def main() -> int:
