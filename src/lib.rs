@@ -21,6 +21,7 @@ pub mod schema;
 pub mod service;
 pub mod shortlist;
 pub mod watch;
+pub(crate) mod zhipin_browser;
 pub(crate) mod zhipin_direct;
 pub(crate) mod zhipin_http;
 

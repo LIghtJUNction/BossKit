@@ -197,33 +197,80 @@ fn invalid_limit_is_a_json_error() {
 }
 
 #[test]
-fn recruiter_role_is_safe_metadata_and_blocks_geek_surfaces_without_network() {
+fn login_removed_phone_manual_and_repair_modes_before_network() {
     let directory = tempdir().expect("temporary directory");
-    let login = run_json(directory.path(), &["login", "--role", "recruiter"]);
-    assert_eq!(
-        login["data"]["results"][0]["state"],
-        "manual_login_required"
-    );
-    let accounts = run_json(directory.path(), &["account", "list"]);
-    assert_eq!(accounts["data"]["accounts"][0]["role"], "recruiter");
+    for flag in ["--phone", "--manual", "--repair"] {
+        let output = Command::cargo_bin("boss")
+            .expect("binary")
+            .arg("--json")
+            .env("BOSS_DATA_DIR", directory.path())
+            .args(["login", flag])
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+        assert_eq!(error["error"]["code"], "invalid_argument");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn login_requires_a_fresh_cookie_and_preserves_the_stored_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().expect("temporary directory");
+    let auth_dir = directory.path().join(".auth");
+    std::fs::create_dir(&auth_dir).expect("auth directory");
+    std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("auth permissions");
+    let sessions = auth_dir.join("sessions.json");
+    std::fs::write(
+        &sessions,
+        br#"{"selected_account":"default","accounts":{"default":{"role":"geek","zhipin":{"cookie":"wt2=fixture"}}}}"#,
+    )
+    .expect("session file");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o600))
+        .expect("session permissions");
+
+    let before = std::fs::read(&sessions).expect("stored session");
     let output = Command::cargo_bin("boss")
         .expect("binary")
         .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
-        .args(["search", "rust"])
+        .env("BOSS_ZHIPIN_COOKIE", "wt2=ENV_COOKIE_MUST_NOT_BE_USED")
+        .arg("login")
         .output()
         .expect("run");
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
-    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert_eq!(error["error"]["code"], "authentication_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--cookie-stdin"))
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("ENV_COOKIE_MUST_NOT_BE_USED"));
+    assert_eq!(std::fs::read(&sessions).expect("stored session"), before);
+}
+
+#[test]
+fn login_cookie_stdin_rejects_multiple_lines_without_echo_or_network() {
+    let directory = tempdir().expect("temporary directory");
+    let secret = "wt2=FRESH_COOKIE_MUST_NOT_APPEAR\nsecond=value\n";
     let output = Command::cargo_bin("boss")
         .expect("binary")
         .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
-        .args(["recruiter", "replies", "--limit", "21"])
+        .args(["login", "--cookie-stdin", "--role", "recruiter"])
+        .write_stdin(secret)
         .output()
         .expect("run");
     assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "authentication_error");
+    assert!(!rendered.contains("FRESH_COOKIE_MUST_NOT_APPEAR"));
+    assert!(!directory.path().join(".auth").exists());
 }
 
 #[test]
@@ -267,6 +314,50 @@ fn recruiter_inbox_requires_an_explicit_account_and_supports_native_filters() {
         error["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("cannot be used with"))
+    );
+}
+
+#[test]
+fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["recruiter", "candidates", "视频剪辑"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "--account",
+            "lty",
+            "recruiter",
+            "candidates",
+            "video",
+            "--limit",
+            "6",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("between 1 and 5"))
     );
 }
 
@@ -440,6 +531,27 @@ fn chat_send_requires_yes_before_service_discovery_and_never_echoes_text() {
 }
 
 #[test]
+fn chat_exchange_wechat_requires_yes_before_using_runtime_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    std::fs::write(directory.path().join("config.json"), b"{invalid").expect("invalid config");
+    let secret = "wt2=EXCHANGE_COOKIE_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", secret)
+        .args(["chat", "exchange-wechat", "zhipin-job"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!rendered.contains(secret) && !directory.path().join(".auth").exists());
+}
+
+#[test]
 fn chat_send_rejects_invalid_text_before_credentials_without_echoing_it() {
     let directory = tempdir().expect("temporary directory");
     seed_jobs(directory.path());
@@ -460,7 +572,38 @@ fn chat_send_rejects_invalid_text_before_credentials_without_echoing_it() {
 }
 
 #[test]
-fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
+fn chat_send_rejects_link_references_before_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    seed_jobs(directory.path());
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", "wt2=COOKIE_MUST_NOT_BE_USED")
+        .args([
+            "chat",
+            "send",
+            "zhipin-job",
+            "--message",
+            "项目地址 https://github.com/example/project",
+            "--yes",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("plain text"))
+    );
+    assert!(!rendered.contains("COOKIE_MUST_NOT_BE_USED"));
+}
+
+#[test]
+fn recruiter_and_direct_chat_are_cli_only_and_schema_marks_confirmed_writes() {
     let directory = tempdir().expect("temporary directory");
     let responses = run_mcp(
         directory.path(),
@@ -473,7 +616,9 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
             .iter()
             .all(|tool| !matches!(
                 tool["name"].as_str(),
-                Some("chat_greet" | "chat_send" | "chat_history" | "chat_inbox")
+                Some(
+                    "chat_greet" | "chat_send" | "chat_history" | "chat_inbox" | "recruiter_reply"
+                )
             ))
     );
 
@@ -487,6 +632,10 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
         .iter()
         .find(|command| command["name"] == "chat send")
         .expect("native send");
+    let exchange = commands
+        .iter()
+        .find(|command| command["name"] == "chat exchange-wechat")
+        .expect("native exchange-wechat");
     let history = commands
         .iter()
         .find(|command| command["name"] == "chat history")
@@ -495,19 +644,32 @@ fn direct_chat_is_cli_only_and_schema_marks_writes_and_history_read() {
         .iter()
         .find(|command| command["name"] == "chat inbox")
         .expect("native inbox");
+    let recruiter_reply = commands
+        .iter()
+        .find(|command| command["name"] == "recruiter reply")
+        .expect("native recruiter reply");
     assert!(
         greet["remote_write"] == true
             && greet["local_write"] == true
             && send["remote_write"] == true
             && send["local_write"] == true
+            && exchange["remote_write"] == true
+            && exchange["local_write"] == true
             && history["remote_write"] == false
             && history["local_write"] == true
             && inbox["remote_write"] == false
             && inbox["local_write"] == true
+            && recruiter_reply["remote_write"] == true
+            && recruiter_reply["local_write"] == true
     );
     assert_eq!(
         schema["data"]["risk"]["confirmed_platform_messages"],
-        serde_json::json!(["chat greet", "chat send"])
+        serde_json::json!([
+            "chat greet",
+            "chat send",
+            "chat exchange-wechat",
+            "recruiter reply"
+        ])
     );
 }
 
@@ -558,21 +720,34 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
         assert!(!directory.path().join(".auth").exists());
     }
 
-    for args in [
-        vec!["chat", "inbox"],
-        vec!["chat", "inbox", "a", "b", "c", "d", "e", "f"],
-    ] {
-        let output = Command::cargo_bin("boss")
-            .expect("binary")
-            .arg("--json")
-            .env("BOSS_DATA_DIR", directory.path())
-            .args(args)
-            .output()
-            .expect("run");
-        assert!(!output.status.success());
-        let value: Value = serde_json::from_slice(&output.stdout).expect("json");
-        assert_eq!(value["error"]["code"], "invalid_argument");
-    }
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["chat", "inbox", "a", "b", "c", "d", "e", "f"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn chat_inbox_without_ids_is_a_safe_noop_without_cached_jobs() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["chat", "inbox"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["count"], 0);
+    assert_eq!(value["data"]["network_checked"], false);
+    assert_eq!(value["data"]["verification"], "no_cached_zhipin_jobs");
 }
 
 #[test]

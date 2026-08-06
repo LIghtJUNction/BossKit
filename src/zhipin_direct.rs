@@ -17,6 +17,7 @@ pub(crate) const MAX_CHAT_HISTORY_MESSAGES: usize = 20;
 const MAX_CHAT_HISTORY_TEXT_CHARS: usize = 2000;
 const MAX_CHAT_HISTORY_RESPONSE_BYTES: usize = 60 * 1024;
 pub(crate) const MAX_CHAT_INBOX_CONVERSATIONS: usize = 5;
+pub(crate) const MAX_CHAT_INBOX_CANDIDATES: usize = 3;
 const MAX_CHAT_INBOX_TEXT_CHARS: usize = 512;
 const MAX_CHAT_INBOX_RESPONSE_BYTES: usize = 60 * 1024;
 const MAX_ZHIPIN_REMOTE_ID_CHARS: usize = 2048;
@@ -60,6 +61,13 @@ struct HistoryRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct InboxRequest<'a> {
+    action: &'static str,
+    cookie: &'a str,
+    remote_ids: &'a [&'a str],
+}
+
+#[derive(Debug, Serialize)]
+struct InboxExistingRequest<'a> {
     action: &'static str,
     cookie: &'a str,
     remote_ids: &'a [&'a str],
@@ -210,6 +218,14 @@ pub(crate) struct DirectInbox {
     pub(crate) conversations: Vec<Option<DirectInboxLatest>>,
 }
 
+/// Latest safe text for cached jobs whose exact conversations currently exist.
+#[derive(Debug)]
+pub(crate) struct DirectInboxExisting {
+    pub(crate) cookie: String,
+    pub(crate) verification: String,
+    pub(crate) conversations: Vec<(String, Option<DirectInboxLatest>)>,
+}
+
 /// A bounded online resume snapshot whose refreshed Cookie remains private.
 #[derive(Debug)]
 pub(crate) struct DirectOnlineResume {
@@ -240,7 +256,7 @@ pub(crate) fn refresh_session(cookie: &str) -> Result<DirectSessionRefresh, Boss
 pub(crate) fn refresh_recruiter_session(cookie: &str) -> Result<DirectSessionRefresh, BossError> {
     let response = match crate::zhipin_http::recruiter_replies(cookie, 1, 1) {
         Ok(response) => response,
-        Err(error) if is_recruiter_challenge(&error) => {
+        Err(error) if is_recruiter_helper_recoverable(&error) => {
             let request = serde_json::to_vec(&RefreshRequest {
                 action: "recruiter_refresh",
                 cookie,
@@ -269,7 +285,7 @@ pub(crate) fn recruiter_replies(
     }
     let response = match crate::zhipin_http::recruiter_replies(cookie, limit, page) {
         Ok(response) => response,
-        Err(error) if is_recruiter_challenge(&error) => {
+        Err(error) if is_recruiter_helper_recoverable(&error) => {
             let request = serde_json::to_vec(&RecruiterRepliesRequest {
                 action: "recruiter_replies",
                 cookie,
@@ -330,7 +346,40 @@ pub(crate) fn normalize_message(message: &str) -> Result<String, BossError> {
             "chat message must be printable and single-line".to_owned(),
         ));
     }
+    if has_link_or_reference_markup(normalized) {
+        return Err(BossError::InvalidArgument(
+            "chat message must be plain text without links or rich-message references".to_owned(),
+        ));
+    }
     Ok(normalized.to_owned())
+}
+
+/// BOSS may interpret URLs and Markdown-like link syntax as rich-message
+/// references. The browserless MQTT path only sends plain text, so reject
+/// those inputs locally instead of publishing a payload that the platform
+/// later reports as invalid reference content.
+fn has_link_or_reference_markup(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["http://", "https://", "ftp://", "www.", "github.com/"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || has_structural_markdown_link(message)
+}
+
+fn has_structural_markdown_link(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    for close_label in 0..bytes.len().saturating_sub(1) {
+        if bytes[close_label] != b']' || bytes[close_label + 1] != b'(' {
+            continue;
+        }
+        if !bytes[..close_label].contains(&b'[') {
+            continue;
+        }
+        if bytes[close_label + 2..].contains(&b')') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Sends one custom message to an existing exact Zhipin conversation.
@@ -380,6 +429,22 @@ pub(crate) fn inbox(cookie: &str, remote_ids: &[&str]) -> Result<DirectInbox, Bo
     })
     .map_err(|_| transport_error("unable to encode direct transport request"))?;
     parse_inbox_response(&invoke_helper(&request)?, remote_ids)
+}
+
+/// Reads the latest safe text for cached jobs, ignoring jobs without a current
+/// exact conversation. The caller supplies the bounded local candidate set.
+pub(crate) fn inbox_existing(
+    cookie: &str,
+    remote_ids: &[&str],
+) -> Result<DirectInboxExisting, BossError> {
+    validate_inbox_candidate_ids(remote_ids)?;
+    let request = serde_json::to_vec(&InboxExistingRequest {
+        action: "inbox_existing",
+        cookie,
+        remote_ids,
+    })
+    .map_err(|_| transport_error("unable to encode direct transport request"))?;
+    parse_existing_inbox_response(&invoke_helper(&request)?, remote_ids)
 }
 
 /// Reads the current BOSS Zhipin online resume without modifying it.
@@ -481,8 +546,14 @@ fn parse_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossErro
     })
 }
 
-fn is_recruiter_challenge(error: &BossError) -> bool {
-    matches!(error, BossError::Authentication(message) if message.contains("API code 37"))
+fn is_recruiter_helper_recoverable(error: &BossError) -> bool {
+    // reqwest can fail before exposing BOSS's code 37; the embedded helper can
+    // perform one bounded token retry, while all other failures remain stop signals.
+    matches!(
+        error,
+        BossError::Authentication(message)
+            if message.contains("API code 37") || message == "native Zhipin request failed"
+    )
 }
 
 fn parse_recruiter_refresh_response(bytes: &[u8]) -> Result<DirectSessionRefresh, BossError> {
@@ -634,11 +705,21 @@ fn parse_send_response(bytes: &[u8]) -> Result<DirectMessage, BossError> {
     crate::auth::validate_cookie(&cookie)?;
     let state = response
         .state
-        .filter(|value| matches!(value.as_str(), "already_sent" | "message_verified"))
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "already_sent" | "message_verified" | "rejected" | "unverified"
+            )
+        })
         .ok_or_else(|| transport_error("direct message state was invalid"))?;
     let verification = response
         .verification
-        .filter(|value| value == "exact_outgoing_text_in_history")
+        .filter(|value| match state.as_str() {
+            "already_sent" | "message_verified" => value == "exact_outgoing_text_in_history",
+            "rejected" => value == "explicit_application_rejection_without_exact_history",
+            "unverified" => value == "exact_outgoing_text_absent_after_publication",
+            _ => false,
+        })
         .ok_or_else(|| transport_error("direct message verification was invalid"))?;
     Ok(DirectMessage {
         cookie,
@@ -725,6 +806,25 @@ fn validate_inbox_remote_ids(remote_ids: &[&str]) -> Result<(), BossError> {
     Ok(())
 }
 
+fn validate_inbox_candidate_ids(remote_ids: &[&str]) -> Result<(), BossError> {
+    if !(1..=MAX_CHAT_INBOX_CANDIDATES).contains(&remote_ids.len()) {
+        return Err(BossError::InvalidArgument(
+            "chat inbox cache scan requires between 1 and 3 jobs".to_owned(),
+        ));
+    }
+    let mut unique = std::collections::HashSet::with_capacity(remote_ids.len());
+    if remote_ids.iter().any(|remote_id| {
+        remote_id.is_empty()
+            || remote_id.chars().count() > MAX_ZHIPIN_REMOTE_ID_CHARS
+            || !unique.insert(*remote_id)
+    }) {
+        return Err(BossError::InvalidArgument(
+            "chat inbox cache scan requires unique valid Zhipin job identifiers".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox, BossError> {
     if bytes.len() > MAX_CHAT_INBOX_RESPONSE_BYTES {
         return Err(transport_error(
@@ -792,6 +892,80 @@ fn parse_inbox_response(bytes: &[u8], remote_ids: &[&str]) -> Result<DirectInbox
         conversations: conversations
             .into_iter()
             .map(|conversation| conversation.latest)
+            .collect(),
+    })
+}
+
+fn parse_existing_inbox_response(
+    bytes: &[u8],
+    requested_remote_ids: &[&str],
+) -> Result<DirectInboxExisting, BossError> {
+    if bytes.len() > MAX_CHAT_INBOX_RESPONSE_BYTES {
+        return Err(transport_error(
+            "direct inbox result exceeded the safe output budget",
+        ));
+    }
+    validate_inbox_candidate_ids(requested_remote_ids)?;
+    let response: HelperResponse = serde_json::from_slice(bytes)
+        .map_err(|_| transport_error("direct transport returned an invalid result"))?;
+    if !response.ok {
+        return Err(transport_error(
+            response
+                .error
+                .as_deref()
+                .unwrap_or("direct Zhipin inbox failed"),
+        ));
+    }
+    if response.action.as_deref() != Some("inbox_existing")
+        || response.state.is_some()
+        || response.messages.is_some()
+        || response.error.is_some()
+        || response.snapshot.is_some()
+        || response.replies.is_some()
+    {
+        return Err(transport_error("direct transport action mismatch"));
+    }
+    let cookie = response
+        .updated_cookie
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| transport_error("direct transport returned no session"))?;
+    crate::auth::validate_cookie(&cookie)?;
+    let verification = response
+        .verification
+        .filter(|value| value == "cached_existing_conversations_and_user_id")
+        .ok_or_else(|| transport_error("direct inbox verification was invalid"))?;
+    let conversations = response
+        .conversations
+        .filter(|items| items.len() <= requested_remote_ids.len())
+        .ok_or_else(|| transport_error("direct inbox conversations were invalid"))?;
+    let requested: std::collections::HashSet<&str> = requested_remote_ids.iter().copied().collect();
+    let mut seen = std::collections::HashSet::with_capacity(conversations.len());
+    if response.count != Some(conversations.len())
+        || conversations.iter().any(|conversation| {
+            !requested.contains(conversation.remote_id.as_str())
+                || !seen.insert(conversation.remote_id.as_str())
+                || conversation.latest.as_ref().is_some_and(|latest| {
+                    !matches!(latest.direction.as_str(), "incoming" | "outgoing")
+                        || latest.text.is_empty()
+                        || latest.text.chars().count() > MAX_CHAT_INBOX_TEXT_CHARS
+                        || latest
+                            .text
+                            .chars()
+                            .any(|character| !is_safe_history_character(character))
+                        || latest.timestamp_ms == 0
+                        || (latest.truncated
+                            && latest.text.chars().count() != MAX_CHAT_INBOX_TEXT_CHARS)
+                })
+        })
+    {
+        return Err(transport_error("direct inbox conversations were invalid"));
+    }
+    Ok(DirectInboxExisting {
+        cookie,
+        verification,
+        conversations: conversations
+            .into_iter()
+            .map(|conversation| (conversation.remote_id, conversation.latest))
             .collect(),
     })
 }
@@ -1210,10 +1384,73 @@ mod tests {
     }
 
     #[test]
+    fn message_validation_rejects_links_and_rich_references() {
+        for message in [
+            "项目地址 https://github.com/example/project",
+            "查看 github.com/example/project",
+            "[项目](https://example.test/project)",
+            "[项目](内部说明)",
+        ] {
+            let error = normalize_message(message).expect_err("link/reference must be rejected");
+            assert!(error.to_string().contains("plain text"));
+        }
+        assert!(normalize_message("可以先聊聊岗位的业务范围").is_ok());
+        assert!(normalize_message("数组[0]、区间(1, 3)和值]可以分开讨论(").is_ok());
+    }
+
+    #[test]
+    fn send_reconciliation_accepts_exact_outgoing_top_level_text_after_publish() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'text':'hello','time':11,'quote':{'text':'earlier'}}]\nprint(scope['has_exact_outgoing_text'](messages,7,9,'hello'))",
+        );
+        assert_eq!(result, "True");
+    }
+
+    #[test]
+    fn send_reconciliation_accepts_body_text_and_ignores_quote_metadata() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'body':{'text':'hello'},'time':11,'quote':{'id':3,'body':{'text':'quoted'}}}]\nprint(scope['has_exact_outgoing_text'](messages,7,9,'hello'))",
+        );
+        assert_eq!(result, "True");
+    }
+
+    #[test]
+    fn send_reconciliation_rejects_wrong_sender_target_and_malformed_records() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':8},'to':{'uid':9},'text':'hello'},{'from':{'uid':7},'to':{'uid':10},'body':{'text':'hello'}},{'from':'bad','text':'hello'},None]\nvalid=[item for item in messages if isinstance(item,dict)]\nprint(scope['has_exact_outgoing_text'](valid,7,9,'hello'))",
+        );
+        assert_eq!(result, "False");
+    }
+
+    #[test]
+    fn send_reconciliation_prefers_exact_history_over_quote_error() {
+        let result = run_pure_helper(
+            "messages=[{'from':{'uid':7},'to':{'uid':9},'text':'hello','quote':{'invalid':True}}]\noutcome=scope['reconcile_send_outcome'](messages,7,9,'hello',True,'引用内容无效')\nprint(outcome['state']+'|'+outcome['verification'])",
+        );
+        assert_eq!(result, "message_verified|exact_outgoing_text_in_history");
+    }
+
+    #[test]
+    fn send_reconciliation_distinguishes_rejected_unverified_and_delayed_visibility() {
+        let result = run_pure_helper(
+            "empty=[]\nrejected=scope['reconcile_send_outcome'](empty,7,9,'hello',True,'invalid reference')\nunverified=scope['reconcile_send_outcome'](empty,7,9,'hello',True)\ndelayed=[empty,[{'from':{'uid':7},'to':{'uid':9},'body':{'text':'hello'}}]]\nstates=[scope['reconcile_send_outcome'](page,7,9,'hello',True)['state'] for page in delayed]\nprint('|'.join([rejected['state'],unverified['state'],*states]))",
+        );
+        assert_eq!(result, "rejected|unverified|unverified|message_verified");
+    }
+
+    #[test]
     fn parses_only_history_verified_message_states() {
-        for state in ["already_sent", "message_verified"] {
+        for (state, verification) in [
+            ("already_sent", "exact_outgoing_text_in_history"),
+            ("message_verified", "exact_outgoing_text_in_history"),
+            (
+                "rejected",
+                "explicit_application_rejection_without_exact_history",
+            ),
+            ("unverified", "exact_outgoing_text_absent_after_publication"),
+        ] {
             let payload = format!(
-                "{{\"ok\":true,\"action\":\"send\",\"state\":\"{state}\",\"verification\":\"exact_outgoing_text_in_history\",\"updated_cookie\":\"wt2=secret\"}}"
+                "{{\"ok\":true,\"action\":\"send\",\"state\":\"{state}\",\"verification\":\"{verification}\",\"updated_cookie\":\"wt2=secret\"}}"
             );
             let result = parse_send_response(payload.as_bytes()).expect("verified message");
             assert_eq!(result.state, state);
@@ -1346,6 +1583,50 @@ mod tests {
         let oversized = "x".repeat(MAX_ZHIPIN_REMOTE_ID_CHARS + 1);
         assert!(validate_inbox_remote_ids(&[oversized.as_str()]).is_err());
         assert!(validate_inbox_remote_ids(&["1", "2", "3", "4", "5", "6"]).is_err());
+    }
+
+    #[test]
+    fn inbox_cache_scan_is_strictly_smaller_than_explicit_batch_queries() {
+        assert!(validate_inbox_candidate_ids(&[]).is_err());
+        assert!(validate_inbox_candidate_ids(&["remote", "remote"]).is_err());
+        assert!(validate_inbox_candidate_ids(&["1", "2", "3"]).is_ok());
+        assert!(validate_inbox_candidate_ids(&["1", "2", "3", "4"]).is_err());
+    }
+
+    #[test]
+    fn parses_only_verified_existing_cached_conversations() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "ok":true,
+            "action":"inbox_existing",
+            "verification":"cached_existing_conversations_and_user_id",
+            "updated_cookie":"wt2=secret",
+            "count":1,
+            "conversations":[{"remote_id":"remote-2","latest":null}]
+        }))
+        .expect("payload");
+        let result = parse_existing_inbox_response(&payload, &["remote-1", "remote-2"])
+            .expect("verified existing inbox");
+        assert_eq!(
+            result.verification,
+            "cached_existing_conversations_and_user_id"
+        );
+        assert_eq!(result.conversations.len(), 1);
+
+        let invalid = serde_json::json!({
+            "ok":true,
+            "action":"inbox_existing",
+            "verification":"cached_existing_conversations_and_user_id",
+            "updated_cookie":"wt2=secret",
+            "count":1,
+            "conversations":[{"remote_id":"not-requested","latest":null}]
+        });
+        assert!(
+            parse_existing_inbox_response(
+                &serde_json::to_vec(&invalid).expect("payload"),
+                &["remote-1"]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1618,13 +1899,19 @@ print('normalized')
     }
 
     #[test]
-    fn native_recruiter_challenge_error_routes_to_legacy_token_retry() {
-        assert!(is_recruiter_challenge(&BossError::Authentication(
+    fn native_recruiter_recoverable_errors_route_to_helper() {
+        assert!(is_recruiter_helper_recoverable(&BossError::Authentication(
             "Zhipin security challenge requires native token support; API code 37 request was not retried"
                 .to_owned(),
         )));
-        assert!(!is_recruiter_challenge(&BossError::Authentication(
-            "Zhipin request failed with API code 24".to_owned(),
+        assert!(is_recruiter_helper_recoverable(&BossError::Authentication(
+            "native Zhipin request failed".to_owned(),
         )));
+        assert!(!is_recruiter_helper_recoverable(
+            &BossError::Authentication("Zhipin request failed with API code 24".to_owned(),)
+        ));
+        assert!(!is_recruiter_helper_recoverable(
+            &BossError::Authentication("native recruiter MQTT connection failed".to_owned(),)
+        ));
     }
 }
