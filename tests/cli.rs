@@ -324,7 +324,7 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
         .expect("binary")
         .arg("--json")
         .env("BOSS_DATA_DIR", directory.path())
-        .args(["recruiter", "candidates", "视频剪辑"])
+        .args(["recruiter", "candidates", "视频剪辑", "--job-id", "job"])
         .output()
         .expect("run");
     assert!(!output.status.success());
@@ -346,6 +346,8 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
             "recruiter",
             "candidates",
             "video",
+            "--job-id",
+            "job",
             "--limit",
             "6",
         ])
@@ -371,13 +373,16 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
         .args([
             "recruiter",
             "greet",
-            "42",
             "--encrypt-geek-id",
             "encrypted-geek",
             "--security-id",
             "security",
             "--encrypt-job-id",
             "job",
+            "--expect-id",
+            "expect",
+            "--lid",
+            "lid",
             "--message",
             "你好，想和你聊聊这个岗位",
             "--yes",
@@ -402,13 +407,16 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
             "lty",
             "recruiter",
             "greet",
-            "42",
             "--encrypt-geek-id",
             "encrypted-geek",
             "--security-id",
             "security",
             "--encrypt-job-id",
             "job",
+            "--expect-id",
+            "expect",
+            "--lid",
+            "lid",
             "--message",
             "你好，想和你聊聊这个岗位",
         ])
@@ -422,37 +430,6 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
         "invalid argument: recruiter greet requires --yes"
     );
 
-    let output = Command::cargo_bin("boss")
-        .expect("binary")
-        .arg("--json")
-        .env("BOSS_DATA_DIR", directory.path())
-        .args([
-            "--account",
-            "lty",
-            "recruiter",
-            "greet",
-            "0",
-            "--encrypt-geek-id",
-            "encrypted-geek",
-            "--security-id",
-            "security",
-            "--encrypt-job-id",
-            "job",
-            "--message",
-            "你好，想和你聊聊这个岗位",
-            "--yes",
-        ])
-        .output()
-        .expect("run");
-    assert!(!output.status.success());
-    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
-    assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("positive integer"))
-    );
-
     let secret = "wt2=RECRUITER_GREET_COOKIE_MUST_NOT_APPEAR";
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -464,13 +441,16 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
             "lty",
             "recruiter",
             "greet",
-            "42",
             "--encrypt-geek-id",
             "encrypted-geek",
             "--security-id",
             "security",
             "--encrypt-job-id",
             "job",
+            "--expect-id",
+            "expect",
+            "--lid",
+            "lid",
             "--message",
             "项目地址 https://github.com/example/project",
             "--yes",

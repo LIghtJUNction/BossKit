@@ -12,6 +12,7 @@ use bosskit::campaign::{
 use bosskit::export::{ExportFormat, ExportOptions, ExportSource};
 use bosskit::model::ErrorBody;
 use bosskit::schema::SchemaFormat;
+use bosskit::service::RecruiterGreetRequest;
 use bosskit::{BossError, BossService, Envelope, SearchSpecPatch};
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -254,6 +255,9 @@ enum RecruiterCommand {
     Candidates {
         /// Search keywords, for example `视频剪辑`
         keywords: String,
+        /// Encrypted recruiting job identifier from the recruiter job surface
+        #[arg(long)]
+        job_id: String,
         /// Optional BOSS city code, for example `101230100`
         #[arg(long)]
         city: Option<String>,
@@ -317,8 +321,6 @@ enum RecruiterCommand {
     },
     /// Send one explicitly confirmed recruiter initial greeting to an exact candidate
     Greet {
-        /// Numeric candidate UID from the same bounded recruiter candidate search card
-        uid: String,
         /// Encrypted candidate identifier from the same native search card
         #[arg(long)]
         encrypt_geek_id: String,
@@ -328,6 +330,12 @@ enum RecruiterCommand {
         /// Encrypted job identifier associated with the candidate selection
         #[arg(long)]
         encrypt_job_id: String,
+        /// Candidate expectation identifier from the same recommendation card
+        #[arg(long)]
+        expect_id: String,
+        /// Recommendation card lid; pass the exact value, including an empty value when supplied by BOSS
+        #[arg(long)]
+        lid: String,
         /// One printable single-line greeting, at most 200 characters
         #[arg(long)]
         message: String,
@@ -1414,12 +1422,14 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
         }
         Command::Recruiter { command } => match command {
             RecruiterCommand::Candidates {
+                job_id,
                 keywords,
                 city,
                 limit,
                 detail,
             } => {
                 print_json(&Envelope::success(service.recruiter_candidates(
+                    &job_id,
                     &keywords,
                     city.as_deref(),
                     limit,
@@ -1458,19 +1468,23 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 ));
             }
             RecruiterCommand::Greet {
-                uid,
                 encrypt_geek_id,
                 security_id,
                 encrypt_job_id,
+                expect_id,
+                lid,
                 message,
                 yes,
             } => {
                 print_json(&Envelope::success(service.recruiter_greet(
-                    &uid,
-                    &encrypt_geek_id,
-                    &security_id,
-                    &encrypt_job_id,
-                    &message,
+                    RecruiterGreetRequest::new(
+                        &encrypt_geek_id,
+                        &security_id,
+                        &encrypt_job_id,
+                        &expect_id,
+                        &lid,
+                        &message,
+                    ),
                     yes,
                 )?));
             }
