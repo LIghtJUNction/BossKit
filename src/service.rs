@@ -49,7 +49,8 @@ fn chat_send_remote_modified(state: &str) -> Value {
     match state {
         "message_verified" => json!(true),
         "already_sent" | "rejected" => json!(false),
-        "unverified" | _ => Value::Null,
+        "unverified" => Value::Null,
+        _ => Value::Null,
     }
 }
 

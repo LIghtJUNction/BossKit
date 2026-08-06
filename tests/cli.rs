@@ -720,18 +720,16 @@ fn chat_inbox_is_bounded_and_rejects_invalid_local_targets_before_credentials() 
         assert!(!directory.path().join(".auth").exists());
     }
 
-    for args in [vec!["chat", "inbox", "a", "b", "c", "d", "e", "f"]] {
-        let output = Command::cargo_bin("boss")
-            .expect("binary")
-            .arg("--json")
-            .env("BOSS_DATA_DIR", directory.path())
-            .args(args)
-            .output()
-            .expect("run");
-        assert!(!output.status.success());
-        let value: Value = serde_json::from_slice(&output.stdout).expect("json");
-        assert_eq!(value["error"]["code"], "invalid_argument");
-    }
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args(["chat", "inbox", "a", "b", "c", "d", "e", "f"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "invalid_argument");
 }
 
 #[test]
