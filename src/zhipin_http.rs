@@ -27,11 +27,11 @@ const RECRUITER_REFERER: &str = "https://www.zhipin.com/web/chat/index";
 const CANDIDATE_SEARCH_REFERER: &str = "https://www.zhipin.com/web/frame/search/";
 const RECRUITER_FILTER_PATH: &str = "/wapi/zprelation/friend/filterByLabel";
 const RECRUITER_FRIEND_DETAIL_PATH: &str = "/wapi/zprelation/friend/getBossFriendListV2.json";
-const CANDIDATE_SEARCH_PATH: &str = "/wapi/zpitem/web/boss/search/geeks.json";
+const CANDIDATE_SEARCH_PATH: &str = "/wapi/zpjob/rec/geek/list";
 const CANDIDATE_DETAIL_PATH: &str = "/wapi/zpitem/web/boss/search/geek/info";
 const RECRUITER_HISTORY_PATH: &str = "/wapi/zpchat/boss/historyMsg";
 const RECRUITER_RESUME_PATH: &str = "/wapi/zpboss/h5/geek/detail/get";
-const RECRUITER_GREET_PATH: &str = "/wapi/zprelation/friend/bossAddFriend";
+const RECRUITER_GREET_PATH: &str = "/wapi/zpjob/chat/start";
 const USER_INFO_PATH: &str = "/wapi/zpuser/wap/getUserInfo.json";
 const WT_PATH: &str = "/wapi/zppassport/get/wt";
 // BOSS returns up to 100 recruiter rows in one page; bound the raw payload
@@ -151,6 +151,11 @@ pub(crate) struct RecruiterCandidateRecord {
     pub(crate) encrypt_uid: Option<String>,
     pub(crate) security_id: Option<String>,
     pub(crate) encrypt_job_id: Option<String>,
+    pub(crate) expect_id: Option<String>,
+    pub(crate) lid: Option<String>,
+    /// `Some(false)` is the only state eligible for a new greeting. Missing
+    /// or malformed values are deliberately retained as ineligible.
+    pub(crate) have_chatted: Option<bool>,
     pub(crate) name: String,
     pub(crate) age: String,
     pub(crate) birth_year: Option<u16>,
@@ -183,6 +188,7 @@ pub(crate) struct RecruiterCandidatePage {
 /// hard degree filter and soft ranking locally; this route never opens a chat.
 pub(crate) fn recruiter_candidates(
     cookie: &str,
+    encrypt_job_id: &str,
     keywords: &str,
     city: Option<&str>,
     limit: usize,
@@ -193,11 +199,20 @@ pub(crate) fn recruiter_candidates(
         ));
     }
     auth::validate_cookie(cookie)?;
+    let encrypt_job_id = encrypt_job_id.trim().to_owned();
+    if encrypt_job_id.is_empty()
+        || encrypt_job_id.chars().count() > 4096
+        || !encrypt_job_id.is_ascii()
+    {
+        return Err(BossError::InvalidArgument(
+            "recruiter candidates encrypted job id is invalid".to_owned(),
+        ));
+    }
     let keywords = keywords.trim().to_owned();
     let city = city.map(str::to_owned);
     let cookie = cookie.to_owned();
     std::thread::spawn(move || {
-        recruiter_candidates_blocking(&cookie, &keywords, city.as_deref(), limit)
+        recruiter_candidates_blocking(&cookie, &encrypt_job_id, &keywords, city.as_deref(), limit)
     })
     .join()
     .map_err(|_| transport_error("native recruiter candidate search thread panicked"))?
@@ -375,6 +390,7 @@ fn detail_array_text(
 
 fn recruiter_candidates_blocking(
     cookie: &str,
+    encrypt_job_id: &str,
     keywords: &str,
     city: Option<&str>,
     limit: usize,
@@ -386,13 +402,18 @@ fn recruiter_candidates_blocking(
         .map_err(|_| transport_error("unable to build native Zhipin HTTP client"))?;
     let mut query = vec![
         ("page", "1".to_owned()),
-        ("jobId", "0".to_owned()),
-        ("keywords", keywords.to_owned()),
-        ("degree", "-1".to_owned()),
-        ("schoolLevel", "-1".to_owned()),
-        ("gender", "-1".to_owned()),
-        ("applyStatus", "-1".to_owned()),
-        ("source", "1".to_owned()),
+        ("jobId", encrypt_job_id.to_owned()),
+        ("age", "16,-1".to_owned()),
+        ("school", "0".to_owned()),
+        ("degree", "0".to_owned()),
+        ("experience", "0".to_owned()),
+        ("activation", "0".to_owned()),
+        ("recentNotView", "0".to_owned()),
+        ("exchangeResumeWithColleague", "0".to_owned()),
+        ("gender", "0".to_owned()),
+        ("major", "0".to_owned()),
+        ("keyword1", keywords.to_owned()),
+        ("switchJobFrequency", "0".to_owned()),
     ];
     if let Some(city) = city.filter(|value| !value.is_empty()) {
         query.push(("city", city.to_owned()));
@@ -405,7 +426,7 @@ fn recruiter_candidates_blocking(
         CANDIDATE_SEARCH_REFERER,
         MAX_CANDIDATE_RESPONSE_BYTES,
     )?;
-    parse_recruiter_candidates(&payload, limit)
+    parse_recruiter_candidates(&payload, limit, encrypt_job_id)
 }
 
 /// Fetches one bounded recruiter friend-list page without invoking Python.
@@ -473,35 +494,41 @@ pub(crate) fn recruiter_resume(
         .map_err(|_| transport_error("native recruiter resume thread panicked"))?
 }
 
-/// Sends one recruiter-side initial greeting to an exact candidate and
-/// verifies that the candidate appears in the recruiter friend list.
+/// Sends one recruiter-side initial greeting after re-reading the same
+/// job-scoped recommendation list and matching the exact eligible card.
 pub(crate) fn recruiter_greet(
     cookie: &str,
-    uid: &str,
     encrypt_geek_id: &str,
     security_id: &str,
     encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
+    message: &str,
 ) -> Result<RecruiterGreetResult, BossError> {
-    let target_uid = uid
-        .parse::<i64>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            BossError::InvalidArgument("recruiter greet uid must be a positive integer".to_owned())
-        })?;
-    validate_recruiter_greet_identifiers(encrypt_geek_id, security_id, encrypt_job_id)?;
+    let message = normalize_message(message)?;
+    validate_recruiter_greet_identifiers(
+        encrypt_geek_id,
+        security_id,
+        encrypt_job_id,
+        expect_id,
+        lid,
+    )?;
     auth::validate_cookie(cookie)?;
     let cookie = cookie.to_owned();
     let encrypt_geek_id = encrypt_geek_id.to_owned();
     let security_id = security_id.to_owned();
     let encrypt_job_id = encrypt_job_id.to_owned();
+    let expect_id = expect_id.to_owned();
+    let lid = lid.to_owned();
     std::thread::spawn(move || {
         recruiter_greet_blocking(
             &cookie,
-            target_uid,
             &encrypt_geek_id,
             &security_id,
             &encrypt_job_id,
+            &expect_id,
+            &lid,
+            &message,
         )
     })
     .join()
@@ -512,18 +539,14 @@ pub(crate) fn validate_recruiter_greet_identifiers(
     encrypt_geek_id: &str,
     security_id: &str,
     encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
 ) -> Result<(), BossError> {
-    if encrypt_geek_id.trim().is_empty()
-        || encrypt_geek_id.chars().count() > 4096
-        || !encrypt_geek_id.is_ascii()
-    {
-        return Err(BossError::InvalidArgument(
-            "recruiter greet encrypted candidate id is invalid".to_owned(),
-        ));
-    }
     for (field, value) in [
+        ("encrypted candidate id", encrypt_geek_id),
         ("security id", security_id),
         ("encrypted job id", encrypt_job_id),
+        ("expectation id", expect_id),
     ] {
         if value.trim().is_empty() || value.chars().count() > 4096 || !value.is_ascii() {
             return Err(BossError::InvalidArgument(format!(
@@ -531,51 +554,168 @@ pub(crate) fn validate_recruiter_greet_identifiers(
             )));
         }
     }
+    if lid.chars().count() > 4096 || !lid.is_ascii() {
+        return Err(BossError::InvalidArgument(
+            "recruiter greet lid is invalid".to_owned(),
+        ));
+    }
     Ok(())
 }
 
 fn recruiter_greet_blocking(
     cookie: &str,
-    target_uid: i64,
     encrypt_geek_id: &str,
     security_id: &str,
     encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
+    message: &str,
 ) -> Result<RecruiterGreetResult, BossError> {
     let client = Client::builder()
         .redirect(Policy::none())
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| transport_error("unable to build native Zhipin HTTP client"))?;
-    if has_exact_recruiter_friend(&client, cookie, target_uid, encrypt_geek_id, encrypt_job_id)? {
-        return Ok(RecruiterGreetResult {
-            state: "already_connected".to_owned(),
-            verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
-        });
-    }
-    let form = [
-        ("encryptGeekId", encrypt_geek_id.to_owned()),
-        ("securityId", security_id.to_owned()),
-        ("encryptJobId", encrypt_job_id.to_owned()),
-    ];
-    match native_recruiter_greet_post(&client, cookie, &form)? {
-        RecruiterGreetWriteOutcome::Unknown => {
-            return Ok(RecruiterGreetResult {
-                state: "unverified".to_owned(),
-                verification: "boss_add_friend_write_outcome_unknown".to_owned(),
-            });
-        }
-        RecruiterGreetWriteOutcome::Rejected => {
-            return Ok(RecruiterGreetResult {
-                state: "rejected".to_owned(),
-                verification: "boss_add_friend_api_rejected".to_owned(),
-            });
-        }
-        RecruiterGreetWriteOutcome::Accepted => {}
-    }
-    verify_recruiter_greet_after_write(
-        || has_exact_recruiter_friend(&client, cookie, target_uid, encrypt_geek_id, encrypt_job_id),
-        || std::thread::sleep(Duration::from_millis(500)),
+    let form = recruiter_greet_form(
+        encrypt_geek_id,
+        encrypt_job_id,
+        expect_id,
+        lid,
+        message,
+        security_id,
+    );
+    recruiter_greet_after_preflight(
+        || recruiter_greeting_preflight_candidates(&client, cookie, encrypt_job_id),
+        || native_recruiter_greet_post(&client, cookie, &form),
+        encrypt_geek_id,
+        security_id,
+        encrypt_job_id,
+        expect_id,
+        lid,
     )
+}
+
+fn recruiter_greet_after_preflight<F, W>(
+    preflight: F,
+    write: W,
+    encrypt_geek_id: &str,
+    security_id: &str,
+    encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
+) -> Result<RecruiterGreetResult, BossError>
+where
+    F: FnOnce() -> Result<RecruiterCandidatePage, BossError>,
+    W: FnOnce() -> Result<RecruiterGreetWriteOutcome, BossError>,
+{
+    let page = preflight()?;
+    ensure_recruiter_greet_preflight(
+        &page.records,
+        encrypt_geek_id,
+        security_id,
+        encrypt_job_id,
+        expect_id,
+        lid,
+    )?;
+    match write()? {
+        RecruiterGreetWriteOutcome::Accepted => Ok(RecruiterGreetResult {
+            state: "api_accepted".to_owned(),
+            verification: "chat_start_api_status_1".to_owned(),
+        }),
+        RecruiterGreetWriteOutcome::Rejected => Ok(RecruiterGreetResult {
+            state: "rejected".to_owned(),
+            verification: "chat_start_rejected".to_owned(),
+        }),
+        RecruiterGreetWriteOutcome::Unknown => Ok(RecruiterGreetResult {
+            state: "unverified".to_owned(),
+            verification: "chat_start_write_outcome_unknown".to_owned(),
+        }),
+    }
+}
+
+fn recruiter_greeting_preflight_candidates(
+    client: &Client,
+    cookie: &str,
+    encrypt_job_id: &str,
+) -> Result<RecruiterCandidatePage, BossError> {
+    let payload = native_json_get_with_referer(
+        client,
+        cookie,
+        CANDIDATE_SEARCH_PATH,
+        &[
+            ("page", "1".to_owned()),
+            ("jobId", encrypt_job_id.to_owned()),
+            ("age", "16,-1".to_owned()),
+            ("school", "0".to_owned()),
+            ("degree", "0".to_owned()),
+            ("experience", "0".to_owned()),
+            ("activation", "0".to_owned()),
+            ("recentNotView", "0".to_owned()),
+            ("exchangeResumeWithColleague", "0".to_owned()),
+            ("gender", "0".to_owned()),
+            ("major", "0".to_owned()),
+            ("keyword1", "-1".to_owned()),
+            ("switchJobFrequency", "0".to_owned()),
+        ],
+        CANDIDATE_SEARCH_REFERER,
+        MAX_CANDIDATE_RESPONSE_BYTES,
+    )?;
+    parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS, encrypt_job_id)
+}
+
+fn ensure_recruiter_greet_preflight(
+    candidates: &[RecruiterCandidateRecord],
+    encrypt_geek_id: &str,
+    security_id: &str,
+    encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
+) -> Result<(), BossError> {
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.encrypt_uid.as_deref() == Some(encrypt_geek_id))
+        .ok_or_else(|| {
+            BossError::InvalidArgument(
+                "recruiter greet candidate was not found in the fresh recommendation list"
+                    .to_owned(),
+            )
+        })?;
+    if candidate.have_chatted != Some(false) {
+        return Err(BossError::InvalidArgument(
+            "recruiter greet candidate is not eligible in the fresh recommendation list".to_owned(),
+        ));
+    }
+    if candidate.security_id.as_deref() != Some(security_id)
+        || candidate.encrypt_job_id.as_deref() != Some(encrypt_job_id)
+        || candidate.expect_id.as_deref() != Some(expect_id)
+        || candidate.lid.as_deref() != Some(lid)
+    {
+        return Err(BossError::InvalidArgument(
+            "recruiter greet candidate metadata did not match the fresh recommendation card"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn recruiter_greet_form(
+    encrypt_geek_id: &str,
+    encrypt_job_id: &str,
+    expect_id: &str,
+    lid: &str,
+    message: &str,
+    security_id: &str,
+) -> [(&'static str, String); 8] {
+    [
+        ("gid", encrypt_geek_id.to_owned()),
+        ("suid", String::new()),
+        ("jid", encrypt_job_id.to_owned()),
+        ("expectId", expect_id.to_owned()),
+        ("lid", lid.to_owned()),
+        ("greet", message.to_owned()),
+        ("from", String::new()),
+        ("securityId", security_id.to_owned()),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,97 +776,19 @@ fn parse_recruiter_greet_write_response(
             "Zhipin recruiter greeting stopped for risk-control API code {code}; request was not retried"
         )));
     }
-    Ok(if code == 0 {
-        RecruiterGreetWriteOutcome::Accepted
-    } else {
-        RecruiterGreetWriteOutcome::Rejected
-    })
-}
-
-fn verify_recruiter_greet_after_write<F, W>(
-    mut has_exact_friend: F,
-    mut wait_between_attempts: W,
-) -> Result<RecruiterGreetResult, BossError>
-where
-    F: FnMut() -> Result<bool, BossError>,
-    W: FnMut(),
-{
-    for attempt in 0..3 {
-        match has_exact_friend() {
-            Ok(true) => {
-                return Ok(RecruiterGreetResult {
-                    state: "greeting_verified".to_owned(),
-                    verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
-                });
-            }
-            Ok(false) => {}
-            Err(_) => {
-                return Ok(RecruiterGreetResult {
-                    state: "unverified".to_owned(),
-                    verification: "boss_add_friend_api_code_0_friend_verification_failed"
-                        .to_owned(),
-                });
-            }
-        }
-        if attempt < 2 {
-            wait_between_attempts();
-        }
+    if code != 0 {
+        return Ok(RecruiterGreetWriteOutcome::Rejected);
     }
-    Ok(RecruiterGreetResult {
-        state: "unverified".to_owned(),
-        verification: "boss_add_friend_api_code_0_without_exact_friend".to_owned(),
+    let status = payload
+        .get("zpData")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("status"))
+        .and_then(Value::as_i64);
+    Ok(match status {
+        Some(1) => RecruiterGreetWriteOutcome::Accepted,
+        Some(_) => RecruiterGreetWriteOutcome::Rejected,
+        None => RecruiterGreetWriteOutcome::Unknown,
     })
-}
-
-fn has_exact_recruiter_friend(
-    client: &Client,
-    cookie: &str,
-    target_numeric_uid: i64,
-    target_uid: &str,
-    target_job_id: &str,
-) -> Result<bool, BossError> {
-    let mut found = false;
-    for page in 1..=MAX_FRIEND_SEARCH_PAGES {
-        let payload = recruiter_payload(client, cookie, page)?;
-        let items = payload
-            .get("zpData")
-            .and_then(Value::as_object)
-            .ok_or_else(|| transport_error("native recruiter response returned no result data"))
-            .and_then(recruiter_items)?;
-        for object in items.iter().filter_map(Value::as_object) {
-            let matches =
-                recruiter_friend_matches(object, target_numeric_uid, target_uid, target_job_id);
-            if matches && found {
-                return Err(transport_error(
-                    "native recruiter conversation lookup was ambiguous",
-                ));
-            }
-            found |= matches;
-        }
-        if items.is_empty() {
-            break;
-        }
-    }
-    Ok(found)
-}
-
-fn recruiter_friend_matches(
-    object: &serde_json::Map<String, Value>,
-    target_numeric_uid: i64,
-    target_uid: &str,
-    target_job_id: &str,
-) -> bool {
-    let uid_matches = ["encryptUid", "encryptGeekId", "encryptFriendId"]
-        .into_iter()
-        .filter_map(|key| object.get(key))
-        .filter_map(Value::as_str)
-        .any(|value| value == target_uid);
-    recruiter_uid(object) == Some(target_numeric_uid)
-        && uid_matches
-        && object
-            .get("encryptJobId")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == target_job_id)
 }
 
 fn recruiter_resume_blocking(
@@ -1001,10 +1063,11 @@ fn extract_github_refs(value: &str) -> Vec<String> {
 fn parse_recruiter_candidates(
     payload: &Value,
     limit: usize,
+    encrypt_job_id: &str,
 ) -> Result<RecruiterCandidatePage, BossError> {
-    if !(1..=5).contains(&limit) {
+    if !(1..=MAX_RECRUITER_INBOX_RECORDS).contains(&limit) {
         return Err(BossError::InvalidArgument(
-            "recruiter candidate limit must be 1..=5".to_owned(),
+            "recruiter candidate parse limit must be 1..=20".to_owned(),
         ));
     }
     let data = payload
@@ -1015,7 +1078,7 @@ fn parse_recruiter_candidates(
         .get("hasMore")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let items: &[Value] = match data.get("geeks").and_then(Value::as_array) {
+    let items: &[Value] = match data.get("geekList").and_then(Value::as_array) {
         Some(items) => items.as_slice(),
         None if data.is_empty() || !has_more => &[],
         None => {
@@ -1027,12 +1090,15 @@ fn parse_recruiter_candidates(
     let records = items
         .iter()
         .take(MAX_RECRUITER_INBOX_RECORDS)
-        .filter_map(parse_recruiter_candidate)
+        .filter_map(|item| parse_recruiter_candidate(item, encrypt_job_id))
         .collect();
     Ok(RecruiterCandidatePage { records, has_more })
 }
 
-fn parse_recruiter_candidate(value: &Value) -> Option<RecruiterCandidateRecord> {
+fn parse_recruiter_candidate(
+    value: &Value,
+    encrypt_job_id: &str,
+) -> Option<RecruiterCandidateRecord> {
     let item = value.as_object()?;
     let card = item
         .get("geekCard")
@@ -1041,7 +1107,13 @@ fn parse_recruiter_candidate(value: &Value) -> Option<RecruiterCandidateRecord> 
     let uid = candidate_text(card, item, &["uid", "geekId"]);
     let encrypt_uid = candidate_text(card, item, &["encryptGeekId", "encryptUid"]);
     let security_id = candidate_text(card, item, &["securityId"]);
-    let encrypt_job_id = candidate_text(card, item, &["encryptJobId"]);
+    let expect_id = candidate_text(card, item, &["expectId", "encryptExpectId"]);
+    let lid = candidate_text(card, item, &["lid"]);
+    let have_chatted = item
+        .get("haveChatted")
+        .or_else(|| card.get("haveChatted"))
+        .map(Value::as_bool)
+        .unwrap_or(None);
     let name = candidate_text(card, item, &["name", "geekName"]);
     let age = candidate_text(card, item, &["ageDesc", "age"]);
     let degree = candidate_text(
@@ -1128,7 +1200,10 @@ fn parse_recruiter_candidate(value: &Value) -> Option<RecruiterCandidateRecord> 
         uid: (!uid.is_empty()).then_some(uid),
         encrypt_uid: (!encrypt_uid.is_empty()).then_some(encrypt_uid),
         security_id: (!security_id.is_empty()).then_some(security_id),
-        encrypt_job_id: (!encrypt_job_id.is_empty()).then_some(encrypt_job_id),
+        encrypt_job_id: Some(encrypt_job_id.to_owned()),
+        expect_id: (!expect_id.is_empty()).then_some(expect_id),
+        lid: Some(lid),
+        have_chatted,
         name: bounded_text(if name.is_empty() { "候选人" } else { &name }, 128),
         age: bounded_text(&age, 64),
         birth_year,
@@ -2272,6 +2347,33 @@ fn transport_error(message: &str) -> BossError {
 mod tests {
     use super::*;
 
+    fn preflight_candidate(have_chatted: Option<bool>) -> RecruiterCandidateRecord {
+        RecruiterCandidateRecord {
+            uid: Some("42".to_owned()),
+            encrypt_uid: Some("geek".to_owned()),
+            security_id: Some("security".to_owned()),
+            encrypt_job_id: Some("job".to_owned()),
+            expect_id: Some("expect".to_owned()),
+            lid: Some("lid".to_owned()),
+            have_chatted,
+            name: "Candidate".to_owned(),
+            age: String::new(),
+            birth_year: None,
+            degree: "本科".to_owned(),
+            work_years: String::new(),
+            expected_positions: Vec::new(),
+            summary: String::new(),
+            projects: Vec::new(),
+        }
+    }
+
+    fn preflight_page(candidate: RecruiterCandidateRecord) -> RecruiterCandidatePage {
+        RecruiterCandidatePage {
+            records: vec![candidate],
+            has_more: false,
+        }
+    }
+
     #[test]
     fn parses_only_bounded_and_identifier_free_recruiter_records() {
         let payload = br#"{"code":0,"zpData":{"friendList":[{"isFromGeek":true,"uid":"private"},{"lastMessage":{"fromGeek":false}}]}}"#;
@@ -2312,55 +2414,51 @@ mod tests {
     }
 
     #[test]
-    fn recruiter_greeting_requires_exact_candidate_and_job() {
+    fn recruiter_greeting_requires_all_card_identifiers() {
         assert!(
-            validate_recruiter_greet_identifiers("encrypted-geek", "security", "encrypted-job")
-                .is_ok()
+            validate_recruiter_greet_identifiers(
+                "encrypted-geek",
+                "security",
+                "encrypted-job",
+                "expect",
+                "lid"
+            )
+            .is_ok()
         );
-        assert!(validate_recruiter_greet_identifiers("候选人", "security", "job").is_err());
-        assert!(validate_recruiter_greet_identifiers("geek", "", "job").is_err());
-        let friend = serde_json::json!({
-            "uid":42,
-            "encryptUid":"encrypted-geek",
-            "encryptJobId":"encrypted-job"
-        });
-        let object = friend.as_object().expect("friend object");
-        assert!(recruiter_friend_matches(
-            object,
-            42,
-            "encrypted-geek",
-            "encrypted-job"
-        ));
-        assert!(!recruiter_friend_matches(
-            object,
-            42,
-            "encrypted-geek",
-            "other-job"
-        ));
-        assert!(!recruiter_friend_matches(
-            object,
-            42,
-            "other-geek",
-            "encrypted-job"
-        ));
-        assert!(!recruiter_friend_matches(
-            object,
-            43,
-            "encrypted-geek",
-            "encrypted-job"
-        ));
+        assert!(
+            validate_recruiter_greet_identifiers("候选人", "security", "job", "expect", "lid")
+                .is_err()
+        );
+        assert!(validate_recruiter_greet_identifiers("geek", "", "job", "expect", "lid").is_err());
+        assert!(
+            validate_recruiter_greet_identifiers("geek", "security", "job", "", "lid").is_err()
+        );
     }
 
     #[test]
     fn recruiter_greeting_response_distinguishes_acceptance_and_rejection() {
         assert_eq!(
-            parse_recruiter_greet_write_response(br#"{"code":0}"#).expect("accepted"),
+            parse_recruiter_greet_write_response(br#"{"code":0,"zpData":{"status":1}}"#)
+                .expect("accepted"),
             RecruiterGreetWriteOutcome::Accepted
         );
         assert_eq!(
             parse_recruiter_greet_write_response(br#"{"code":5}"#).expect("rejected"),
             RecruiterGreetWriteOutcome::Rejected
         );
+    }
+
+    #[test]
+    fn recruiter_greeting_api_acceptance_is_not_delivery_verification() {
+        let response = parse_recruiter_greet_write_response(br#"{"code":0,"zpData":{"status":1}}"#)
+            .expect("accepted");
+        assert_eq!(response, RecruiterGreetWriteOutcome::Accepted);
+        let result = RecruiterGreetResult {
+            state: "api_accepted".to_owned(),
+            verification: "chat_start_api_status_1".to_owned(),
+        };
+        assert_eq!(result.state, "api_accepted");
+        assert!(!result.verification.contains("verified"));
     }
 
     #[test]
@@ -2398,69 +2496,94 @@ mod tests {
     }
 
     #[test]
-    fn recruiter_greeting_post_write_verification_error_is_structured_unverified() {
-        let mut attempts = 0;
-        let result = verify_recruiter_greet_after_write(
-            || {
-                attempts += 1;
-                Err(transport_error("friend list transport failed"))
-            },
-            || panic!("verification errors must not be retried"),
-        )
-        .expect("structured result");
-
-        assert_eq!(attempts, 1);
-        assert_eq!(result.state, "unverified");
+    fn recruiter_greeting_form_matches_chat_start_contract() {
         assert_eq!(
-            result.verification,
-            "boss_add_friend_api_code_0_friend_verification_failed"
+            recruiter_greet_form("geek", "job", "expect", "lid", "hello", "security"),
+            [
+                ("gid", "geek".to_owned()),
+                ("suid", String::new()),
+                ("jid", "job".to_owned()),
+                ("expectId", "expect".to_owned()),
+                ("lid", "lid".to_owned()),
+                ("greet", "hello".to_owned()),
+                ("from", String::new()),
+                ("securityId", "security".to_owned()),
+            ]
         );
     }
 
     #[test]
-    fn recruiter_greeting_later_post_write_parse_error_is_structured_unverified() {
-        let mut attempts = 0;
-        let mut waits = 0;
-        let result = verify_recruiter_greet_after_write(
+    fn recruiter_greeting_preflight_reads_before_one_exact_write() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = recruiter_greet_after_preflight(
             || {
-                attempts += 1;
-                if attempts == 1 {
-                    Ok(false)
-                } else {
-                    Err(BossError::Parse("friend list was malformed".to_owned()))
-                }
+                events.borrow_mut().push("get");
+                Ok(preflight_page(preflight_candidate(Some(false))))
             },
-            || waits += 1,
+            || {
+                events.borrow_mut().push("post");
+                Ok(RecruiterGreetWriteOutcome::Accepted)
+            },
+            "geek",
+            "security",
+            "job",
+            "expect",
+            "lid",
         )
-        .expect("structured result");
-
-        assert_eq!(attempts, 2);
-        assert_eq!(waits, 1);
-        assert_eq!(result.state, "unverified");
-        assert_eq!(
-            result.verification,
-            "boss_add_friend_api_code_0_friend_verification_failed"
-        );
+        .expect("accepted greeting");
+        assert_eq!(*events.borrow(), ["get", "post"]);
+        assert_eq!(result.state, "api_accepted");
     }
 
     #[test]
-    fn recruiter_greeting_post_write_verification_still_requires_exact_friend() {
-        let mut attempts = 0;
-        let result = verify_recruiter_greet_after_write(
-            || {
-                attempts += 1;
-                Ok(attempts == 3)
+    fn recruiter_greeting_preflight_blocks_ineligible_missing_or_malformed_candidates() {
+        for candidate in [
+            preflight_candidate(Some(true)),
+            preflight_candidate(None),
+            RecruiterCandidateRecord {
+                encrypt_uid: Some("other".to_owned()),
+                ..preflight_candidate(Some(false))
             },
-            || {},
-        )
-        .expect("verified result");
+            RecruiterCandidateRecord {
+                security_id: Some("other-security".to_owned()),
+                ..preflight_candidate(Some(false))
+            },
+        ] {
+            let mut writes = 0;
+            let result = recruiter_greet_after_preflight(
+                || Ok(preflight_page(candidate)),
+                || {
+                    writes += 1;
+                    Ok(RecruiterGreetWriteOutcome::Accepted)
+                },
+                "geek",
+                "security",
+                "job",
+                "expect",
+                "lid",
+            );
+            assert!(result.is_err());
+            assert_eq!(writes, 0);
+        }
+    }
 
-        assert_eq!(attempts, 3);
-        assert_eq!(result.state, "greeting_verified");
-        assert_eq!(
-            result.verification,
-            "exact_candidate_and_job_in_recruiter_friend_list"
+    #[test]
+    fn recruiter_greeting_preflight_read_error_prevents_write() {
+        let mut writes = 0;
+        let result = recruiter_greet_after_preflight(
+            || Err(transport_error("preflight read failed")),
+            || {
+                writes += 1;
+                Ok(RecruiterGreetWriteOutcome::Accepted)
+            },
+            "geek",
+            "security",
+            "job",
+            "expect",
+            "lid",
         );
+        assert!(result.is_err());
+        assert_eq!(writes, 0);
     }
 
     #[test]
@@ -2581,13 +2704,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_bounded_candidate_cards_without_contact_fields() {
+    fn parses_job_scoped_recommendation_cards_without_contact_fields() {
         let payload = serde_json::json!({
             "code": 0,
             "zpData": {
                 "page": 1,
                 "hasMore": true,
-                "geeks": [{
+                "geekList": [{
+                    "haveChatted": false,
                     "geekCard": {
                         "uid": 42,
                         "encryptGeekId": "encrypted-geek",
@@ -2597,7 +2721,8 @@ mod tests {
                         "degreeName": "本科",
                         "workYearDesc": "3年",
                         "securityId": "security",
-                        "encryptJobId": "job",
+                        "expectId": "expect",
+                        "lid": "lid",
                         "expectPositionName": "视频剪辑",
                         "userDescription": "自学 PR，作品集和项目经历。电话 13800138000",
                         "projectExperience": [{
@@ -2609,7 +2734,7 @@ mod tests {
                 }]
             }
         });
-        let page = parse_recruiter_candidates(&payload, 5).expect("candidates");
+        let page = parse_recruiter_candidates(&payload, 5, "job").expect("candidates");
         assert!(page.has_more);
         assert_eq!(page.records.len(), 1);
         let candidate = &page.records[0];
@@ -2617,6 +2742,9 @@ mod tests {
         assert_eq!(candidate.encrypt_uid.as_deref(), Some("encrypted-geek"));
         assert_eq!(candidate.security_id.as_deref(), Some("security"));
         assert_eq!(candidate.encrypt_job_id.as_deref(), Some("job"));
+        assert_eq!(candidate.expect_id.as_deref(), Some("expect"));
+        assert_eq!(candidate.lid.as_deref(), Some("lid"));
+        assert_eq!(candidate.have_chatted, Some(false));
         assert_eq!(candidate.degree, "本科");
         assert_eq!(candidate.birth_year, Some(1998));
         assert_eq!(candidate.expected_positions, vec!["视频剪辑"]);
@@ -2626,39 +2754,66 @@ mod tests {
     }
 
     #[test]
-    fn candidate_parser_does_not_treat_plain_job_id_as_encrypted_job_id() {
+    fn recommendation_parser_uses_the_requested_encrypted_job_id() {
         let payload = serde_json::json!({
             "code": 0,
             "zpData": {
-                "geeks": [{
+                "geekList": [{
                     "geekCard": {
                         "uid": 42,
                         "encryptGeekId": "encrypted-geek",
                         "securityId": "security",
-                        "jobId": 123,
+                        "expectId": "expect",
+                        "lid": "lid",
                         "name": "Candidate"
                     }
                 }]
             }
         });
 
-        let page = parse_recruiter_candidates(&payload, 1).expect("candidates");
+        let page = parse_recruiter_candidates(&payload, 1, "encrypted-job").expect("candidates");
         assert_eq!(page.records.len(), 1);
-        assert_eq!(page.records[0].encrypt_job_id, None);
+        assert_eq!(
+            page.records[0].encrypt_job_id.as_deref(),
+            Some("encrypted-job")
+        );
+        assert_eq!(page.records[0].have_chatted, None);
     }
 
     #[test]
-    fn candidate_search_requires_a_single_bounded_limit() {
-        let payload = serde_json::json!({"code":0,"zpData":{"geeks":[]}});
-        assert!(parse_recruiter_candidates(&payload, 1).is_ok());
-        assert!(parse_recruiter_candidates(&payload, 6).is_err());
+    fn recommendation_parser_preserves_explicit_conversation_eligibility() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "zpData": {"geekList": [
+                {"haveChatted": false, "geekCard": {"name": "Eligible"}},
+                {"haveChatted": true, "geekCard": {"name": "Existing"}},
+                {"haveChatted": "false", "geekCard": {"name": "Malformed"}},
+                {"geekCard": {"name": "Missing"}}
+            ]}
+        });
+        let page = parse_recruiter_candidates(&payload, 5, "job").expect("candidates");
+        assert_eq!(page.records.len(), 4);
+        assert_eq!(page.records[0].have_chatted, Some(false));
+        assert_eq!(page.records[1].have_chatted, Some(true));
+        assert_eq!(page.records[2].have_chatted, None);
+        assert_eq!(page.records[3].have_chatted, None);
+    }
+
+    #[test]
+    fn candidate_parser_allows_the_bounded_preflight_page() {
+        let payload = serde_json::json!({"code":0,"zpData":{"geekList":[]}});
+        assert!(parse_recruiter_candidates(&payload, 1, "job").is_ok());
+        assert!(parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS, "job").is_ok());
+        assert!(
+            parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS + 1, "job").is_err()
+        );
     }
 
     #[test]
     fn parses_search_card_highest_degree_and_nested_highlights() {
         let payload = serde_json::json!({
             "code": 0,
-            "zpData": {"geeks": [{
+            "zpData": {"geekList": [{
                 "ageDesc": "29岁",
                 "highlightExpectName": "视频剪辑",
                 "highlightGeekDescName": "自学<em class='h'>剪辑</em>并持续复盘",
@@ -2675,7 +2830,7 @@ mod tests {
                 }
             }]}
         });
-        let page = parse_recruiter_candidates(&payload, 5).expect("candidates");
+        let page = parse_recruiter_candidates(&payload, 5, "job").expect("candidates");
         let candidate = &page.records[0];
         assert_eq!(candidate.degree, "本科");
         assert_eq!(candidate.work_years, "2年");
