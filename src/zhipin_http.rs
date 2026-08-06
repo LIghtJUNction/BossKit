@@ -45,6 +45,7 @@ const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleW
 const MAX_HISTORY_TEXT_CHARS: usize = 2000;
 const MAX_RESUME_DESCRIPTION_CHARS: usize = 16 * 1024;
 const MAX_RESUME_ITEMS: usize = 20;
+const MAX_PUBLIC_RECRUITER_CANDIDATES: usize = 5;
 pub(crate) const MAX_RECRUITER_INBOX_RECORDS: usize = 20;
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 // Keep exact resume/reply UID lookup bounded. A UID surfaced by the bounded
@@ -85,6 +86,9 @@ pub(crate) struct RecruiterGreetResult {
     pub(crate) state: String,
     pub(crate) verification: String,
 }
+
+#[derive(Debug)]
+pub(crate) struct RecruiterGreeting(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RecruiterResumeSnapshot {
@@ -193,10 +197,10 @@ pub(crate) fn recruiter_candidates(
     city: Option<&str>,
     limit: usize,
 ) -> Result<RecruiterCandidatePage, BossError> {
-    if !(1..=5).contains(&limit) {
-        return Err(BossError::InvalidArgument(
-            "recruiter candidate limit must be 1..=5".to_owned(),
-        ));
+    if !(1..=MAX_PUBLIC_RECRUITER_CANDIDATES).contains(&limit) {
+        return Err(BossError::InvalidArgument(format!(
+            "recruiter candidate limit must be 1..={MAX_PUBLIC_RECRUITER_CANDIDATES}"
+        )));
     }
     auth::validate_cookie(cookie)?;
     let encrypt_job_id = encrypt_job_id.trim().to_owned();
@@ -400,6 +404,23 @@ fn recruiter_candidates_blocking(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| transport_error("unable to build native Zhipin HTTP client"))?;
+    let query = recruiter_recommendation_query(encrypt_job_id, keywords, city);
+    let payload = native_json_get_with_referer(
+        &client,
+        cookie,
+        CANDIDATE_SEARCH_PATH,
+        &query,
+        CANDIDATE_SEARCH_REFERER,
+        MAX_CANDIDATE_RESPONSE_BYTES,
+    )?;
+    parse_recruiter_candidates(&payload, limit, encrypt_job_id)
+}
+
+fn recruiter_recommendation_query(
+    encrypt_job_id: &str,
+    keywords: &str,
+    city: Option<&str>,
+) -> Vec<(&'static str, String)> {
     let mut query = vec![
         ("page", "1".to_owned()),
         ("jobId", encrypt_job_id.to_owned()),
@@ -418,15 +439,7 @@ fn recruiter_candidates_blocking(
     if let Some(city) = city.filter(|value| !value.is_empty()) {
         query.push(("city", city.to_owned()));
     }
-    let payload = native_json_get_with_referer(
-        &client,
-        cookie,
-        CANDIDATE_SEARCH_PATH,
-        &query,
-        CANDIDATE_SEARCH_REFERER,
-        MAX_CANDIDATE_RESPONSE_BYTES,
-    )?;
-    parse_recruiter_candidates(&payload, limit, encrypt_job_id)
+    query
 }
 
 /// Fetches one bounded recruiter friend-list page without invoking Python.
@@ -503,9 +516,8 @@ pub(crate) fn recruiter_greet(
     encrypt_job_id: &str,
     expect_id: &str,
     lid: &str,
-    message: &str,
+    message: RecruiterGreeting,
 ) -> Result<RecruiterGreetResult, BossError> {
-    let message = normalize_message(message)?;
     validate_recruiter_greet_identifiers(
         encrypt_geek_id,
         security_id,
@@ -528,11 +540,15 @@ pub(crate) fn recruiter_greet(
             &encrypt_job_id,
             &expect_id,
             &lid,
-            &message,
+            &message.0,
         )
     })
     .join()
     .map_err(|_| transport_error("native recruiter greeting thread panicked"))?
+}
+
+pub(crate) fn normalize_recruiter_greeting(message: &str) -> Result<RecruiterGreeting, BossError> {
+    normalize_message(message).map(RecruiterGreeting)
 }
 
 pub(crate) fn validate_recruiter_greet_identifiers(
@@ -638,25 +654,12 @@ fn recruiter_greeting_preflight_candidates(
     cookie: &str,
     encrypt_job_id: &str,
 ) -> Result<RecruiterCandidatePage, BossError> {
+    let query = recruiter_recommendation_query(encrypt_job_id, "-1", None);
     let payload = native_json_get_with_referer(
         client,
         cookie,
         CANDIDATE_SEARCH_PATH,
-        &[
-            ("page", "1".to_owned()),
-            ("jobId", encrypt_job_id.to_owned()),
-            ("age", "16,-1".to_owned()),
-            ("school", "0".to_owned()),
-            ("degree", "0".to_owned()),
-            ("experience", "0".to_owned()),
-            ("activation", "0".to_owned()),
-            ("recentNotView", "0".to_owned()),
-            ("exchangeResumeWithColleague", "0".to_owned()),
-            ("gender", "0".to_owned()),
-            ("major", "0".to_owned()),
-            ("keyword1", "-1".to_owned()),
-            ("switchJobFrequency", "0".to_owned()),
-        ],
+        &query,
         CANDIDATE_SEARCH_REFERER,
         MAX_CANDIDATE_RESPONSE_BYTES,
     )?;
@@ -1066,9 +1069,9 @@ fn parse_recruiter_candidates(
     encrypt_job_id: &str,
 ) -> Result<RecruiterCandidatePage, BossError> {
     if !(1..=MAX_RECRUITER_INBOX_RECORDS).contains(&limit) {
-        return Err(BossError::InvalidArgument(
-            "recruiter candidate parse limit must be 1..=20".to_owned(),
-        ));
+        return Err(BossError::InvalidArgument(format!(
+            "recruiter candidate preflight limit must be 1..={MAX_RECRUITER_INBOX_RECORDS}"
+        )));
     }
     let data = payload
         .get("zpData")
@@ -2436,6 +2439,26 @@ mod tests {
     }
 
     #[test]
+    fn recruiter_greeting_invalid_message_is_rejected_before_authentication_or_post() {
+        let error = normalize_recruiter_greeting("https://example.test")
+            .expect_err("links must be rejected at the greeting write boundary");
+        assert!(error.to_string().contains("plain text"));
+    }
+
+    #[test]
+    fn recruiter_recommendation_query_is_shared_by_search_and_preflight() {
+        let search = recruiter_recommendation_query("job", "video", Some("101230100"));
+        assert!(search.contains(&("jobId", "job".to_owned())));
+        assert!(search.contains(&("keyword1", "video".to_owned())));
+        assert!(search.contains(&("city", "101230100".to_owned())));
+
+        let preflight = recruiter_recommendation_query("job", "-1", None);
+        assert!(preflight.contains(&("jobId", "job".to_owned())));
+        assert!(preflight.contains(&("keyword1", "-1".to_owned())));
+        assert!(!preflight.iter().any(|(key, _)| *key == "city"));
+    }
+
+    #[test]
     fn recruiter_greeting_response_distinguishes_acceptance_and_rejection() {
         assert_eq!(
             parse_recruiter_greet_write_response(br#"{"code":0,"zpData":{"status":1}}"#)
@@ -2806,6 +2829,13 @@ mod tests {
         assert!(parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS, "job").is_ok());
         assert!(
             parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS + 1, "job").is_err()
+        );
+        let error = parse_recruiter_candidates(&payload, MAX_RECRUITER_INBOX_RECORDS + 1, "job")
+            .expect_err("preflight limit must stay bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("recruiter candidate preflight limit must be 1..=20")
         );
     }
 

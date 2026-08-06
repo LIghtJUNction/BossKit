@@ -802,7 +802,7 @@ impl BossService {
                 "recruiter greet requires --yes".to_owned(),
             ));
         }
-        let message = crate::zhipin_direct::normalize_message(request.message)?;
+        let message = crate::zhipin_http::normalize_recruiter_greeting(request.message)?;
         crate::zhipin_http::validate_recruiter_greet_identifiers(
             request.encrypt_geek_id,
             request.security_id,
@@ -827,7 +827,7 @@ impl BossService {
             request.encrypt_job_id,
             request.expect_id,
             request.lid,
-            &message,
+            message,
         )?;
         let accepted = greeting.state == "api_accepted";
         Ok(json!({
