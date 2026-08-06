@@ -356,14 +356,14 @@ impl AuthStore {
                 _ => {}
             }
         }
-        let complete = primary_cookie_present && stoken_present;
+        let ready = primary_cookie_present;
         SessionHealth {
             cookie_present: true,
             primary_cookie_present,
             stoken_present,
             auxiliary_cookie_present,
-            state: if complete { "ready" } else { "partial" },
-            next_action: if complete { "none" } else { "boss login" },
+            state: if ready { "ready" } else { "partial" },
+            next_action: if ready { "none" } else { "boss login" },
         }
     }
 
@@ -928,27 +928,38 @@ mod tests {
 
         store
             .store_session(Platform::Zhipin, "wt2=primary-fixture".to_owned())
-            .expect("store partial session");
-        let partial = store.session_health(Platform::Zhipin);
-        assert_eq!(partial.state, "partial");
-        assert_eq!(partial.next_action, "boss login");
-        assert!(!partial.stoken_present);
+            .expect("store ready session");
+        let ready = store.session_health(Platform::Zhipin);
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.next_action, "none");
+        assert!(ready.cookie_present);
+        assert!(ready.primary_cookie_present);
+        assert!(!ready.stoken_present);
+        assert!(!ready.auxiliary_cookie_present);
 
         store
             .store_session(
                 Platform::Zhipin,
-                "wt2=primary-fixture; __zp_stoken__=stoken-fixture; wbg=aux-fixture".to_owned(),
+                "__zp_stoken__=stoken-fixture; wbg=aux-fixture".to_owned(),
             )
-            .expect("store session");
-        let health = store.session_health(Platform::Zhipin);
-        assert_eq!(health.state, "ready");
-        assert!(health.cookie_present);
-        assert!(health.primary_cookie_present);
-        assert!(health.stoken_present);
-        assert!(health.auxiliary_cookie_present);
-        let serialized = serde_json::to_string(&health).expect("serialize health");
+            .expect("store partial session");
+        let partial = store.session_health(Platform::Zhipin);
+        assert_eq!(partial.state, "partial");
+        assert_eq!(partial.next_action, "boss login");
+        assert!(partial.cookie_present);
+        assert!(!partial.primary_cookie_present);
+        assert!(partial.stoken_present);
+        assert!(partial.auxiliary_cookie_present);
+
+        let serialized = serde_json::to_string(&[ready, partial]).expect("serialize health");
+        assert!(serialized.contains("primary_cookie_present"));
+        assert!(serialized.contains("stoken_present"));
+        assert!(serialized.contains("auxiliary_cookie_present"));
+        assert!(serialized.contains("\"state\":\"ready\""));
+        assert!(serialized.contains("\"state\":\"partial\""));
         assert!(!serialized.contains("primary-fixture"));
         assert!(!serialized.contains("stoken-fixture"));
+        assert!(!serialized.contains("aux-fixture"));
     }
 
     #[cfg(unix)]
