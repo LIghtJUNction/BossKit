@@ -31,6 +31,7 @@ const CANDIDATE_SEARCH_PATH: &str = "/wapi/zpitem/web/boss/search/geeks.json";
 const CANDIDATE_DETAIL_PATH: &str = "/wapi/zpitem/web/boss/search/geek/info";
 const RECRUITER_HISTORY_PATH: &str = "/wapi/zpchat/boss/historyMsg";
 const RECRUITER_RESUME_PATH: &str = "/wapi/zpboss/h5/geek/detail/get";
+const RECRUITER_GREET_PATH: &str = "/wapi/zprelation/friend/bossAddFriend";
 const USER_INFO_PATH: &str = "/wapi/zpuser/wap/getUserInfo.json";
 const WT_PATH: &str = "/wapi/zppassport/get/wt";
 // BOSS returns up to 100 recruiter rows in one page; bound the raw payload
@@ -75,6 +76,12 @@ pub(crate) struct RecruiterInboxRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RecruiterSendResult {
+    pub(crate) state: String,
+    pub(crate) verification: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RecruiterGreetResult {
     pub(crate) state: String,
     pub(crate) verification: String,
 }
@@ -141,7 +148,9 @@ pub(crate) struct RecruiterInboxPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecruiterCandidateRecord {
     pub(crate) uid: Option<String>,
+    pub(crate) encrypt_uid: Option<String>,
     pub(crate) security_id: Option<String>,
+    pub(crate) encrypt_job_id: Option<String>,
     pub(crate) name: String,
     pub(crate) age: String,
     pub(crate) birth_year: Option<u16>,
@@ -464,6 +473,262 @@ pub(crate) fn recruiter_resume(
         .map_err(|_| transport_error("native recruiter resume thread panicked"))?
 }
 
+/// Sends one recruiter-side initial greeting to an exact candidate and
+/// verifies that the candidate appears in the recruiter friend list.
+pub(crate) fn recruiter_greet(
+    cookie: &str,
+    uid: &str,
+    encrypt_geek_id: &str,
+    security_id: &str,
+    encrypt_job_id: &str,
+) -> Result<RecruiterGreetResult, BossError> {
+    let target_uid = uid
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            BossError::InvalidArgument("recruiter greet uid must be a positive integer".to_owned())
+        })?;
+    validate_recruiter_greet_identifiers(encrypt_geek_id, security_id, encrypt_job_id)?;
+    auth::validate_cookie(cookie)?;
+    let cookie = cookie.to_owned();
+    let encrypt_geek_id = encrypt_geek_id.to_owned();
+    let security_id = security_id.to_owned();
+    let encrypt_job_id = encrypt_job_id.to_owned();
+    std::thread::spawn(move || {
+        recruiter_greet_blocking(
+            &cookie,
+            target_uid,
+            &encrypt_geek_id,
+            &security_id,
+            &encrypt_job_id,
+        )
+    })
+    .join()
+    .map_err(|_| transport_error("native recruiter greeting thread panicked"))?
+}
+
+pub(crate) fn validate_recruiter_greet_identifiers(
+    encrypt_geek_id: &str,
+    security_id: &str,
+    encrypt_job_id: &str,
+) -> Result<(), BossError> {
+    if encrypt_geek_id.trim().is_empty()
+        || encrypt_geek_id.chars().count() > 4096
+        || !encrypt_geek_id.is_ascii()
+    {
+        return Err(BossError::InvalidArgument(
+            "recruiter greet encrypted candidate id is invalid".to_owned(),
+        ));
+    }
+    for (field, value) in [
+        ("security id", security_id),
+        ("encrypted job id", encrypt_job_id),
+    ] {
+        if value.trim().is_empty() || value.chars().count() > 4096 || !value.is_ascii() {
+            return Err(BossError::InvalidArgument(format!(
+                "recruiter greet {field} is invalid"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn recruiter_greet_blocking(
+    cookie: &str,
+    target_uid: i64,
+    encrypt_geek_id: &str,
+    security_id: &str,
+    encrypt_job_id: &str,
+) -> Result<RecruiterGreetResult, BossError> {
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| transport_error("unable to build native Zhipin HTTP client"))?;
+    if has_exact_recruiter_friend(&client, cookie, target_uid, encrypt_geek_id, encrypt_job_id)? {
+        return Ok(RecruiterGreetResult {
+            state: "already_connected".to_owned(),
+            verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
+        });
+    }
+    let form = [
+        ("encryptGeekId", encrypt_geek_id.to_owned()),
+        ("securityId", security_id.to_owned()),
+        ("encryptJobId", encrypt_job_id.to_owned()),
+    ];
+    match native_recruiter_greet_post(&client, cookie, &form)? {
+        RecruiterGreetWriteOutcome::Unknown => {
+            return Ok(RecruiterGreetResult {
+                state: "unverified".to_owned(),
+                verification: "boss_add_friend_write_outcome_unknown".to_owned(),
+            });
+        }
+        RecruiterGreetWriteOutcome::Rejected => {
+            return Ok(RecruiterGreetResult {
+                state: "rejected".to_owned(),
+                verification: "boss_add_friend_api_rejected".to_owned(),
+            });
+        }
+        RecruiterGreetWriteOutcome::Accepted => {}
+    }
+    verify_recruiter_greet_after_write(
+        || has_exact_recruiter_friend(&client, cookie, target_uid, encrypt_geek_id, encrypt_job_id),
+        || std::thread::sleep(Duration::from_millis(500)),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecruiterGreetWriteOutcome {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
+fn native_recruiter_greet_post(
+    client: &Client,
+    cookie: &str,
+    form: &[(&str, String)],
+) -> Result<RecruiterGreetWriteOutcome, BossError> {
+    let request_headers = headers(cookie)?;
+    wait_for_recruiter_request_slot();
+    let response = match client
+        .post(format!("{BASE_URL}{RECRUITER_GREET_PATH}"))
+        .headers(request_headers)
+        .form(form)
+        .send()
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(RecruiterGreetWriteOutcome::Unknown),
+    };
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        if recruiter_greet_hard_stop_status(status) {
+            return Err(BossError::Http {
+                status,
+                message: "native Zhipin recruiter greeting was rejected".to_owned(),
+            });
+        }
+        return Ok(RecruiterGreetWriteOutcome::Unknown);
+    }
+    let bytes = match read_bounded_response(response, MAX_RESPONSE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(RecruiterGreetWriteOutcome::Unknown),
+    };
+    parse_recruiter_greet_write_response(&bytes)
+}
+
+fn recruiter_greet_hard_stop_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429)
+}
+
+fn parse_recruiter_greet_write_response(
+    bytes: &[u8],
+) -> Result<RecruiterGreetWriteOutcome, BossError> {
+    let Ok(payload) = serde_json::from_slice::<Value>(bytes) else {
+        return Ok(RecruiterGreetWriteOutcome::Unknown);
+    };
+    let Some(code) = payload.get("code").and_then(Value::as_i64) else {
+        return Ok(RecruiterGreetWriteOutcome::Unknown);
+    };
+    if matches!(code, 9 | 36 | 37) {
+        return Err(transport_error(&format!(
+            "Zhipin recruiter greeting stopped for risk-control API code {code}; request was not retried"
+        )));
+    }
+    Ok(if code == 0 {
+        RecruiterGreetWriteOutcome::Accepted
+    } else {
+        RecruiterGreetWriteOutcome::Rejected
+    })
+}
+
+fn verify_recruiter_greet_after_write<F, W>(
+    mut has_exact_friend: F,
+    mut wait_between_attempts: W,
+) -> Result<RecruiterGreetResult, BossError>
+where
+    F: FnMut() -> Result<bool, BossError>,
+    W: FnMut(),
+{
+    for attempt in 0..3 {
+        match has_exact_friend() {
+            Ok(true) => {
+                return Ok(RecruiterGreetResult {
+                    state: "greeting_verified".to_owned(),
+                    verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
+                });
+            }
+            Ok(false) => {}
+            Err(_) => {
+                return Ok(RecruiterGreetResult {
+                    state: "unverified".to_owned(),
+                    verification: "boss_add_friend_api_code_0_friend_verification_failed"
+                        .to_owned(),
+                });
+            }
+        }
+        if attempt < 2 {
+            wait_between_attempts();
+        }
+    }
+    Ok(RecruiterGreetResult {
+        state: "unverified".to_owned(),
+        verification: "boss_add_friend_api_code_0_without_exact_friend".to_owned(),
+    })
+}
+
+fn has_exact_recruiter_friend(
+    client: &Client,
+    cookie: &str,
+    target_numeric_uid: i64,
+    target_uid: &str,
+    target_job_id: &str,
+) -> Result<bool, BossError> {
+    let mut found = false;
+    for page in 1..=MAX_FRIEND_SEARCH_PAGES {
+        let payload = recruiter_payload(client, cookie, page)?;
+        let items = payload
+            .get("zpData")
+            .and_then(Value::as_object)
+            .ok_or_else(|| transport_error("native recruiter response returned no result data"))
+            .and_then(recruiter_items)?;
+        for object in items.iter().filter_map(Value::as_object) {
+            let matches =
+                recruiter_friend_matches(object, target_numeric_uid, target_uid, target_job_id);
+            if matches && found {
+                return Err(transport_error(
+                    "native recruiter conversation lookup was ambiguous",
+                ));
+            }
+            found |= matches;
+        }
+        if items.is_empty() {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+fn recruiter_friend_matches(
+    object: &serde_json::Map<String, Value>,
+    target_numeric_uid: i64,
+    target_uid: &str,
+    target_job_id: &str,
+) -> bool {
+    let uid_matches = ["encryptUid", "encryptGeekId", "encryptFriendId"]
+        .into_iter()
+        .filter_map(|key| object.get(key))
+        .filter_map(Value::as_str)
+        .any(|value| value == target_uid);
+    recruiter_uid(object) == Some(target_numeric_uid)
+        && uid_matches
+        && object
+            .get("encryptJobId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == target_job_id)
+}
+
 fn recruiter_resume_blocking(
     cookie: &str,
     uid: &str,
@@ -773,12 +1038,10 @@ fn parse_recruiter_candidate(value: &Value) -> Option<RecruiterCandidateRecord> 
         .get("geekCard")
         .and_then(Value::as_object)
         .unwrap_or(item);
-    let uid = candidate_text(
-        card,
-        item,
-        &["uid", "geekId", "encryptGeekId", "encryptUid"],
-    );
+    let uid = candidate_text(card, item, &["uid", "geekId"]);
+    let encrypt_uid = candidate_text(card, item, &["encryptGeekId", "encryptUid"]);
     let security_id = candidate_text(card, item, &["securityId"]);
+    let encrypt_job_id = candidate_text(card, item, &["encryptJobId"]);
     let name = candidate_text(card, item, &["name", "geekName"]);
     let age = candidate_text(card, item, &["ageDesc", "age"]);
     let degree = candidate_text(
@@ -863,7 +1126,9 @@ fn parse_recruiter_candidate(value: &Value) -> Option<RecruiterCandidateRecord> 
     let birth_year = parse_birth_year(&birth_value);
     Some(RecruiterCandidateRecord {
         uid: (!uid.is_empty()).then_some(uid),
+        encrypt_uid: (!encrypt_uid.is_empty()).then_some(encrypt_uid),
         security_id: (!security_id.is_empty()).then_some(security_id),
+        encrypt_job_id: (!encrypt_job_id.is_empty()).then_some(encrypt_job_id),
         name: bounded_text(if name.is_empty() { "候选人" } else { &name }, 128),
         age: bounded_text(&age, 64),
         birth_year,
@@ -1196,7 +1461,7 @@ fn recruiter_send_blocking(
         &message,
         now_millis()?,
     )?;
-    publish_mqtt(cookie, &user_token, wt2, payload)?;
+    let publication_failed = publish_mqtt(cookie, &user_token, wt2, payload).is_err();
     for attempt in 0..3 {
         let after = recruiter_history(&client, cookie, target_uid, &friend.security_id)?;
         if has_outgoing_text(&after, user_id, target_uid, &message) {
@@ -1209,9 +1474,15 @@ fn recruiter_send_blocking(
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    Err(transport_error(
-        "native recruiter message could not be verified",
-    ))
+    Ok(RecruiterSendResult {
+        state: "unverified".to_owned(),
+        verification: if publication_failed {
+            "recruiter_publish_failed_without_exact_history"
+        } else {
+            "recruiter_publish_acknowledged_without_exact_history"
+        }
+        .to_owned(),
+    })
 }
 
 fn headers(cookie: &str) -> Result<HeaderMap, BossError> {
@@ -1379,10 +1650,10 @@ fn parse_native_json_response_bounded(
         .get("code")
         .and_then(Value::as_i64)
         .ok_or_else(|| transport_error("native Zhipin response omitted API code"))?;
-    if code == 37 {
-        return Err(transport_error(
-            "Zhipin security challenge requires native token support; API code 37 request was not retried",
-        ));
+    if matches!(code, 9 | 36 | 37) {
+        return Err(transport_error(&format!(
+            "Zhipin request stopped for risk-control API code {code}; request was not retried"
+        )));
     }
     if code != 0 {
         return Err(transport_error(&format!(
@@ -2041,6 +2312,158 @@ mod tests {
     }
 
     #[test]
+    fn recruiter_greeting_requires_exact_candidate_and_job() {
+        assert!(
+            validate_recruiter_greet_identifiers("encrypted-geek", "security", "encrypted-job")
+                .is_ok()
+        );
+        assert!(validate_recruiter_greet_identifiers("候选人", "security", "job").is_err());
+        assert!(validate_recruiter_greet_identifiers("geek", "", "job").is_err());
+        let friend = serde_json::json!({
+            "uid":42,
+            "encryptUid":"encrypted-geek",
+            "encryptJobId":"encrypted-job"
+        });
+        let object = friend.as_object().expect("friend object");
+        assert!(recruiter_friend_matches(
+            object,
+            42,
+            "encrypted-geek",
+            "encrypted-job"
+        ));
+        assert!(!recruiter_friend_matches(
+            object,
+            42,
+            "encrypted-geek",
+            "other-job"
+        ));
+        assert!(!recruiter_friend_matches(
+            object,
+            42,
+            "other-geek",
+            "encrypted-job"
+        ));
+        assert!(!recruiter_friend_matches(
+            object,
+            43,
+            "encrypted-geek",
+            "encrypted-job"
+        ));
+    }
+
+    #[test]
+    fn recruiter_greeting_response_distinguishes_acceptance_and_rejection() {
+        assert_eq!(
+            parse_recruiter_greet_write_response(br#"{"code":0}"#).expect("accepted"),
+            RecruiterGreetWriteOutcome::Accepted
+        );
+        assert_eq!(
+            parse_recruiter_greet_write_response(br#"{"code":5}"#).expect("rejected"),
+            RecruiterGreetWriteOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn recruiter_greeting_ambiguous_response_is_unknown() {
+        for body in [
+            b"not-json".as_slice(),
+            br#"{}"#.as_slice(),
+            br#"{"code":"0"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                parse_recruiter_greet_write_response(body).expect("unknown outcome"),
+                RecruiterGreetWriteOutcome::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn recruiter_greeting_auth_and_rate_limit_statuses_are_hard_stops() {
+        for status in [401, 403, 429] {
+            assert!(recruiter_greet_hard_stop_status(status));
+        }
+        for status in [400, 404, 500, 503] {
+            assert!(!recruiter_greet_hard_stop_status(status));
+        }
+    }
+
+    #[test]
+    fn recruiter_greeting_risk_codes_are_hard_stops() {
+        for code in [9, 36, 37] {
+            let body = format!(r#"{{"code":{code}}}"#);
+            let error = parse_recruiter_greet_write_response(body.as_bytes())
+                .expect_err("risk code must stop");
+            assert!(error.to_string().contains("risk-control"));
+        }
+    }
+
+    #[test]
+    fn recruiter_greeting_post_write_verification_error_is_structured_unverified() {
+        let mut attempts = 0;
+        let result = verify_recruiter_greet_after_write(
+            || {
+                attempts += 1;
+                Err(transport_error("friend list transport failed"))
+            },
+            || panic!("verification errors must not be retried"),
+        )
+        .expect("structured result");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(result.state, "unverified");
+        assert_eq!(
+            result.verification,
+            "boss_add_friend_api_code_0_friend_verification_failed"
+        );
+    }
+
+    #[test]
+    fn recruiter_greeting_later_post_write_parse_error_is_structured_unverified() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let result = verify_recruiter_greet_after_write(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(false)
+                } else {
+                    Err(BossError::Parse("friend list was malformed".to_owned()))
+                }
+            },
+            || waits += 1,
+        )
+        .expect("structured result");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, 1);
+        assert_eq!(result.state, "unverified");
+        assert_eq!(
+            result.verification,
+            "boss_add_friend_api_code_0_friend_verification_failed"
+        );
+    }
+
+    #[test]
+    fn recruiter_greeting_post_write_verification_still_requires_exact_friend() {
+        let mut attempts = 0;
+        let result = verify_recruiter_greet_after_write(
+            || {
+                attempts += 1;
+                Ok(attempts == 3)
+            },
+            || {},
+        )
+        .expect("verified result");
+
+        assert_eq!(attempts, 3);
+        assert_eq!(result.state, "greeting_verified");
+        assert_eq!(
+            result.verification,
+            "exact_candidate_and_job_in_recruiter_friend_list"
+        );
+    }
+
+    #[test]
     fn rejects_challenge_and_oversized_or_malformed_payloads() {
         for payload in [
             br#"{"code":37,"zpData":{"seed":"private"}}"#.as_slice(),
@@ -2167,11 +2590,14 @@ mod tests {
                 "geeks": [{
                     "geekCard": {
                         "uid": 42,
+                        "encryptGeekId": "encrypted-geek",
                         "name": "S**",
                         "ageDesc": "28岁",
                         "birthYear": 1998,
                         "degreeName": "本科",
                         "workYearDesc": "3年",
+                        "securityId": "security",
+                        "encryptJobId": "job",
                         "expectPositionName": "视频剪辑",
                         "userDescription": "自学 PR，作品集和项目经历。电话 13800138000",
                         "projectExperience": [{
@@ -2188,12 +2614,37 @@ mod tests {
         assert_eq!(page.records.len(), 1);
         let candidate = &page.records[0];
         assert_eq!(candidate.uid.as_deref(), Some("42"));
+        assert_eq!(candidate.encrypt_uid.as_deref(), Some("encrypted-geek"));
+        assert_eq!(candidate.security_id.as_deref(), Some("security"));
+        assert_eq!(candidate.encrypt_job_id.as_deref(), Some("job"));
         assert_eq!(candidate.degree, "本科");
         assert_eq!(candidate.birth_year, Some(1998));
         assert_eq!(candidate.expected_positions, vec!["视频剪辑"]);
         assert!(candidate.summary.contains("[redacted]"));
         assert!(!candidate.summary.contains("13800138000"));
         assert_eq!(candidate.projects.len(), 1);
+    }
+
+    #[test]
+    fn candidate_parser_does_not_treat_plain_job_id_as_encrypted_job_id() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "zpData": {
+                "geeks": [{
+                    "geekCard": {
+                        "uid": 42,
+                        "encryptGeekId": "encrypted-geek",
+                        "securityId": "security",
+                        "jobId": 123,
+                        "name": "Candidate"
+                    }
+                }]
+            }
+        });
+
+        let page = parse_recruiter_candidates(&payload, 1).expect("candidates");
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].encrypt_job_id, None);
     }
 
     #[test]
