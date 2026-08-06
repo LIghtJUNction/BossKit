@@ -315,6 +315,26 @@ enum RecruiterCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Send one explicitly confirmed recruiter initial greeting to an exact candidate
+    Greet {
+        /// Numeric candidate UID from the same bounded recruiter candidate search card
+        uid: String,
+        /// Encrypted candidate identifier from the same native search card
+        #[arg(long)]
+        encrypt_geek_id: String,
+        /// Candidate security identifier returned by the native search card
+        #[arg(long)]
+        security_id: String,
+        /// Encrypted job identifier associated with the candidate selection
+        #[arg(long)]
+        encrypt_job_id: String,
+        /// One printable single-line greeting, at most 200 characters
+        #[arg(long)]
+        message: String,
+        /// Confirm this external write
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -989,6 +1009,16 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             "recruiter reply requires --yes".to_owned(),
         ));
     }
+    if matches!(
+        &cli.command,
+        Command::Recruiter {
+            command: RecruiterCommand::Greet { yes: false, .. }
+        }
+    ) {
+        return Err(BossError::InvalidArgument(
+            "recruiter greet requires --yes".to_owned(),
+        ));
+    }
     if let Command::Chat { command } = &cli.command {
         match command {
             ChatCommand::Greet { yes: false, .. } => {
@@ -1426,6 +1456,23 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                 print_json(&Envelope::success(
                     service.recruiter_reply(&uid, &message, yes)?,
                 ));
+            }
+            RecruiterCommand::Greet {
+                uid,
+                encrypt_geek_id,
+                security_id,
+                encrypt_job_id,
+                message,
+                yes,
+            } => {
+                print_json(&Envelope::success(service.recruiter_greet(
+                    &uid,
+                    &encrypt_geek_id,
+                    &security_id,
+                    &encrypt_job_id,
+                    &message,
+                    yes,
+                )?));
             }
         },
         Command::Chat { command } => match command {

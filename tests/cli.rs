@@ -362,6 +362,134 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
 }
 
 #[test]
+fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials() {
+    let directory = tempdir().expect("temporary directory");
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "recruiter",
+            "greet",
+            "42",
+            "--encrypt-geek-id",
+            "encrypted-geek",
+            "--security-id",
+            "security",
+            "--encrypt-job-id",
+            "job",
+            "--message",
+            "你好，想和你聊聊这个岗位",
+            "--yes",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "--account",
+            "lty",
+            "recruiter",
+            "greet",
+            "42",
+            "--encrypt-geek-id",
+            "encrypted-geek",
+            "--security-id",
+            "security",
+            "--encrypt-job-id",
+            "job",
+            "--message",
+            "你好，想和你聊聊这个岗位",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert_eq!(
+        error["error"]["message"],
+        "invalid argument: recruiter greet requires --yes"
+    );
+
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .args([
+            "--account",
+            "lty",
+            "recruiter",
+            "greet",
+            "0",
+            "--encrypt-geek-id",
+            "encrypted-geek",
+            "--security-id",
+            "security",
+            "--encrypt-job-id",
+            "job",
+            "--message",
+            "你好，想和你聊聊这个岗位",
+            "--yes",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("positive integer"))
+    );
+
+    let secret = "wt2=RECRUITER_GREET_COOKIE_MUST_NOT_APPEAR";
+    let output = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--json")
+        .env("BOSS_DATA_DIR", directory.path())
+        .env("BOSS_ZHIPIN_COOKIE", secret)
+        .args([
+            "--account",
+            "lty",
+            "recruiter",
+            "greet",
+            "42",
+            "--encrypt-geek-id",
+            "encrypted-geek",
+            "--security-id",
+            "security",
+            "--encrypt-job-id",
+            "job",
+            "--message",
+            "项目地址 https://github.com/example/project",
+            "--yes",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("plain text"))
+    );
+    assert!(!rendered.contains(secret));
+}
+
+#[test]
 fn recruiter_inbox_brief_is_a_native_candidate_projection() {
     let directory = tempdir().expect("temporary directory");
     let output = Command::cargo_bin("boss")
@@ -617,7 +745,12 @@ fn recruiter_and_direct_chat_are_cli_only_and_schema_marks_confirmed_writes() {
             .all(|tool| !matches!(
                 tool["name"].as_str(),
                 Some(
-                    "chat_greet" | "chat_send" | "chat_history" | "chat_inbox" | "recruiter_reply"
+                    "chat_greet"
+                        | "chat_send"
+                        | "chat_history"
+                        | "chat_inbox"
+                        | "recruiter_greet"
+                        | "recruiter_reply"
                 )
             ))
     );
@@ -668,6 +801,7 @@ fn recruiter_and_direct_chat_are_cli_only_and_schema_marks_confirmed_writes() {
             "chat greet",
             "chat send",
             "chat exchange-wechat",
+            "recruiter greet",
             "recruiter reply"
         ])
     );

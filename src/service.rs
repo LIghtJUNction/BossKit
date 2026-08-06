@@ -54,6 +54,61 @@ fn chat_send_remote_modified(state: &str) -> Value {
     }
 }
 
+fn recruiter_greet_remote_modified(connection_state: &str, message_state: Option<&str>) -> Value {
+    match (connection_state, message_state) {
+        ("greeting_verified", _) | ("already_connected", Some("message_verified")) => json!(true),
+        ("already_connected", Some("already_sent" | "rejected")) | ("rejected", None) => {
+            json!(false)
+        }
+        _ => Value::Null,
+    }
+}
+
+fn recruiter_greet_final_state(connection_state: &str, message_state: Option<&str>) -> String {
+    message_state.unwrap_or(connection_state).to_owned()
+}
+
+struct RecruiterGreetOutcome {
+    state: String,
+    message_state: Option<String>,
+    verification: String,
+    message_error: Option<&'static str>,
+    remote_modified: Value,
+    custom_message_sent: bool,
+    custom_message_verified: bool,
+}
+
+fn recruiter_greet_outcome(
+    greeting: &crate::zhipin_http::RecruiterGreetResult,
+    message_result: Option<Result<crate::zhipin_http::RecruiterSendResult, BossError>>,
+) -> RecruiterGreetOutcome {
+    let (message_state, message_verification, message_error) = match message_result {
+        Some(Ok(sent)) => (Some(sent.state), Some(sent.verification), None),
+        Some(Err(error)) => (
+            Some("unverified".to_owned()),
+            Some("recruiter_send_failed_after_verified_connection".to_owned()),
+            Some(error.code()),
+        ),
+        None => (None, None, None),
+    };
+    let state = recruiter_greet_final_state(&greeting.state, message_state.as_deref());
+    let verification = match message_verification {
+        Some(message_verification) => {
+            format!("{};{}", greeting.verification, message_verification)
+        }
+        None => greeting.verification.clone(),
+    };
+    RecruiterGreetOutcome {
+        remote_modified: recruiter_greet_remote_modified(&greeting.state, message_state.as_deref()),
+        custom_message_sent: state == "message_verified",
+        custom_message_verified: matches!(state.as_str(), "message_verified" | "already_sent"),
+        state,
+        message_state,
+        verification,
+        message_error,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileIdentity {
     len: u64,
@@ -740,7 +795,78 @@ impl BossService {
             "state":sent.state,
             "verification":sent.verification,
             "network_checked":true,
-            "remote_modified":sent.state == "message_verified"
+            "remote_modified":chat_send_remote_modified(&sent.state)
+        }))
+    }
+
+    /// Establishes one explicitly confirmed recruiter-side conversation.
+    pub fn recruiter_greet(
+        &mut self,
+        uid: &str,
+        encrypt_geek_id: &str,
+        security_id: &str,
+        encrypt_job_id: &str,
+        message: &str,
+        yes: bool,
+    ) -> Result<Value, BossError> {
+        if !yes {
+            return Err(BossError::InvalidArgument(
+                "recruiter greet requires --yes".to_owned(),
+            ));
+        }
+        if uid.parse::<u64>().ok().filter(|value| *value > 0).is_none() {
+            return Err(BossError::InvalidArgument(
+                "recruiter greet uid must be a positive integer".to_owned(),
+            ));
+        }
+        let message = crate::zhipin_direct::normalize_message(message)?;
+        crate::zhipin_http::validate_recruiter_greet_identifiers(
+            encrypt_geek_id,
+            security_id,
+            encrypt_job_id,
+        )?;
+        if self.auth.active_role() != ZhipinRole::Recruiter {
+            return Err(BossError::Authentication(
+                "recruiter greet requires a selected recruiter Zhipin session".to_owned(),
+            ));
+        }
+        let cookie = self.auth.session_cookie(Platform::Zhipin).ok_or_else(|| {
+            BossError::Authentication(
+                "recruiter greet requires a selected recruiter Zhipin session".to_owned(),
+            )
+        })?;
+        let greeting = crate::zhipin_http::recruiter_greet(
+            &cookie,
+            uid,
+            encrypt_geek_id,
+            security_id,
+            encrypt_job_id,
+        )?;
+        let message_result = if matches!(
+            greeting.state.as_str(),
+            "already_connected" | "greeting_verified"
+        ) {
+            Some(crate::zhipin_http::recruiter_send(&cookie, uid, &message))
+        } else {
+            None
+        };
+        let outcome = recruiter_greet_outcome(&greeting, message_result);
+        Ok(json!({
+            "action":"recruiter_greet",
+            "account":self.auth.active_account(),
+            "role":"recruiter",
+            "encrypt_geek_id":encrypt_geek_id,
+            "uid":uid,
+            "state":outcome.state,
+            "connection_state":greeting.state,
+            "message_state":outcome.message_state,
+            "verification":outcome.verification,
+            "message_error":outcome.message_error,
+            "network_checked":true,
+            "remote_modified":outcome.remote_modified,
+            "custom_message_sent":outcome.custom_message_sent,
+            "custom_message_verified":outcome.custom_message_verified,
+            "resume_submitted":false
         }))
     }
 
@@ -2929,6 +3055,23 @@ fn rank_recruiter_candidate(
         score += 1;
         reasons.push("年龄接近 95-00 年偏好".to_owned());
     }
+    let greeting = match (
+        candidate
+            .uid
+            .as_deref()
+            .filter(|uid| uid.parse::<u64>().is_ok_and(|value| value > 0)),
+        candidate.encrypt_uid.as_deref(),
+        candidate.security_id.as_deref(),
+        candidate.encrypt_job_id.as_deref(),
+    ) {
+        (Some(uid), Some(encrypt_geek_id), Some(security_id), Some(encrypt_job_id)) => json!({
+            "uid":uid,
+            "encrypt_geek_id":encrypt_geek_id,
+            "security_id":security_id,
+            "encrypt_job_id":encrypt_job_id,
+        }),
+        _ => Value::Null,
+    };
     (
         score,
         candidate.name.clone(),
@@ -2942,6 +3085,7 @@ fn rank_recruiter_candidate(
             "expected_positions":candidate.expected_positions,
             "summary":candidate.summary,
             "projects":candidate.projects,
+            "greeting":greeting,
             "match_score":score,
             "match_reasons":reasons
         }),
@@ -3042,6 +3186,148 @@ mod tests {
         assert_eq!(chat_send_remote_modified("rejected"), json!(false));
         assert_eq!(chat_send_remote_modified("unverified"), Value::Null);
         assert_eq!(chat_send_remote_modified("unknown_state"), Value::Null);
+    }
+
+    #[test]
+    fn recruiter_greet_remote_modified_covers_two_stage_state_machine() {
+        let cases = [
+            ("greeting_verified", None, json!(true)),
+            ("greeting_verified", Some("message_verified"), json!(true)),
+            ("greeting_verified", Some("already_sent"), json!(true)),
+            ("greeting_verified", Some("rejected"), json!(true)),
+            ("greeting_verified", Some("unverified"), json!(true)),
+            ("already_connected", None, Value::Null),
+            ("already_connected", Some("message_verified"), json!(true)),
+            ("already_connected", Some("already_sent"), json!(false)),
+            ("already_connected", Some("rejected"), json!(false)),
+            ("already_connected", Some("unverified"), Value::Null),
+            ("rejected", None, json!(false)),
+            ("unverified", None, Value::Null),
+        ];
+        for (connection_state, message_state, expected) in cases {
+            assert_eq!(
+                recruiter_greet_remote_modified(connection_state, message_state),
+                expected,
+                "unexpected aggregate mutation state for {connection_state}/{message_state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recruiter_greet_final_state_prefers_message_outcome() {
+        for (connection_state, message_state, expected) in [
+            (
+                "greeting_verified",
+                Some("message_verified"),
+                "message_verified",
+            ),
+            ("greeting_verified", Some("already_sent"), "already_sent"),
+            ("greeting_verified", Some("rejected"), "rejected"),
+            ("greeting_verified", Some("unverified"), "unverified"),
+            (
+                "already_connected",
+                Some("message_verified"),
+                "message_verified",
+            ),
+            ("already_connected", Some("already_sent"), "already_sent"),
+            ("already_connected", Some("rejected"), "rejected"),
+            ("already_connected", Some("unverified"), "unverified"),
+            ("rejected", None, "rejected"),
+            ("unverified", None, "unverified"),
+        ] {
+            assert_eq!(
+                recruiter_greet_final_state(connection_state, message_state),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn recruiter_greet_send_error_preserves_verified_connection_mutation() {
+        let greeting = crate::zhipin_http::RecruiterGreetResult {
+            state: "greeting_verified".to_owned(),
+            verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
+        };
+        let outcome = recruiter_greet_outcome(
+            &greeting,
+            Some(Err(BossError::Authentication(
+                "native recruiter history unavailable".to_owned(),
+            ))),
+        );
+
+        assert_eq!(outcome.state, "unverified");
+        assert_eq!(outcome.message_state.as_deref(), Some("unverified"));
+        assert_eq!(outcome.remote_modified, json!(true));
+        assert_eq!(outcome.message_error, Some("authentication_error"));
+        assert_eq!(
+            outcome.verification,
+            "exact_candidate_and_job_in_recruiter_friend_list;recruiter_send_failed_after_verified_connection"
+        );
+        assert!(!outcome.custom_message_sent);
+        assert!(!outcome.custom_message_verified);
+    }
+
+    #[test]
+    fn recruiter_greet_unverified_message_never_claims_custom_message_success() {
+        let greeting = crate::zhipin_http::RecruiterGreetResult {
+            state: "greeting_verified".to_owned(),
+            verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
+        };
+        let outcome = recruiter_greet_outcome(
+            &greeting,
+            Some(Ok(crate::zhipin_http::RecruiterSendResult {
+                state: "unverified".to_owned(),
+                verification: "recruiter_publish_acknowledged_without_exact_history".to_owned(),
+            })),
+        );
+
+        assert_eq!(outcome.state, "unverified");
+        assert_eq!(outcome.remote_modified, json!(true));
+        assert!(!outcome.custom_message_sent);
+        assert!(!outcome.custom_message_verified);
+    }
+
+    #[test]
+    fn recruiter_greet_rejected_message_preserves_verified_connection_mutation() {
+        let greeting = crate::zhipin_http::RecruiterGreetResult {
+            state: "greeting_verified".to_owned(),
+            verification: "exact_candidate_and_job_in_recruiter_friend_list".to_owned(),
+        };
+        let outcome = recruiter_greet_outcome(
+            &greeting,
+            Some(Ok(crate::zhipin_http::RecruiterSendResult {
+                state: "rejected".to_owned(),
+                verification: "recruiter_message_rejected".to_owned(),
+            })),
+        );
+
+        assert_eq!(outcome.state, "rejected");
+        assert_eq!(outcome.remote_modified, json!(true));
+        assert!(!outcome.custom_message_sent);
+        assert!(!outcome.custom_message_verified);
+    }
+
+    #[test]
+    fn recruiter_candidate_greeting_metadata_keeps_uid_and_opaque_ids_together() {
+        let candidate = crate::zhipin_http::RecruiterCandidateRecord {
+            uid: Some("42".to_owned()),
+            encrypt_uid: Some("encrypted-geek".to_owned()),
+            security_id: Some("security".to_owned()),
+            encrypt_job_id: Some("encrypted-job".to_owned()),
+            name: "Candidate".to_owned(),
+            age: "28岁".to_owned(),
+            birth_year: Some(1998),
+            degree: "本科".to_owned(),
+            work_years: "3年".to_owned(),
+            expected_positions: vec!["AI应用开发".to_owned()],
+            summary: "Agent 项目".to_owned(),
+            projects: vec!["RAG".to_owned()],
+        };
+        let (_, _, value, _) = rank_recruiter_candidate(candidate, "AI");
+        assert_eq!(value["greeting"]["uid"], "42");
+        assert_eq!(value["greeting"]["encrypt_geek_id"], "encrypted-geek");
+        assert_eq!(value["greeting"]["security_id"], "security");
+        assert_eq!(value["greeting"]["encrypt_job_id"], "encrypted-job");
     }
 
     struct MockProvider {
