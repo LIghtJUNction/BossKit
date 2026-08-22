@@ -1,6 +1,6 @@
 [package]
 name = "bosskit"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "MIT"
 description = "BOSS 直聘 job search, chat, and recruiting CLI with local MCP tools"
