@@ -1,14 +1,14 @@
 //! Shared command and MCP tool capability registry.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-use crate::BossError;
 use crate::campaign::{
     DEFAULT_MINIMUM_RESUME_SCORE, MAX_CAMPAIGN_NAME_CHARS, MAX_PLANS_PER_BUILD,
     MAX_RULE_VALUE_CHARS, MAX_STATE_NOTE_CHARS, MAX_TEMPLATE_CHARS,
 };
+use crate::BossError;
 
 /// Supported capability schema wrapper.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -724,19 +724,17 @@ mod tests {
     fn recruiter_commands_are_native_only_and_reply_is_risk_marked() {
         let native = render(SchemaFormat::Native).expect("native");
         let commands = native["commands"].as_array().expect("commands");
-        assert!(
-            [
-                "recruiter candidates",
-                "recruiter replies",
-                "recruiter inbox",
-                "recruiter resume",
-                "recruiter resumes",
-            ]
-            .into_iter()
-            .all(|name| commands
-                .iter()
-                .any(|command| { command["name"] == name && command["remote_write"] == false }))
-        );
+        assert!([
+            "recruiter candidates",
+            "recruiter replies",
+            "recruiter inbox",
+            "recruiter resume",
+            "recruiter resumes",
+        ]
+        .into_iter()
+        .all(|name| commands
+            .iter()
+            .any(|command| { command["name"] == name && command["remote_write"] == false })));
         let reply = commands
             .iter()
             .find(|command| command["name"] == "recruiter reply")
@@ -747,11 +745,9 @@ mod tests {
             .find(|command| command["name"] == "recruiter greet")
             .expect("recruiter greet");
         assert!(greet["remote_write"] == true && greet["local_write"] == true);
-        assert!(
-            tool_registry()
-                .iter()
-                .all(|tool| !tool.name.starts_with("recruiter_"))
-        );
+        assert!(tool_registry()
+            .iter()
+            .all(|tool| !tool.name.starts_with("recruiter_")));
     }
 
     #[test]
