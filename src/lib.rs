@@ -1,6 +1,5 @@
-//! Shared services for the `boss` read-only job search CLI and MCP server.
+//! Shared services for the BOSS 直聘-focused `boss` CLI and MCP server.
 
-pub mod ai;
 pub mod auth;
 pub mod cache;
 pub mod campaign;
@@ -12,10 +11,8 @@ pub mod export;
 pub mod history;
 pub mod mcp;
 pub mod model;
-pub mod notify;
 pub mod preset;
 pub mod provider;
-pub mod reply;
 pub mod resume;
 pub mod schema;
 pub mod service;
@@ -25,7 +22,6 @@ pub(crate) mod zhipin_browser;
 pub(crate) mod zhipin_direct;
 pub(crate) mod zhipin_http;
 
-pub use ai::{AiProfile, AiProfileStore, AiScore};
 pub use cache::JobCache;
 pub use campaign::{
     ApplicationPlan, BlacklistKind, BlacklistRule, CampaignField, CampaignPolicy, CampaignRule,
@@ -36,12 +32,7 @@ pub use config::{AppConfig, ConfigEntry, ConfigStore};
 pub use data::DataPaths;
 pub use error::BossError;
 pub use model::{
-    Envelope, Job, Platform, PlatformInfo, SearchFilters, SearchReport, SearchSpec, SearchSpecPatch,
+    Envelope, Job, Platform, SearchFilters, SearchReport, SearchSpec, SearchSpecPatch,
 };
-pub use notify::{
-    NotificationAudit, NotificationPayload, NotificationStatus, NotificationStore,
-    NotificationSummary,
-};
-pub use reply::{ReplyMatch, ReplyRule, ReplyStore};
 pub use service::BossService;
 pub use shortlist::{ShortlistEntry, ShortlistStore};

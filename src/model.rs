@@ -214,19 +214,6 @@ impl SearchFilters {
     }
 }
 
-/// Platform registration and capability information.
-#[derive(Debug, Serialize)]
-pub struct PlatformInfo {
-    /// Stable platform name.
-    pub platform: &'static str,
-    /// Human-readable name.
-    pub display_name: &'static str,
-    /// Whether read-only search is implemented.
-    pub search: &'static str,
-    /// Supported operations.
-    pub capabilities: [&'static str; 2],
-}
-
 /// Safe provider failure details.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderFailure {

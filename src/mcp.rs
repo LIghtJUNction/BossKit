@@ -9,7 +9,6 @@ use crate::campaign::{
     MAX_PLANS_PER_BUILD,
 };
 use crate::export::{ExportFormat, ExportOptions, ExportSource};
-use crate::notify::normalize_event;
 use crate::schema::{SchemaFormat, tool_registry};
 use crate::{BossError, BossService, SearchSpecPatch};
 
@@ -619,155 +618,6 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 .map_err(ToolCallError::Execution)?;
             Ok((success_value(document), false))
         }
-        "ai_profile_add" => {
-            validate_allowed(&arguments, &["name", "base_url", "model"])?;
-            Ok((
-                success_value(
-                    service
-                        .ai_profile_add(
-                            required_string(&arguments, "name")?,
-                            required_string(&arguments, "base_url")?,
-                            required_string(&arguments, "model")?,
-                        )
-                        .map_err(ToolCallError::Execution)?,
-                ),
-                false,
-            ))
-        }
-        "ai_profile_list" => {
-            validate_allowed(&arguments, &[])?;
-            Ok((
-                success_value(
-                    service
-                        .ai_profile_list()
-                        .map_err(ToolCallError::Execution)?,
-                ),
-                false,
-            ))
-        }
-        "ai_profile_show" => {
-            validate_allowed(&arguments, &["name"])?;
-            Ok((
-                success_value(
-                    service
-                        .ai_profile_show(required_string(&arguments, "name")?)
-                        .map_err(ToolCallError::Execution)?,
-                ),
-                false,
-            ))
-        }
-        "ai_profile_remove" => {
-            validate_allowed(&arguments, &["name"])?;
-            Ok((
-                success_value(
-                    service
-                        .ai_profile_remove(required_string(&arguments, "name")?)
-                        .map_err(ToolCallError::Execution)?,
-                ),
-                false,
-            ))
-        }
-        "ai_draft" => {
-            validate_allowed(&arguments, &["profile", "job_id", "resume_name", "confirm"])?;
-            if !optional_bool(&arguments, "confirm", false)? {
-                return Err(ToolCallError::InvalidArguments(
-                    "ai_draft requires confirm=true".to_owned(),
-                ));
-            }
-            Ok((
-                success_value(json!({
-                    "mode":"confirmed_ai_draft",
-                    "text":service.ai_draft(
-                        required_string(&arguments, "profile")?,
-                        required_string(&arguments, "job_id")?,
-                        required_string(&arguments, "resume_name")?,
-                        true,
-                    ).await.map_err(ToolCallError::Execution)?
-                })),
-                false,
-            ))
-        }
-        "ai_score" => {
-            validate_allowed(&arguments, &["profile", "job_id", "resume_name", "confirm"])?;
-            if !optional_bool(&arguments, "confirm", false)? {
-                return Err(ToolCallError::InvalidArguments(
-                    "ai_score requires confirm=true".to_owned(),
-                ));
-            }
-            Ok((
-                success_value(json!({
-                    "mode":"confirmed_ai_score",
-                    "score":service.ai_score(
-                        required_string(&arguments, "profile")?,
-                        required_string(&arguments, "job_id")?,
-                        required_string(&arguments, "resume_name")?,
-                        true,
-                    ).await.map_err(ToolCallError::Execution)?
-                })),
-                false,
-            ))
-        }
-        "notify_preview" => {
-            validate_allowed(&arguments, &["event"])?;
-            let event = notification_event(&arguments)?;
-            Ok((
-                success_value(json!({
-                    "mode":"local_notification_preview",
-                    "sent":false,
-                    "payload":service.notification_preview(&event).map_err(ToolCallError::Execution)?
-                })),
-                false,
-            ))
-        }
-        "notify_send" => {
-            validate_allowed(&arguments, &["event", "confirm"])?;
-            if !optional_bool(&arguments, "confirm", false)? {
-                return Err(ToolCallError::InvalidArguments(
-                    "notify_send requires confirm=true".to_owned(),
-                ));
-            }
-            let event = notification_event(&arguments)?;
-            Ok((
-                success_value(
-                    service
-                        .notification_send(&event, true)
-                        .await
-                        .map_err(ToolCallError::Execution)?,
-                ),
-                false,
-            ))
-        }
-        "keyword_reply_add" => {
-            validate_allowed(&arguments, &["keyword", "reply"])?;
-            let rule = service
-                .reply_add(
-                    required_string(&arguments, "keyword")?,
-                    required_string(&arguments, "reply")?,
-                )
-                .map_err(ToolCallError::Execution)?;
-            Ok((success_value(rule), false))
-        }
-        "keyword_reply_list" => {
-            validate_allowed(&arguments, &[])?;
-            Ok((
-                success_value(service.reply_list().map_err(ToolCallError::Execution)?),
-                false,
-            ))
-        }
-        "keyword_reply_remove" => {
-            validate_allowed(&arguments, &["keyword"])?;
-            let rule = service
-                .reply_remove(required_string(&arguments, "keyword")?)
-                .map_err(ToolCallError::Execution)?;
-            Ok((success_value(rule), false))
-        }
-        "keyword_reply_match" => {
-            validate_allowed(&arguments, &["message"])?;
-            let suggestion = service
-                .reply_match(required_string(&arguments, "message")?)
-                .map_err(ToolCallError::Execution)?;
-            Ok((success_value(suggestion), false))
-        }
         "campaign_policy_add" => {
             validate_allowed(&arguments, CAMPAIGN_POLICY_FIELDS)?;
             let policy: CampaignPolicy =
@@ -1031,14 +881,12 @@ async fn call_tool(service: &BossService, params: &Value) -> Result<(Value, bool
                 "history",
                 "shortlist",
                 "presets",
-                "reply_rules",
                 "watches",
                 "resumes",
                 "campaign_policies",
                 "campaign_blacklist",
                 "greeting_templates",
                 "application_plans",
-                "ai_profiles",
                 "all",
             ]
             .contains(&target)
@@ -1127,11 +975,6 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, ToolCal
             "{field} must be a string"
         ))),
     }
-}
-
-fn notification_event(value: &Value) -> Result<String, ToolCallError> {
-    let event = required_string(value, "event")?;
-    normalize_event(event).map_err(|error| ToolCallError::InvalidArguments(error.to_string()))
 }
 
 fn required_string_allow_empty<'a>(
@@ -1331,53 +1174,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ai_tools_require_confirmation_reject_unknown_arguments_and_match_registry() {
-        let directory = tempdir().expect("tempdir");
-        let service =
-            BossService::from_paths(crate::DataPaths::new(directory.path())).expect("service");
-        let listed = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
-        )
-        .await
-        .expect("list");
-        for name in [
-            "ai_profile_add",
-            "ai_profile_list",
-            "ai_profile_show",
-            "ai_profile_remove",
-            "ai_draft",
-            "ai_score",
-        ] {
-            assert!(
-                listed["result"]["tools"]
-                    .as_array()
-                    .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
-            );
-        }
-        let draft = listed["result"]["tools"]
-            .as_array()
-            .and_then(|tools| tools.iter().find(|tool| tool["name"] == "ai_draft"))
-            .expect("draft tool");
-        assert_eq!(draft["inputSchema"]["properties"]["confirm"]["const"], true);
-
-        for arguments in [
-            json!({"profile":"local","job_id":"cached","resume_name":"base","confirm":false}),
-            json!({"profile":"local","job_id":"cached","resume_name":"base","confirm":true,"unexpected":true}),
-        ] {
-            let response = handle_input(
-                &service,
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"ai_draft","arguments":arguments
-                }}),
-            )
-            .await
-            .expect("response");
-            assert_eq!(response["error"]["code"], -32602, "{response}");
-        }
-    }
-
     #[test]
     fn search_workflow_schema_properties_match_runtime_allowlists() {
         let registry = tool_registry();
@@ -1456,101 +1252,6 @@ mod tests {
             assert_eq!(response["result"]["isError"], false, "{response}");
         }
         assert!(directory.path().join("presets.json").exists());
-    }
-
-    #[tokio::test]
-    async fn keyword_reply_tools_are_strict_and_return_local_suggestions() {
-        let registry = tool_registry();
-        for (name, fields) in [
-            ("keyword_reply_add", &["keyword", "reply"][..]),
-            ("keyword_reply_list", &[][..]),
-            ("keyword_reply_remove", &["keyword"][..]),
-            ("keyword_reply_match", &["message"][..]),
-        ] {
-            let tool = registry
-                .iter()
-                .find(|tool| tool.name == name)
-                .expect("registered tool");
-            let properties: BTreeSet<&str> = tool.input_schema["properties"]
-                .as_object()
-                .expect("properties")
-                .keys()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(properties, fields.iter().copied().collect(), "{name}");
-            assert_eq!(tool.input_schema["additionalProperties"], false, "{name}");
-        }
-
-        let directory = tempdir().expect("tempdir");
-        let service =
-            BossService::from_paths(crate::DataPaths::new(directory.path())).expect("service");
-        let add = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                "name":"keyword_reply_add","arguments":{"keyword":"Offer","reply":"Thanks"}
-            }}),
-        )
-        .await
-        .expect("add response");
-        assert_eq!(add["result"]["isError"], false);
-
-        let matched = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                "name":"keyword_reply_match","arguments":{"message":"NEW OFFER"}
-            }}),
-        )
-        .await
-        .expect("match response");
-        let suggestion: Value = serde_json::from_str(
-            matched["result"]["content"][0]["text"]
-                .as_str()
-                .expect("suggestion text"),
-        )
-        .expect("suggestion json");
-        assert_eq!(
-            (
-                suggestion["data"]["matched"].as_bool(),
-                suggestion["data"]["rule"]["reply"].as_str()
-            ),
-            (Some(true), Some("Thanks"))
-        );
-
-        let listed = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                "name":"keyword_reply_list","arguments":{}
-            }}),
-        )
-        .await
-        .expect("list response");
-        let rules: Value = serde_json::from_str(
-            listed["result"]["content"][0]["text"]
-                .as_str()
-                .expect("list text"),
-        )
-        .expect("list json");
-        assert_eq!(rules["data"].as_array().map(Vec::len), Some(1));
-
-        let removed = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
-                "name":"keyword_reply_remove","arguments":{"keyword":"offer"}
-            }}),
-        )
-        .await
-        .expect("remove response");
-        assert_eq!(removed["result"]["isError"], false);
-
-        let rejected = handle_input(
-            &service,
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
-                "name":"keyword_reply_add","arguments":{"keyword":"Offer","reply":"Thanks","extra":true}
-            }}),
-        )
-        .await
-        .expect("invalid response");
-        assert_eq!(rejected["error"]["code"], -32602);
     }
 
     #[tokio::test]

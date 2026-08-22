@@ -100,12 +100,13 @@ boss config set page_size 30
 boss config reset page_size
 ```
 
-支持的安全配置键为 `request_timeout_secs`、`page_size`、`operating_mode` 和 `log_level`。旧版 `platform` 配置会被安全忽略。
+支持的安全配置键只有 `request_timeout_secs` 和 `page_size`。旧版 `platform`、`operating_mode` 与 `log_level` 配置会被安全忽略，并在下次写入配置时移除。
 
 ## 能力边界
 
 - 仅支持 BOSS 直聘；不宣称多平台支持。
 - 本地简历筛选是确定性的，输出用于人工复核，而非平台自动投递。
+- 不内置通用模型调用、任意 Webhook 通知或本地关键词回复规则；这些能力与 BOSS 直聘核心工作流无关。
 - 登录验证在纯命令行 HTTPS 与本机挑战计算中完成；不会启动或依赖浏览器。
 - BossKit 是免费的开源软件，采用 [MIT License](LICENSE)。
 

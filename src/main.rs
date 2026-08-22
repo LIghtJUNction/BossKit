@@ -77,11 +77,6 @@ enum Command {
         #[command(subcommand)]
         command: PresetCommand,
     },
-    /// 管理只在本地建议文本的关键词回复
-    Reply {
-        #[command(subcommand)]
-        command: ReplyCommand,
-    },
     /// 管理仅基于本地缓存的人工复核求职计划
     Campaign {
         #[command(subcommand)]
@@ -101,16 +96,6 @@ enum Command {
     Account {
         #[command(subcommand)]
         command: AccountCommand,
-    },
-    /// 管理无凭据的本地 AI 配置与明确确认的模型调用
-    Ai {
-        #[command(subcommand)]
-        command: AiCommand,
-    },
-    /// 预览或明确发送最小化通知 Webhook 摘要
-    Notify {
-        #[command(subcommand)]
-        command: NotifyCommand,
     },
     /// 汇总严格本地工作流统计
     Stats {
@@ -167,11 +152,11 @@ enum Command {
         /// 从标准输入读取一个 Cookie；不接受命令行参数中的凭据
         #[arg(short = 'c', long)]
         cookie_stdin: bool,
-        /// BOSS account surface to verify and save
+        /// 要验证并保存的 BOSS 账户角色
         #[arg(long, value_enum, default_value = "geek")]
         role: RoleArg,
     },
-    /// Recruiter review, full online-resume read, and explicit one-at-a-time replies; CLI-only
+    /// 招聘者候选人复核、在线简历读取及逐人明确回复；仅限 CLI
     Recruiter {
         #[command(subcommand)]
         command: RecruiterCommand,
@@ -251,95 +236,95 @@ enum ChatCommand {
 
 #[derive(Subcommand)]
 enum RecruiterCommand {
-    /// Search one bounded first page of masked candidates; read-only and no gender filter
+    /// 只读搜索一页受限的脱敏候选人；不按性别筛选
     Candidates {
-        /// Search keywords, for example `视频剪辑`
+        /// 搜索关键词，例如 `视频剪辑`
         keywords: String,
-        /// Encrypted recruiting job identifier from the recruiter job surface
+        /// 招聘者职位列表中的加密职位 ID
         #[arg(long)]
         job_id: String,
-        /// Optional BOSS city code, for example `101230100`
+        /// 可选 BOSS 城市代码，例如 `101230100`
         #[arg(long)]
         city: Option<String>,
-        /// Maximum candidates returned after local screening (1..=5)
+        /// 本地筛选后最多返回的候选人数（1..=5）
         #[arg(long, default_value_t = 5, value_parser = parse_candidate_limit)]
         limit: usize,
-        /// Read one selected candidate's structured resume summary; no contacts
+        /// 读取选中候选人的结构化简历摘要；不含联系方式
         #[arg(long)]
         detail: bool,
     },
-    /// List bounded redacted candidate reply states from the recruiter friend list
+    /// 从招聘者好友列表读取受限、脱敏的候选人回复状态
     Replies {
         #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
         limit: usize,
         #[arg(long, default_value_t = 1, value_parser = parse_recruiter_page)]
         page: usize,
     },
-    /// Read exact recruiter conversations and the latest safe text
+    /// 读取招聘者精确会话及最新安全文本
     Inbox {
         #[arg(long, default_value_t = 20, value_parser = parse_recruiter_limit)]
         limit: usize,
         #[arg(long, value_parser = parse_recruiter_page, conflicts_with = "all")]
         page: Option<usize>,
-        /// Scan up to three recruiter pages, bounded by --limit
+        /// 最多扫描三页，并受 --limit 限制
         #[arg(long, conflicts_with = "page")]
         all: bool,
-        /// Keep only conversations whose latest message is from the candidate
+        /// 只保留最新消息来自候选人的会话
         #[arg(long)]
         pending: bool,
-        /// Keep jobs whose title contains this text
+        /// 只保留职位名称包含此文本的会话
         #[arg(long, value_name = "TEXT")]
         job: Option<String>,
-        /// Return only name, UID, and the latest safe message for quick candidate review
+        /// 只返回姓名、UID 和最新安全消息，便于快速复核
         #[arg(long)]
         brief: bool,
     },
-    /// Read one exact candidate's full recruiter-side online resume
+    /// 读取一位精确候选人的招聘者侧完整在线简历
     Resume {
-        /// Numeric candidate uid from `boss recruiter inbox`
+        /// 来自 `boss recruiter inbox` 的候选人数字 UID
         uid: String,
     },
-    /// Read several exact candidate resumes serially; no messages or writes
+    /// 串行读取多位精确候选人的简历；不发送消息且不写远程数据
     Resumes {
-        /// Numeric candidate UIDs from `boss recruiter inbox` (maximum 10)
+        /// 来自 `boss recruiter inbox` 的候选人数字 UID（最多 10 个）
         #[arg(required = true, num_args = 1..=10, value_name = "UID")]
         uids: Vec<String>,
-        /// Return only uid, name, expected positions, summary, and projects
+        /// 只返回 UID、姓名、期望职位、摘要和项目
         #[arg(long)]
         brief: bool,
     },
-    /// Send one explicitly confirmed recruiter follow-up to an exact candidate
+    /// 向一位精确候选人发送明确确认的招聘者跟进消息
     Reply {
-        /// Numeric candidate uid from `boss recruiter inbox`
+        /// 来自 `boss recruiter inbox` 的候选人数字 UID
         uid: String,
-        /// One printable single-line follow-up, at most 200 characters
+        /// 一行可打印跟进消息，最多 200 个字符
         #[arg(long)]
         message: String,
-        /// Confirm this external write
+        /// 确认这次外部写入
         #[arg(long)]
         yes: bool,
     },
-    /// Send one explicitly confirmed recruiter initial greeting to an exact candidate
+    /// 向一位精确候选人发送明确确认的首次招呼
     Greet {
-        /// Encrypted candidate identifier from the same native search card
+        /// 同一推荐卡片中的加密候选人 ID
         #[arg(long)]
         encrypt_geek_id: String,
-        /// Candidate security identifier returned by the native search card
+        /// 原生搜索卡片返回的候选人安全 ID
         #[arg(long)]
         security_id: String,
-        /// Encrypted job identifier associated with the candidate selection
+        /// 与候选人选择关联的加密职位 ID
         #[arg(long)]
         encrypt_job_id: String,
-        /// Candidate expectation identifier from the same recommendation card
+        /// 同一推荐卡片中的候选人期望 ID
         #[arg(long)]
         expect_id: String,
-        /// Recommendation card lid; pass the exact value, including an empty value when supplied by BOSS
+        /// 推荐卡片的 lid；必须原样传递，包括 BOSS 返回的空值
         #[arg(long)]
         lid: String,
-        /// One printable single-line greeting, at most 200 characters
+        /// 一行可打印招呼消息，最多 200 个字符
         #[arg(long)]
         message: String,
-        /// Confirm this external write
+        /// 确认这次外部写入
         #[arg(long)]
         yes: bool,
     },
@@ -363,33 +348,33 @@ impl From<RoleArg> for ZhipinRole {
 fn parse_recruiter_limit(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
-        .map_err(|_| "limit must be an integer".to_owned())?;
+        .map_err(|_| "limit 必须是整数".to_owned())?;
     if (1..=20).contains(&parsed) {
         Ok(parsed)
     } else {
-        Err("limit must be between 1 and 20".to_owned())
+        Err("limit 必须在 1 到 20 之间".to_owned())
     }
 }
 
 fn parse_recruiter_page(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
-        .map_err(|_| "page must be an integer".to_owned())?;
+        .map_err(|_| "page 必须是整数".to_owned())?;
     if (1..=50).contains(&parsed) {
         Ok(parsed)
     } else {
-        Err("page must be between 1 and 50".to_owned())
+        Err("page 必须在 1 到 50 之间".to_owned())
     }
 }
 
 fn parse_candidate_limit(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
-        .map_err(|_| "limit must be an integer".to_owned())?;
+        .map_err(|_| "limit 必须是整数".to_owned())?;
     if (1..=5).contains(&parsed) {
         Ok(parsed)
     } else {
-        Err("candidate limit must be between 1 and 5".to_owned())
+        Err("limit 必须在 1 到 5 之间".to_owned())
     }
 }
 
@@ -463,20 +448,6 @@ enum PresetCommand {
     /// 删除预设
     #[command(visible_alias = "remove")]
     Rm { name: String },
-}
-
-#[derive(Subcommand)]
-enum ReplyCommand {
-    /// 添加或更新本地关键词回复
-    Add { keyword: String, reply: String },
-    /// 列出本地关键词回复
-    #[command(visible_alias = "list")]
-    Ls,
-    /// 移除本地关键词回复
-    #[command(visible_alias = "remove")]
-    Rm { keyword: String },
-    /// 按本地消息文本返回建议，不发送平台消息
-    Match { message: String },
 }
 
 #[derive(Subcommand)]
@@ -720,61 +691,6 @@ enum ResumeCommand {
 }
 
 #[derive(Subcommand)]
-enum AiCommand {
-    /// 添加或更新无凭据的 HTTPS OpenAI 兼容配置
-    Profile {
-        #[command(subcommand)]
-        command: AiProfileCommand,
-    },
-    /// 使用一个缓存职位和一份本地类型化简历生成 AI 文稿
-    Draft {
-        profile: String,
-        job_id: String,
-        resume_name: String,
-        #[arg(long)]
-        yes: bool,
-    },
-    /// 根据一份本地类型化简历评估一个缓存职位
-    Score {
-        profile: String,
-        job_id: String,
-        resume_name: String,
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum AiProfileCommand {
-    /// 仅添加或更新配置元数据；不接受或存储密钥
-    Add {
-        name: String,
-        base_url: String,
-        model: String,
-    },
-    /// 列出本地配置
-    #[command(visible_alias = "list")]
-    Ls,
-    /// 查看一个本地配置
-    Show { name: String },
-    /// 移除一个本地配置
-    #[command(visible_alias = "remove")]
-    Rm { name: String },
-}
-
-#[derive(Subcommand)]
-enum NotifyCommand {
-    /// 仅渲染受限的本地载荷；不会读取 Webhook 或访问网络
-    Preview { event: String },
-    /// 明确确认后，将受限载荷发送到仅运行时提供的 Webhook
-    Send {
-        event: String,
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand)]
 enum ConfigCommand {
     /// 列出所有安全配置
     #[command(visible_alias = "list")]
@@ -846,8 +762,6 @@ enum CleanTargetArg {
     History,
     Shortlist,
     Presets,
-    #[value(name = "reply_rules", alias = "reply-rules")]
-    ReplyRules,
     Watches,
     Resumes,
     #[value(name = "campaign_policies", alias = "campaign-policies")]
@@ -858,10 +772,6 @@ enum CleanTargetArg {
     GreetingTemplates,
     #[value(name = "application_plans", alias = "application-plans")]
     ApplicationPlans,
-    #[value(name = "ai_profiles", alias = "ai-profiles")]
-    AiProfiles,
-    #[value(name = "notification_audit", alias = "notification-audit")]
-    NotificationAudit,
     All,
 }
 
@@ -872,15 +782,12 @@ impl CleanTargetArg {
             Self::History => "history",
             Self::Shortlist => "shortlist",
             Self::Presets => "presets",
-            Self::ReplyRules => "reply_rules",
             Self::Watches => "watches",
             Self::Resumes => "resumes",
             Self::CampaignPolicies => "campaign_policies",
             Self::CampaignBlacklist => "campaign_blacklist",
             Self::GreetingTemplates => "greeting_templates",
             Self::ApplicationPlans => "application_plans",
-            Self::AiProfiles => "ai_profiles",
-            Self::NotificationAudit => "notification_audit",
             Self::All => "all",
         }
     }
@@ -1080,18 +987,6 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
             }
             PresetCommand::Rm { name } => {
                 print_json(&Envelope::success(service.preset_remove(&name)?));
-            }
-        },
-        Command::Reply { command } => match command {
-            ReplyCommand::Add { keyword, reply } => {
-                print_json(&Envelope::success(service.reply_add(&keyword, &reply)?));
-            }
-            ReplyCommand::Ls => print_json(&Envelope::success(service.reply_list()?)),
-            ReplyCommand::Rm { keyword } => {
-                print_json(&Envelope::success(service.reply_remove(&keyword)?));
-            }
-            ReplyCommand::Match { message } => {
-                print_json(&Envelope::success(service.reply_match(&message)?));
             }
         },
         Command::Campaign { command } => match command {
@@ -1306,58 +1201,6 @@ async fn run(cli: Cli) -> Result<ExitCode, BossError> {
                     print_json(&Envelope::success(service.account_resume_show()?));
                 }
             },
-        },
-        Command::Ai { command } => match command {
-            AiCommand::Profile { command } => match command {
-                AiProfileCommand::Add {
-                    name,
-                    base_url,
-                    model,
-                } => print_json(&Envelope::success(
-                    service.ai_profile_add(&name, &base_url, &model)?,
-                )),
-                AiProfileCommand::Ls => {
-                    print_json(&Envelope::success(service.ai_profile_list()?));
-                }
-                AiProfileCommand::Show { name } => {
-                    print_json(&Envelope::success(service.ai_profile_show(&name)?));
-                }
-                AiProfileCommand::Rm { name } => {
-                    print_json(&Envelope::success(service.ai_profile_remove(&name)?));
-                }
-            },
-            AiCommand::Draft {
-                profile,
-                job_id,
-                resume_name,
-                yes,
-            } => print_json(&Envelope::success(json!({
-                "mode":"confirmed_ai_draft",
-                "text":service.ai_draft(&profile, &job_id, &resume_name, yes).await?
-            }))),
-            AiCommand::Score {
-                profile,
-                job_id,
-                resume_name,
-                yes,
-            } => print_json(&Envelope::success(json!({
-                "mode":"confirmed_ai_score",
-                "score":service.ai_score(&profile, &job_id, &resume_name, yes).await?
-            }))),
-        },
-        Command::Notify { command } => match command {
-            NotifyCommand::Preview { event } => {
-                print_json(&Envelope::success(json!({
-                    "mode":"local_notification_preview",
-                    "sent":false,
-                    "payload":service.notification_preview(&event)?
-                })));
-            }
-            NotifyCommand::Send { event, yes } => {
-                print_json(&Envelope::success(
-                    service.notification_send(&event, yes).await?,
-                ));
-            }
         },
         Command::Stats { days } => {
             print_json(&Envelope::success(service.stats(u64::from(days.get()))?));

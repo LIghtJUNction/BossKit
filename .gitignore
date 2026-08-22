@@ -1,6 +1,7 @@
 /target
 /.boss
 /.codegraph/
+/.memsearch/
 /SWAP.md
 # Personal recruiting skill; keep company-specific hiring material local.
 /.agents/skills/ai-application-engineer-recruiting/

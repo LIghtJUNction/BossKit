@@ -9,30 +9,6 @@ use serde_json::{Value, json};
 use crate::data::atomic_write;
 use crate::{BossError, DataPaths};
 
-/// Supported log verbosity.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LogLevel {
-    /// Errors only.
-    #[default]
-    Error,
-    /// Errors and warnings.
-    Warn,
-    /// Informational messages.
-    Info,
-    /// Debug diagnostics.
-    Debug,
-}
-
-/// Supported operating mode.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatingMode {
-    /// Human-assisted read-only operation.
-    #[default]
-    Assisted,
-}
-
 /// Fully merged effective configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppConfig {
@@ -40,10 +16,6 @@ pub struct AppConfig {
     pub request_timeout_secs: u64,
     /// Default result count.
     pub page_size: usize,
-    /// Restrained execution mode.
-    pub operating_mode: OperatingMode,
-    /// Diagnostic verbosity.
-    pub log_level: LogLevel,
 }
 
 impl Default for AppConfig {
@@ -51,8 +23,6 @@ impl Default for AppConfig {
         Self {
             request_timeout_secs: 15,
             page_size: 20,
-            operating_mode: OperatingMode::Assisted,
-            log_level: LogLevel::Error,
         }
     }
 }
@@ -63,17 +33,29 @@ struct UserOverrides {
     #[serde(
         default,
         rename = "platform",
-        deserialize_with = "discard_legacy_platform",
+        deserialize_with = "discard_legacy_value",
         skip_serializing
     )]
     _legacy_platform: bool,
+    #[serde(
+        default,
+        rename = "operating_mode",
+        deserialize_with = "discard_legacy_value",
+        skip_serializing
+    )]
+    _legacy_operating_mode: bool,
+    #[serde(
+        default,
+        rename = "log_level",
+        deserialize_with = "discard_legacy_value",
+        skip_serializing
+    )]
+    _legacy_log_level: bool,
     request_timeout_secs: Option<u64>,
     page_size: Option<usize>,
-    operating_mode: Option<OperatingMode>,
-    log_level: Option<LogLevel>,
 }
 
-fn discard_legacy_platform<'de, D>(deserializer: D) -> Result<bool, D::Error>
+fn discard_legacy_value<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -140,25 +122,15 @@ impl ConfigStore {
                 .request_timeout_secs
                 .unwrap_or(defaults.request_timeout_secs),
             page_size: self.overrides.page_size.unwrap_or(defaults.page_size),
-            operating_mode: self
-                .overrides
-                .operating_mode
-                .unwrap_or(defaults.operating_mode),
-            log_level: self.overrides.log_level.unwrap_or(defaults.log_level),
         }
     }
 
     /// Lists every safe public key.
     pub fn list(&self) -> Result<Vec<ConfigEntry>, BossError> {
-        [
-            "request_timeout_secs",
-            "page_size",
-            "operating_mode",
-            "log_level",
-        ]
-        .into_iter()
-        .map(|key| self.entry(key))
-        .collect()
+        ["request_timeout_secs", "page_size"]
+            .into_iter()
+            .map(|key| self.entry(key))
+            .collect()
     }
 
     /// Reads one safe public key.
@@ -175,12 +147,6 @@ impl ConfigStore {
             }
             "page_size" => {
                 self.overrides.page_size = Some(parse_positive(raw, key)?);
-            }
-            "operating_mode" => {
-                self.overrides.operating_mode = Some(parse_json_enum(raw, key)?);
-            }
-            "log_level" => {
-                self.overrides.log_level = Some(parse_json_enum(raw, key)?);
             }
             _ => return Err(unknown_key(key)),
         }
@@ -199,8 +165,6 @@ impl ConfigStore {
             match key {
                 "request_timeout_secs" => self.overrides.request_timeout_secs = None,
                 "page_size" => self.overrides.page_size = None,
-                "operating_mode" => self.overrides.operating_mode = None,
-                "log_level" => self.overrides.log_level = None,
                 _ => return Err(unknown_key(key)),
             }
             self.persist()?;
@@ -231,19 +195,12 @@ impl ConfigStore {
                 self.overrides.request_timeout_secs.is_some(),
             ),
             "page_size" => (json!(config.page_size), self.overrides.page_size.is_some()),
-            "operating_mode" => (
-                json!(config.operating_mode),
-                self.overrides.operating_mode.is_some(),
-            ),
-            "log_level" => (json!(config.log_level), self.overrides.log_level.is_some()),
             _ => return Err(unknown_key(key)),
         };
         Ok(ConfigEntry {
             key: match key {
                 "request_timeout_secs" => "request_timeout_secs",
                 "page_size" => "page_size",
-                "operating_mode" => "operating_mode",
-                "log_level" => "log_level",
                 _ => return Err(unknown_key(key)),
             },
             value,
@@ -288,11 +245,6 @@ where
         .ok_or_else(|| BossError::InvalidArgument(format!("{key} must be a positive integer")))
 }
 
-fn parse_json_enum<T: for<'de> Deserialize<'de>>(raw: &str, key: &str) -> Result<T, BossError> {
-    serde_json::from_value(Value::String(raw.to_owned()))
-        .map_err(|_| BossError::InvalidArgument(format!("invalid {key}: {raw}")))
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -324,9 +276,9 @@ mod tests {
     #[test]
     fn reset_restores_default() {
         let (_directory, mut store) = store();
-        store.set("log_level", "debug").expect("set");
-        let change = store.reset(Some("log_level")).expect("reset");
-        assert_eq!(change.new, json!("error"));
+        store.set("page_size", "7").expect("set");
+        let change = store.reset(Some("page_size")).expect("reset");
+        assert_eq!(change.new, json!(20));
     }
 
     #[test]
@@ -336,8 +288,24 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operating_mode_is_rejected() {
-        let (_directory, mut store) = store();
-        assert!(store.set("operating_mode", "research").is_err());
+    fn removed_settings_are_ignored_in_legacy_files_and_rejected() {
+        let directory = tempdir().expect("tempdir");
+        let paths = DataPaths::new(directory.path());
+        fs::write(
+            paths.config(),
+            br#"{"platform":"zhipin","operating_mode":"assisted","log_level":"debug","page_size":9}"#,
+        )
+        .expect("legacy config");
+        let mut store = ConfigStore::from_paths(&paths).expect("config store");
+        assert_eq!(store.effective().page_size, 9);
+        assert_eq!(store.list().expect("list").len(), 2);
+        assert!(store.get("operating_mode").is_err());
+        assert!(store.set("log_level", "debug").is_err());
+
+        store.set("page_size", "10").expect("persist supported key");
+        let serialized = fs::read_to_string(paths.config()).expect("serialized config");
+        assert!(!serialized.contains("platform"));
+        assert!(!serialized.contains("operating_mode"));
+        assert!(!serialized.contains("log_level"));
     }
 }

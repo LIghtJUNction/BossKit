@@ -5,13 +5,10 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 use crate::BossError;
-use crate::ai::MAX_AI_BASE_URL_CHARS;
 use crate::campaign::{
     DEFAULT_MINIMUM_RESUME_SCORE, MAX_CAMPAIGN_NAME_CHARS, MAX_PLANS_PER_BUILD,
     MAX_RULE_VALUE_CHARS, MAX_STATE_NOTE_CHARS, MAX_TEMPLATE_CHARS,
 };
-use crate::notify::MAX_NOTIFICATION_EVENT_CHARS;
-use crate::reply::{MAX_KEYWORD_CHARS, MAX_MESSAGE_CHARS, MAX_REPLY_CHARS};
 
 /// Supported capability schema wrapper.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -241,77 +238,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             },"additionalProperties":false}),
         ),
         tool(
-            "ai_profile_add",
-            "Add or update credential-free local HTTPS OpenAI-compatible model metadata",
-            json!({"type":"object","required":["name","base_url","model"],"properties":{
-                "name":{"type":"string","minLength":1,"maxLength":64},
-                "base_url":{"type":"string","minLength":9,"maxLength":MAX_AI_BASE_URL_CHARS},
-                "model":{"type":"string","minLength":1,"maxLength":256}
-            },"additionalProperties":false}),
-        ),
-        tool(
-            "ai_profile_list",
-            "List credential-free local AI model profiles",
-            empty(),
-        ),
-        tool(
-            "ai_profile_show",
-            "Show one credential-free local AI model profile",
-            name_schema(false),
-        ),
-        tool(
-            "ai_profile_remove",
-            "Remove one credential-free local AI model profile",
-            name_schema(false),
-        ),
-        tool(
-            "ai_draft",
-            "Confirmed remote model call: generate text from one cached job and one typed local resume; never contacts a job platform",
-            ai_operation_schema(),
-        ),
-        tool(
-            "ai_score",
-            "Confirmed remote model call: return strict fit score JSON for one cached job and one typed local resume; never contacts a job platform",
-            ai_operation_schema(),
-        ),
-        tool(
-            "notify_preview",
-            "Render a bounded local notification summary; it never reads a webhook or uses network",
-            notification_event_schema(false),
-        ),
-        tool(
-            "notify_send",
-            "Confirmed remote webhook notification with aggregate counts only; endpoint and response body are never stored",
-            notification_event_schema(true),
-        ),
-        tool(
-            "keyword_reply_add",
-            "Add or update a local keyword-reply rule; it never sends a platform message",
-            json!({"type":"object","required":["keyword","reply"],"properties":{
-                "keyword":{"type":"string","minLength":1,"maxLength":MAX_KEYWORD_CHARS},
-                "reply":{"type":"string","minLength":1,"maxLength":MAX_REPLY_CHARS}
-            },"additionalProperties":false}),
-        ),
-        tool(
-            "keyword_reply_list",
-            "List local keyword-reply rules",
-            empty(),
-        ),
-        tool(
-            "keyword_reply_remove",
-            "Remove one local keyword-reply rule",
-            json!({"type":"object","required":["keyword"],"properties":{
-                "keyword":{"type":"string","minLength":1,"maxLength":MAX_KEYWORD_CHARS}
-            },"additionalProperties":false}),
-        ),
-        tool(
-            "keyword_reply_match",
-            "Match local text deterministically and return a suggestion only; never sends a platform message",
-            json!({"type":"object","required":["message"],"properties":{
-                "message":{"type":"string","minLength":1,"maxLength":MAX_MESSAGE_CHARS}
-            },"additionalProperties":false}),
-        ),
-        tool(
             "campaign_policy_add",
             "Add or update a reusable local-only cached-job campaign policy",
             campaign_policy_schema(),
@@ -429,7 +355,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             "clean_preview",
             "Preview exact known local files; MCP never archives or removes them",
             json!({"type":"object","required":["target"],"properties":{
-                "target":{"type":"string","enum":["jobs","history","shortlist","presets","reply_rules","watches","resumes","campaign_policies","campaign_blacklist","greeting_templates","application_plans","ai_profiles","notification_audit","all"]}
+                "target":{"type":"string","enum":["jobs","history","shortlist","presets","watches","resumes","campaign_policies","campaign_blacklist","greeting_templates","application_plans","all"]}
             },"additionalProperties":false}),
         ),
     ]
@@ -524,7 +450,6 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                 "notes":{
                     "filters":"Search filters are local-only over fields returned in provider lists; no automatic detail fetch.",
                     "history":"History is BossKit local search-attempt history, not remote platform browsing history.",
-                    "keyword_replies":"Keyword replies are deterministic local suggestions only and never send a platform message.",
                     "chat_messages":"chat greet, chat send, chat history, and chat inbox are CLI-only browserless operations for cached Zhipin jobs. chat exchange-wechat is a CLI-only browser-backed native BOSS UI action and requires a local ChromeDriver. greet, send, and exchange-wechat are explicitly confirmed writes; history reads one bounded exact conversation; inbox with explicit IDs reads at most 5 exact conversations, while no-ID inbox scans at most 3 newest cached jobs without pagination, polling, or replying. No chat command submits a resume, sends a phone number, or exposes a WeChat ID, and no chat command is exposed through MCP.",
                     "recruiter":"Recruiter candidates are job-scoped native recommendations. Only cards with explicit haveChatted=false expose greeting context; missing, malformed, and existing-conversation states are skipped. recruiter greet and recruiter reply are explicitly confirmed, one-at-a-time writes. greet makes one native candidate/job start-chat request and reports API acceptance without claiming independent message delivery verification; reply targets an existing conversation. No recruiter command is exposed through MCP.",
                     "campaign_screen":"Resume screening is deterministic and local-only over cached job title, skills, and description. It creates manual-review dry-run plans and never applies or sends a message.",
@@ -533,9 +458,7 @@ pub fn render(format: SchemaFormat) -> Result<Value, BossError> {
                 },
                 "risk":{
                     "remote_writes":true,
-                    "confirmed_remote_notifications":["notify send"],
                     "confirmed_platform_messages":["chat greet","chat send","chat exchange-wechat","recruiter greet","recruiter reply"],
-                    "confirmed_model_calls":["ai draft","ai score"],
                     "all_remote_operations_read_only":false,
                     "local_writes":local_writes
                 }
@@ -562,29 +485,6 @@ fn tool(name: &'static str, description: &'static str, input_schema: Value) -> T
         description,
         input_schema,
     }
-}
-
-fn ai_operation_schema() -> Value {
-    json!({"type":"object","required":["profile","job_id","resume_name","confirm"],"properties":{
-        "profile":{"type":"string","minLength":1,"maxLength":64},
-        "job_id":{"type":"string","minLength":1},
-        "resume_name":{"type":"string","minLength":1,"maxLength":64},
-        "confirm":{"const":true}
-    },"additionalProperties":false})
-}
-
-fn notification_event_schema(confirm: bool) -> Value {
-    let mut properties = json!({
-        "event":{"type":"string","minLength":1,"maxLength":MAX_NOTIFICATION_EVENT_CHARS,
-            "pattern":"^[a-z0-9][a-z0-9._-]{0,63}$"}
-    });
-    let mut required = vec!["event"];
-    if confirm {
-        properties["confirm"] = json!({"const":true});
-        required.push("confirm");
-    }
-    json!({"type":"object","required":required,"properties":properties,
-        "additionalProperties":false})
 }
 
 #[derive(Serialize)]
@@ -637,10 +537,6 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("preset ls", &[]),
         ("preset show", &[]),
         ("preset rm", &["presets"]),
-        ("reply add", &["reply_rules"]),
-        ("reply ls", &[]),
-        ("reply rm", &["reply_rules"]),
-        ("reply match", &[]),
         ("campaign policy add", &["campaign_policies"]),
         ("campaign policy ls", &[]),
         ("campaign policy show", &[]),
@@ -673,14 +569,6 @@ fn command_registry() -> Vec<CommandDefinition> {
         ("resume import", &["resumes"]),
         ("resume export", &["resume_export_target"]),
         ("resume rm", &["resumes"]),
-        ("ai profile add", &["ai_profiles"]),
-        ("ai profile ls", &[]),
-        ("ai profile show", &[]),
-        ("ai profile rm", &["ai_profiles"]),
-        ("ai draft", &[]),
-        ("ai score", &[]),
-        ("notify preview", &[]),
-        ("notify send", &["notification_audit"]),
         ("stats", &[]),
         (
             "clean",
@@ -689,15 +577,12 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "history",
                 "shortlist",
                 "presets",
-                "reply_rules",
                 "watches",
                 "resumes",
                 "campaign_policies",
                 "campaign_blacklist",
                 "greeting_templates",
                 "application_plans",
-                "ai_profiles",
-                "notification_audit",
             ],
         ),
         (
@@ -708,15 +593,12 @@ fn command_registry() -> Vec<CommandDefinition> {
                 "jobs_cache",
                 "shortlist",
                 "presets",
-                "reply_rules",
                 "watches",
                 "resumes",
                 "campaign_policies",
                 "campaign_blacklist",
                 "greeting_templates",
                 "application_plans",
-                "ai_profiles",
-                "notification_audit",
             ],
         ),
     ]
@@ -730,7 +612,6 @@ fn command_registry() -> Vec<CommandDefinition> {
                 | "chat exchange-wechat"
                 | "recruiter greet"
                 | "recruiter reply"
-                | "notify send"
                 | "mcp"
         ),
         local_write: !local_write_targets.is_empty(),
@@ -758,15 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn ai_profile_schema_reuses_the_shared_base_url_bound() {
-        let profile_add = tool_registry()
-            .into_iter()
-            .find(|tool| tool.name == "ai_profile_add")
-            .expect("AI profile tool");
-        assert_eq!(
-            profile_add.input_schema["properties"]["base_url"]["maxLength"],
-            json!(MAX_AI_BASE_URL_CHARS)
-        );
+    fn removed_generic_assistant_tools_stay_out_of_the_registry() {
+        assert!(tool_registry().iter().all(|tool| {
+            !tool.name.starts_with("ai_")
+                && !tool.name.starts_with("notify_")
+                && !tool.name.starts_with("keyword_reply_")
+        }));
     }
 
     #[test]

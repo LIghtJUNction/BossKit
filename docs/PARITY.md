@@ -18,8 +18,8 @@ BossKit is a BOSS 直聘-only Rust 2024 CLI and MCP product. It provides browser
 
 ## Migration
 
-The runtime accepts legacy local config and account documents so users can start normally. Legacy non-BOSS platform settings and stored sessions are discarded during migration, never selected, exposed, or written back.
+The runtime accepts legacy local config and account documents so users can start normally. Legacy non-BOSS platform settings, no-op `operating_mode` / `log_level` settings, and stored non-BOSS sessions are discarded during migration, never selected, exposed, or written back. Retired `reply_rules.json`, `ai_profiles.json`, and `notification_audit.json` files are ignored and left untouched.
 
 ## Not implemented
 
-Automatic application submission, resume mutation/synchronization, bulk greeting, automated reply, background scheduling, CAPTCHA/risk-control bypasses, phone/SMS/browser-repair login, and any non-BOSS provider are intentionally absent. Recruiter candidate search and greeting are bounded and CLI-only.
+Automatic application submission, resume mutation/synchronization, bulk greeting, automated reply, background scheduling, generic model calls, arbitrary Webhook notifications, local keyword-reply rules, CAPTCHA/risk-control bypasses, phone/SMS/browser-repair login, and any non-BOSS provider are intentionally absent. Recruiter candidate search and greeting are bounded and CLI-only.

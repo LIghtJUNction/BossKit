@@ -10,8 +10,6 @@ fn run_json(data_dir: &std::path::Path, args: &[&str]) -> Value {
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
         .env_remove("BOSS_QIANCHENG_COOKIE")
-        .env_remove("BOSS_LLM_API_KEY")
-        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .args(args)
         .output()
         .expect("run");
@@ -38,7 +36,6 @@ fn run_mcp(data_dir: &std::path::Path, requests: &[Value]) -> Vec<Value> {
         .env_remove("BOSS_ZHIPIN_COOKIE")
         .env_remove("BOSS_ZHILIAN_COOKIE")
         .env_remove("BOSS_QIANCHENG_COOKIE")
-        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
         .arg("mcp")
         .write_stdin(input)
         .output()
@@ -76,6 +73,28 @@ fn markdown_is_default_and_json_requires_explicit_flag() {
     assert!(json.status.success());
     let value: Value = serde_json::from_slice(&json.stdout).expect("json");
     assert_eq!(value["ok"], true);
+}
+
+#[test]
+fn help_keeps_the_boss_focused_surface_and_localizes_recruiter_commands() {
+    let help = Command::cargo_bin("boss")
+        .expect("binary")
+        .arg("--help")
+        .output()
+        .expect("top-level help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("UTF-8 help");
+    assert!(!help.contains("\n  ai "));
+    assert!(!help.contains("\n  notify "));
+    assert!(!help.contains("\n  reply "));
+
+    let recruiter = Command::cargo_bin("boss")
+        .expect("binary")
+        .args(["recruiter", "--help"])
+        .output()
+        .expect("recruiter help");
+    assert!(recruiter.status.success());
+    assert!(String::from_utf8_lossy(&recruiter.stdout).contains("只读搜索一页受限的脱敏候选人"));
 }
 
 fn seed_jobs(directory: &std::path::Path) {
@@ -359,7 +378,7 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
     assert!(
         error["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("between 1 and 5"))
+            .is_some_and(|message| message.contains("1 到 5"))
     );
 }
 
@@ -885,83 +904,6 @@ fn cities_reports_exact_shared_mapping() {
 }
 
 #[test]
-fn notification_preview_is_local_and_send_requires_confirmation_or_runtime_configuration() {
-    let directory = tempdir().expect("temporary directory");
-    seed_jobs(directory.path());
-    let preview = run_json(directory.path(), &["notify", "preview", "campaign.ready"]);
-    assert_eq!(
-        (
-            preview["data"]["mode"].as_str(),
-            preview["data"]["sent"].as_bool(),
-            preview["data"]["payload"]["summary"]["cached_jobs"].as_u64(),
-        ),
-        (Some("local_notification_preview"), Some(false), Some(1))
-    );
-    assert!(!directory.path().join("notification_audit.json").exists());
-
-    let unconfirmed = Command::cargo_bin("boss")
-        .expect("binary")
-        .arg("--json")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
-        .args(["notify", "send", "campaign.ready"])
-        .output()
-        .expect("run");
-    assert!(!unconfirmed.status.success());
-    let value: Value = serde_json::from_slice(&unconfirmed.stdout).expect("json");
-    assert_eq!(value["error"]["code"], "invalid_argument");
-    assert!(!directory.path().join("notification_audit.json").exists());
-
-    let unconfigured = Command::cargo_bin("boss")
-        .expect("binary")
-        .arg("--json")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
-        .args(["notify", "send", "campaign.ready", "--yes"])
-        .output()
-        .expect("run");
-    assert!(!unconfigured.status.success());
-    let value: Value = serde_json::from_slice(&unconfigured.stdout).expect("json");
-    assert_eq!(value["error"]["code"], "notification_error");
-    let audit: Value = serde_json::from_slice(
-        &std::fs::read(directory.path().join("notification_audit.json")).expect("audit"),
-    )
-    .expect("audit json");
-    assert_eq!(
-        audit,
-        serde_json::json!([{
-            "event":"campaign.ready", "status":"failure", "timestamp":audit[0]["timestamp"]
-        }])
-    );
-}
-
-#[test]
-fn mcp_notification_tools_match_schema_and_reject_unconfirmed_send_without_network() {
-    let directory = tempdir().expect("temporary directory");
-    let responses = run_mcp(
-        directory.path(),
-        &[
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                "name":"notify_preview","arguments":{"event":"watch.complete"}
-            }}),
-            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                "name":"notify_send","arguments":{"event":"watch.complete","confirm":false}
-            }}),
-        ],
-    );
-    let tools = responses[0]["result"]["tools"].as_array().expect("tools");
-    let send = tools
-        .iter()
-        .find(|tool| tool["name"] == "notify_send")
-        .expect("notify send schema");
-    assert_eq!(send["inputSchema"]["properties"]["confirm"]["const"], true);
-    assert_eq!(responses[1]["result"]["isError"], false);
-    assert_eq!(responses[2]["error"]["code"], -32602);
-    assert!(!directory.path().join("notification_audit.json").exists());
-}
-
-#[test]
 fn shortlist_full_cli_lifecycle_is_local() {
     let directory = tempdir().expect("temporary directory");
     seed_jobs(directory.path());
@@ -1103,37 +1045,6 @@ fn preset_and_watch_snapshots_have_local_lifecycles() {
     run_json(directory.path(), &["preset", "rm", "backend"]);
     let watch = run_json(directory.path(), &["watch", "show", "daily"]);
     assert_eq!(watch["data"]["spec"]["query"], "rust");
-}
-
-#[test]
-fn keyword_reply_cli_lifecycle_returns_local_suggestions() {
-    let directory = tempdir().expect("temporary directory");
-    let added = run_json(
-        directory.path(),
-        &["reply", "add", " Offer ", " Thanks for reaching out. "],
-    );
-    assert_eq!(
-        (
-            added["data"]["keyword"].as_str(),
-            added["data"]["reply"].as_str(),
-        ),
-        (Some("Offer"), Some("Thanks for reaching out."))
-    );
-    let listed = run_json(directory.path(), &["reply", "list"]);
-    let matched = run_json(
-        directory.path(),
-        &["reply", "match", "A new OFFER is ready"],
-    );
-    let unmatched = run_json(directory.path(), &["reply", "match", "No update today"]);
-    let removed = run_json(directory.path(), &["reply", "remove", "offer"]);
-    assert!(
-        listed["data"].as_array().map(Vec::len) == Some(1)
-            && matched["data"]["matched"] == true
-            && matched["data"]["rule"]["reply"] == "Thanks for reaching out."
-            && unmatched["data"]["matched"] == false
-            && unmatched["data"]["rule"].is_null()
-            && removed["data"]["keyword"] == "Offer"
-    );
 }
 
 #[test]
@@ -1487,8 +1398,6 @@ fn campaign_screen_rejects_empty_missing_resume_and_invalid_score() {
             .env_remove("BOSS_ZHIPIN_COOKIE")
             .env_remove("BOSS_ZHILIAN_COOKIE")
             .env_remove("BOSS_QIANCHENG_COOKIE")
-            .env_remove("BOSS_LLM_API_KEY")
-            .env_remove("BOSS_NOTIFY_WEBHOOK_URL")
             .args(args)
             .output()
             .expect("run")
@@ -1609,72 +1518,11 @@ fn resume_cli_is_typed_and_requires_deletion_confirmation() {
 }
 
 #[test]
-fn ai_profile_lifecycle_and_confirmation_gate_never_need_a_network() {
-    let directory = tempdir().expect("temporary directory");
-    seed_jobs(directory.path());
-    run_json(
-        directory.path(),
-        &["resume", "init", "candidate", "--title", "Rust Engineer"],
-    );
-    let profile = run_json(
-        directory.path(),
-        &[
-            "ai",
-            "profile",
-            "add",
-            "local",
-            "https://model.example/v1/",
-            "example-model",
-        ],
-    );
-    let listed = run_json(directory.path(), &["ai", "profile", "ls"]);
-    let shown = run_json(directory.path(), &["ai", "profile", "show", "local"]);
-    let stored =
-        std::fs::read_to_string(directory.path().join("ai_profiles.json")).expect("profile store");
-    assert!(
-        profile["data"]["base_url"] == "https://model.example/v1"
-            && listed["data"].as_array().map(Vec::len) == Some(1)
-            && shown["data"]["model"] == "example-model"
-            && !stored.contains("BOSS_LLM_API_KEY")
-            && !stored.contains("api_key")
-    );
-
-    let unconfirmed = Command::cargo_bin("boss")
-        .expect("binary")
-        .arg("--json")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_LLM_API_KEY")
-        .args(["ai", "draft", "local", "zhipin-job", "candidate"])
-        .output()
-        .expect("unconfirmed draft");
-    assert!(!unconfirmed.status.success());
-    let unconfirmed: Value = serde_json::from_slice(&unconfirmed.stdout).expect("error json");
-    assert_eq!(unconfirmed["error"]["code"], "invalid_argument");
-
-    let missing_key = Command::cargo_bin("boss")
-        .expect("binary")
-        .arg("--json")
-        .env("BOSS_DATA_DIR", directory.path())
-        .env_remove("BOSS_LLM_API_KEY")
-        .args(["ai", "score", "local", "zhipin-job", "candidate", "--yes"])
-        .output()
-        .expect("missing key score");
-    assert!(!missing_key.status.success());
-    let missing_key: Value = serde_json::from_slice(&missing_key.stdout).expect("error json");
-    assert_eq!(missing_key["error"]["code"], "ai_api_key_missing");
-
-    let removed = run_json(directory.path(), &["ai", "profile", "rm", "local"]);
-    assert_eq!(removed["data"]["name"], "local");
-}
-
-#[test]
 fn clean_preview_and_archive_preserve_config_and_report_recovery_paths() {
     let directory = tempdir().expect("temporary directory");
     seed_jobs(directory.path());
     run_json(directory.path(), &["config", "set", "page_size", "7"]);
     run_json(directory.path(), &["preset", "add", "p", "rust"]);
-    run_json(directory.path(), &["reply", "add", "offer", "Thanks"]);
-    let reply_preview = run_json(directory.path(), &["clean", "--target", "reply_rules"]);
     let preview = run_json(directory.path(), &["clean", "--target", "all"]);
     assert!(preview["data"]["preview"] == true && directory.path().join("jobs.json").exists());
     let cleaned = run_json(directory.path(), &["clean", "--target", "all", "--yes"]);
@@ -1708,17 +1556,15 @@ fn clean_preview_and_archive_preserve_config_and_report_recovery_paths() {
     )
     .expect("clean preview json");
     assert!(
-        cleaned["data"]["files"].as_array().map(Vec::len) == Some(13)
-            && reply_preview["data"]["files"].as_array().map(Vec::len) == Some(1)
-            && reply_preview["data"]["files"][0]["target"] == "reply_rules"
+        cleaned["data"]["files"].as_array().map(Vec::len) == Some(10)
             && cleaned["data"]["action"] == "archive"
             && cleaned["data"]["recoverable"] == true
             && archived_paths_exist
             && directory.path().join("config.json").exists()
             && !directory.path().join("jobs.json").exists()
-            && !directory.path().join("reply_rules.json").exists()
+            && !directory.path().join("presets.json").exists()
             && stats["data"]["file_bytes"]["jobs"] == 0
-            && stats["data"]["file_bytes"]["reply_rules"] == 0
+            && stats["data"]["file_bytes"]["presets"] == 0
             && clean_schema
                 .and_then(|tool| tool["description"].as_str())
                 .is_some_and(|description| description.contains("never archives or removes"))

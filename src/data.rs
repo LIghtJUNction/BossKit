@@ -78,12 +78,6 @@ impl DataPaths {
         self.root.join("resumes.json")
     }
 
-    /// Returns the local keyword-reply rule path.
-    #[must_use]
-    pub fn reply_rules(&self) -> PathBuf {
-        self.root.join("reply_rules.json")
-    }
-
     /// Returns the reusable local campaign policy path.
     #[must_use]
     pub fn campaign_policies(&self) -> PathBuf {
@@ -106,18 +100,6 @@ impl DataPaths {
     #[must_use]
     pub fn application_plans(&self) -> PathBuf {
         self.root.join("application_plans.json")
-    }
-
-    /// Returns the credential-free local AI profile path.
-    #[must_use]
-    pub fn ai_profiles(&self) -> PathBuf {
-        self.root.join("ai_profiles.json")
-    }
-
-    /// Returns the redacted local notification audit path.
-    #[must_use]
-    pub fn notification_audit(&self) -> PathBuf {
-        self.root.join("notification_audit.json")
     }
 
     /// Returns the private authentication directory.
@@ -230,20 +212,8 @@ mod tests {
             PathBuf::from("/tmp/bosskit-test/shortlist.json")
         );
         assert_eq!(
-            paths.reply_rules(),
-            PathBuf::from("/tmp/bosskit-test/reply_rules.json")
-        );
-        assert_eq!(
             paths.application_plans(),
             PathBuf::from("/tmp/bosskit-test/application_plans.json")
-        );
-        assert_eq!(
-            paths.ai_profiles(),
-            PathBuf::from("/tmp/bosskit-test/ai_profiles.json")
-        );
-        assert_eq!(
-            paths.notification_audit(),
-            PathBuf::from("/tmp/bosskit-test/notification_audit.json")
         );
         assert_eq!(
             paths.auth_sessions(),
