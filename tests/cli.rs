@@ -263,9 +263,11 @@ fn login_requires_a_fresh_cookie_and_preserves_the_stored_session() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "authentication_error");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--cookie-stdin")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--cookie-stdin"))
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("ENV_COOKIE_MUST_NOT_BE_USED"));
     assert_eq!(std::fs::read(&sessions).expect("stored session"), before);
 }
@@ -303,9 +305,11 @@ fn recruiter_inbox_requires_an_explicit_account_and_supports_native_filters() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--account")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
 
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -325,9 +329,11 @@ fn recruiter_inbox_requires_an_explicit_account_and_supports_native_filters() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("cannot be used with")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be used with"))
+    );
 }
 
 #[test]
@@ -343,9 +349,11 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--account")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
 
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -367,9 +375,11 @@ fn recruiter_candidates_are_bounded_and_require_an_explicit_account() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("1 到 5")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("1 到 5"))
+    );
 }
 
 #[test]
@@ -401,9 +411,11 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--account")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
 
     let output = Command::cargo_bin("boss")
         .expect("binary")
@@ -468,9 +480,11 @@ fn recruiter_greet_requires_explicit_account_and_confirmation_before_credentials
     let rendered = String::from_utf8_lossy(&output.stdout);
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("plain text")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("plain text"))
+    );
     assert!(!rendered.contains(secret));
 }
 
@@ -495,9 +509,11 @@ fn recruiter_inbox_brief_is_a_native_candidate_projection() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--account")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
 }
 
 #[test]
@@ -513,9 +529,11 @@ fn recruiter_resumes_supports_bounded_batch_brief_without_account_fallback() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).expect("error json");
     assert_eq!(error["error"]["code"], "invalid_argument");
-    assert!(error["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("--account")));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account"))
+    );
 }
 
 #[test]
@@ -703,9 +721,11 @@ fn chat_send_rejects_link_references_before_credentials() {
     let rendered = String::from_utf8_lossy(&output.stdout);
     let value: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(value["error"]["code"], "invalid_argument");
-    assert!(value["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("plain text")));
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("plain text"))
+    );
     assert!(!rendered.contains("COOKIE_MUST_NOT_BE_USED"));
 }
 
@@ -716,21 +736,23 @@ fn recruiter_and_direct_chat_are_cli_only_and_schema_marks_confirmed_writes() {
         directory.path(),
         &[serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})],
     );
-    assert!(responses[0]["result"]["tools"]
-        .as_array()
-        .expect("tools")
-        .iter()
-        .all(|tool| !matches!(
-            tool["name"].as_str(),
-            Some(
-                "chat_greet"
-                    | "chat_send"
-                    | "chat_history"
-                    | "chat_inbox"
-                    | "recruiter_greet"
-                    | "recruiter_reply"
-            )
-        )));
+    assert!(
+        responses[0]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .all(|tool| !matches!(
+                tool["name"].as_str(),
+                Some(
+                    "chat_greet"
+                        | "chat_send"
+                        | "chat_history"
+                        | "chat_inbox"
+                        | "recruiter_greet"
+                        | "recruiter_reply"
+                )
+            ))
+    );
 
     let schema = run_json(directory.path(), &["schema", "--format", "native"]);
     let commands = schema["data"]["commands"].as_array().expect("commands");
@@ -1385,18 +1407,22 @@ fn campaign_screen_rejects_empty_missing_resume_and_invalid_score() {
     assert!(!empty.status.success());
     let empty: Value = serde_json::from_slice(&empty.stdout).expect("empty resume error");
     assert_eq!(empty["error"]["code"], "invalid_argument");
-    assert!(empty["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("non-empty title or at least one skill")));
+    assert!(
+        empty["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty title or at least one skill"))
+    );
 
     let missing = run_failure(&[
         "campaign", "screen", "--resume", "missing", "--policy", "all",
     ]);
     assert!(!missing.status.success());
     let missing: Value = serde_json::from_slice(&missing.stdout).expect("missing resume error");
-    assert!(missing["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("not found: missing")));
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not found: missing"))
+    );
 
     let invalid_score = run_failure(&[
         "campaign",
@@ -1449,9 +1475,11 @@ fn campaign_screen_rejects_empty_missing_resume_and_invalid_score() {
     ]);
     assert!(!summary.status.success());
     let summary: Value = serde_json::from_slice(&summary.stdout).expect("summary error");
-    assert!(summary["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("cannot use {{resume_summary}}")));
+    assert!(
+        summary["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot use {{resume_summary}}"))
+    );
     assert!(!directory.path().join("application_plans.json").exists());
 }
 
